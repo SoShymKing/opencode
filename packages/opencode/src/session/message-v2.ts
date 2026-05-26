@@ -38,7 +38,65 @@ interface FetchDecompressionError extends Error {
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
 export { isMedia }
 
-export const AbortedError = NamedError.create("MessageAbortedError", { message: Schema.String })
+export const AbortSource = Schema.Literals([
+  "user_cancel",
+  "session_cancel",
+  "provider_abort",
+  "network_abort",
+  "first_byte_timeout",
+  "stream_idle_timeout",
+  "post_tool_first_event_timeout",
+  "no_visible_part_timeout",
+  "server_restart",
+  "client_disconnect",
+  "unknown",
+])
+export type AbortSource = Schema.Schema.Type<typeof AbortSource>
+
+export const RequestPhase = Schema.Literals(["model_stream", "post_tool_continuation", "message_finalization", "unknown"])
+export type RequestPhase = Schema.Schema.Type<typeof RequestPhase>
+
+const NoResponseDiagnostics = Schema.Struct({
+  providerID: Schema.optional(ProviderID),
+  modelID: Schema.optional(ModelID),
+  sessionID: Schema.optional(SessionID),
+  messageID: Schema.optional(MessageID),
+  elapsedMs: Schema.optional(NonNegativeInt),
+  isPostToolContinuation: Schema.optional(Schema.Boolean),
+  retryAttempt: Schema.optional(NonNegativeInt),
+  firstStreamEventAt: Schema.optional(NonNegativeInt),
+  lastStreamEventAt: Schema.optional(NonNegativeInt),
+  firstVisiblePartAt: Schema.optional(NonNegativeInt),
+  lastVisiblePartAt: Schema.optional(NonNegativeInt),
+  partCount: Schema.optional(NonNegativeInt),
+  tokenCount: Schema.optional(NonNegativeInt),
+})
+export type NoResponseDiagnostics = Schema.Schema.Type<typeof NoResponseDiagnostics>
+
+const NoResponseErrorData = {
+  message: Schema.String,
+  abortSource: AbortSource,
+  phase: RequestPhase,
+  retryable: Schema.Boolean,
+  diagnostics: Schema.optional(NoResponseDiagnostics),
+}
+
+export const AbortedError = NamedError.create("MessageAbortedError", {
+  message: Schema.String,
+  abortSource: Schema.optional(AbortSource),
+})
+export const UnexpectedProviderAbortError = NamedError.create("UnexpectedProviderAbortError", {
+  ...NoResponseErrorData,
+})
+export const PostToolContinuationTimeoutError = NamedError.create("PostToolContinuationTimeoutError", {
+  ...NoResponseErrorData,
+})
+export const EmptyAssistantResponseError = NamedError.create("EmptyAssistantResponseError", {
+  ...NoResponseErrorData,
+})
+export const NoResponseError = NamedError.create("NoResponseError", {
+  ...NoResponseErrorData,
+})
 export const StructuredOutputError = NamedError.create("StructuredOutputError", {
   message: Schema.String,
   retries: NonNegativeInt,
@@ -380,6 +438,10 @@ export type Part =
 const AssistantErrorSchema = Schema.Union([
   ...MessageError.Shared,
   AbortedError.EffectSchema,
+  UnexpectedProviderAbortError.EffectSchema,
+  PostToolContinuationTimeoutError.EffectSchema,
+  EmptyAssistantResponseError.EffectSchema,
+  NoResponseError.EffectSchema,
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   APIError.EffectSchema,
@@ -746,7 +808,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
       if (
         msg.info.error &&
         !(
-          AbortedError.isInstance(msg.info.error) &&
+          (AbortedError.isInstance(msg.info.error) || UnexpectedProviderAbortError.isInstance(msg.info.error)) &&
           msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
         )
       ) {
@@ -1095,12 +1157,37 @@ export function latest(msgs: WithParts[]) {
 
 export function fromError(
   e: unknown,
-  ctx: { providerID: ProviderID; aborted?: boolean },
+  ctx: {
+    providerID: ProviderID
+    aborted?: boolean
+    abortSource?: AbortSource
+    phase?: RequestPhase
+    diagnostics?: NoResponseDiagnostics
+  },
 ): NonNullable<Assistant["error"]> {
   switch (true) {
+    case UnexpectedProviderAbortError.isInstance(e):
+    case PostToolContinuationTimeoutError.isInstance(e):
+    case EmptyAssistantResponseError.isInstance(e):
+    case NoResponseError.isInstance(e):
+      return e instanceof NamedError ? (e.toObject() as NonNullable<Assistant["error"]>) : (e as NonNullable<Assistant["error"]>)
     case e instanceof DOMException && e.name === "AbortError":
-      return new AbortedError(
-        { message: e.message },
+      if (ctx.aborted || ctx.abortSource === "user_cancel" || ctx.abortSource === "session_cancel") {
+        return new AbortedError(
+          { message: e.message, abortSource: ctx.abortSource ?? "user_cancel" },
+          {
+            cause: e,
+          },
+        ).toObject()
+      }
+      return new UnexpectedProviderAbortError(
+        {
+          message: e.message,
+          abortSource: ctx.abortSource ?? "provider_abort",
+          phase: ctx.phase ?? "model_stream",
+          retryable: true,
+          diagnostics: ctx.diagnostics,
+        },
         {
           cause: e,
         },
@@ -1130,7 +1217,7 @@ export function fromError(
       ).toObject()
     case e instanceof Error && (e as FetchDecompressionError).code === "ZlibError":
       if (ctx.aborted) {
-        return new AbortedError({ message: e.message }, { cause: e }).toObject()
+        return new AbortedError({ message: e.message, abortSource: ctx.abortSource ?? "user_cancel" }, { cause: e }).toObject()
       }
       return new APIError(
         {

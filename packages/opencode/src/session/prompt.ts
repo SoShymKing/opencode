@@ -87,6 +87,15 @@ function isOrphanedInterruptedTool(part: MessageV2.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function isPostToolContinuation(lastAssistant: MessageV2.WithParts | undefined, finish: string | undefined) {
+  if (!lastAssistant || finish !== "tool-calls") return false
+  const tools = lastAssistant.parts.filter(
+    (part): part is MessageV2.ToolPart => part.type === "tool" && !isOrphanedInterruptedTool(part),
+  )
+  if (tools.length === 0) return false
+  return tools.every((part) => part.state.status === "completed" || part.state.status === "error")
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts, Image.Error>
@@ -1441,6 +1450,7 @@ export const layer = Layer.effect(
             const system = [...env, ...instructions, ...(skills ? [skills] : [])]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            const postToolContinuation = isPostToolContinuation(lastAssistantMsg, lastAssistant?.finish)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1452,6 +1462,9 @@ export const layer = Layer.effect(
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
+              internal: {
+                postToolContinuation,
+              },
             })
 
             if (structured !== undefined) {

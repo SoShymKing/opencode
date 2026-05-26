@@ -1036,6 +1036,45 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("includes unexpected provider abort messages when they have partial content", async () => {
+    const assistantID = "m-assistant"
+    const error = new MessageV2.UnexpectedProviderAbortError({
+      message: "aborted",
+      abortSource: "provider_abort",
+      phase: "model_stream",
+      retryable: true,
+    }).toObject() as MessageV2.Assistant["error"]
+
+    const input: MessageV2.WithParts[] = [
+      {
+        info: assistantInfo(assistantID, "m-parent", error),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "reasoning",
+            text: "thinking",
+            time: { start: 0 },
+          },
+          {
+            ...basePart(assistantID, "a2"),
+            type: "text",
+            text: "partial answer",
+          },
+        ] as MessageV2.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "thinking", providerOptions: undefined },
+          { type: "text", text: "partial answer" },
+        ],
+      },
+    ])
+  })
+
   test("preserves OpenRouter reasoning details through provider transform", async () => {
     const assistantID = "m-assistant"
     const openrouterModel: Provider.Model = {
@@ -1545,6 +1584,43 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(zlibError, { providerID, aborted: true })
 
     expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("classifies user AbortError as MessageAbortedError with provenance", () => {
+    const result = MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+      providerID,
+      aborted: true,
+      abortSource: "session_cancel",
+    })
+
+    expect(result).toStrictEqual({
+      name: "MessageAbortedError",
+      data: {
+        message: "Aborted",
+        abortSource: "session_cancel",
+      },
+    })
+  })
+
+  test("classifies unexpected AbortError as provider abort", () => {
+    const result = MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+      providerID,
+      diagnostics: {
+        providerID,
+        elapsedMs: 25,
+        isPostToolContinuation: true,
+        retryAttempt: 0,
+        partCount: 0,
+        tokenCount: 0,
+      },
+    })
+
+    expect(result.name).toBe("UnexpectedProviderAbortError")
+    if (!MessageV2.UnexpectedProviderAbortError.isInstance(result)) throw new Error("expected provider abort")
+    expect(result.data.abortSource).toBe("provider_abort")
+    expect(result.data.phase).toBe("model_stream")
+    expect(result.data.retryable).toBe(true)
+    expect(result.data.diagnostics?.isPostToolContinuation).toBe(true)
   })
 })
 

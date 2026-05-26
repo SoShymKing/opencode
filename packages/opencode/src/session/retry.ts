@@ -14,6 +14,7 @@ export type RetryContext = {
   aborted?: boolean
   empty?: boolean
   attempt?: number
+  postToolContinuation?: boolean
 }
 
 export type Retryable = {
@@ -33,6 +34,7 @@ export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_UNEXPECTED_ABORT_LIMIT = 1
+export const RETRY_NO_RESPONSE_LIMIT = 1
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -75,9 +77,28 @@ export function retryable(error: Err, provider: string, context?: RetryContext) 
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.AbortedError.isInstance(error)) {
+    if (error.data.abortSource === "user_cancel" || error.data.abortSource === "session_cancel") return undefined
     if (context?.aborted) return undefined
     if (context?.empty === false) return undefined
     if ((context?.attempt ?? 1) > RETRY_UNEXPECTED_ABORT_LIMIT) return undefined
+    return { message: error.data.message }
+  }
+  if (MessageV2.UnexpectedProviderAbortError.isInstance(error)) {
+    if (context?.aborted) return undefined
+    if (context?.empty === false) return undefined
+    if ((context?.attempt ?? 1) > RETRY_UNEXPECTED_ABORT_LIMIT) return undefined
+    return { message: error.data.message }
+  }
+  if (
+    MessageV2.PostToolContinuationTimeoutError.isInstance(error) ||
+    MessageV2.EmptyAssistantResponseError.isInstance(error) ||
+    MessageV2.NoResponseError.isInstance(error)
+  ) {
+    if (context?.aborted) return undefined
+    if (context?.empty === false) return undefined
+    if (MessageV2.PostToolContinuationTimeoutError.isInstance(error) && context?.postToolContinuation !== true)
+      return undefined
+    if ((context?.attempt ?? 1) > RETRY_NO_RESPONSE_LIMIT) return undefined
     return { message: error.data.message }
   }
   if (MessageV2.APIError.isInstance(error)) {

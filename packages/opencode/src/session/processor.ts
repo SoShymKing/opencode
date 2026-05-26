@@ -30,6 +30,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+export const POST_TOOL_FIRST_EVENT_TIMEOUT_MS = 10_000
 const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
@@ -82,6 +83,18 @@ interface ProcessorContext extends Input {
 
 type StreamEvent = LLMEvent
 
+type StreamActivity = {
+  requestStartedAt: number
+  firstStreamEventAt: number | undefined
+  lastStreamEventAt: number | undefined
+  firstVisiblePartAt: number | undefined
+  lastVisiblePartAt: number | undefined
+  partCount: number
+  tokenCount: number
+  isPostToolContinuation: boolean
+  retryAttempt: number
+}
+
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
 
 export const layer = Layer.effect(
@@ -120,12 +133,43 @@ export const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let retryAttempt = 0
+      let activity: StreamActivity = {
+        requestStartedAt: Date.now(),
+        firstStreamEventAt: undefined,
+        lastStreamEventAt: undefined,
+        firstVisiblePartAt: undefined,
+        lastVisiblePartAt: undefined,
+        partCount: 0,
+        tokenCount: 0,
+        isPostToolContinuation: false,
+        retryAttempt,
+      }
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
+
+      const diagnostics = (): MessageV2.NoResponseDiagnostics => ({
+        providerID: input.model.providerID,
+        modelID: input.model.id,
+        sessionID: input.sessionID,
+        messageID: input.assistantMessage.id,
+        elapsedMs: Math.max(0, Date.now() - activity.requestStartedAt),
+        isPostToolContinuation: activity.isPostToolContinuation,
+        retryAttempt: activity.retryAttempt,
+        firstStreamEventAt: activity.firstStreamEventAt,
+        lastStreamEventAt: activity.lastStreamEventAt,
+        firstVisiblePartAt: activity.firstVisiblePartAt,
+        lastVisiblePartAt: activity.lastVisiblePartAt,
+        partCount: activity.partCount,
+        tokenCount: activity.tokenCount,
+      })
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
           providerID: input.model.providerID,
           aborted,
+          abortSource: aborted ? "user_cancel" : undefined,
+          phase: activity.isPostToolContinuation ? "post_tool_continuation" : "model_stream",
+          diagnostics: diagnostics(),
         })
 
       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
@@ -302,10 +346,21 @@ export const layer = Layer.effect(
 
       const toolInput = (value: unknown): Record<string, any> => (isRecord(value) ? value : { value })
 
+      const markVisiblePart = (increment = true) => {
+        const now = Date.now()
+        activity.firstVisiblePartAt ??= now
+        activity.lastVisiblePartAt = now
+        if (increment) activity.partCount++
+      }
+
+      const tokenTotal = (tokens: MessageV2.Assistant["tokens"]) =>
+        tokens.total ?? tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
+            markVisiblePart()
             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (flags.experimentalEventSystem) {
               yield* events.publish(SessionEvent.Reasoning.Started, {
@@ -329,6 +384,7 @@ export const layer = Layer.effect(
           case "reasoning-delta":
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
+            markVisiblePart(false)
             ctx.reasoningMap[value.id].text += value.text
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
@@ -351,6 +407,7 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            markVisiblePart()
             yield* ensureToolCall(value)
             return
 
@@ -378,6 +435,7 @@ export const layer = Layer.effect(
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
+            markVisiblePart(false)
             const toolCall = yield* ensureToolCall(value)
             const input = toolInput(value.input)
             if (!toolCall.call.inputEnded) {
@@ -450,6 +508,7 @@ export const layer = Layer.effect(
           }
 
           case "tool-result": {
+            markVisiblePart(false)
             const toolCall = yield* readToolCall(value.id)
             const rawOutput = toolResultOutput(value)
             const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
@@ -502,6 +561,7 @@ export const layer = Layer.effect(
           }
 
           case "tool-error": {
+            markVisiblePart(false)
             const toolCall = yield* readToolCall(value.id)
             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (flags.experimentalEventSystem) {
@@ -526,6 +586,7 @@ export const layer = Layer.effect(
             throw new Error(value.message)
 
           case "step-start":
+            activity.partCount++
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
@@ -576,6 +637,8 @@ export const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
+            activity.tokenCount = tokenTotal(usage.tokens)
+            activity.partCount++
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
@@ -617,6 +680,7 @@ export const layer = Layer.effect(
           }
 
           case "text-start":
+            markVisiblePart()
             if (!ctx.assistantMessage.summary) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -640,6 +704,7 @@ export const layer = Layer.effect(
 
           case "text-delta":
             if (!ctx.currentText) return
+            markVisiblePart(false)
             ctx.currentText.text += value.text
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
@@ -653,6 +718,7 @@ export const layer = Layer.effect(
 
           case "text-end":
             if (!ctx.currentText) return
+            markVisiblePart(false)
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
             ctx.currentText.text = (yield* plugin.trigger(
@@ -751,6 +817,16 @@ export const layer = Layer.effect(
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
         const error = parse(e)
+        if (MessageV2.UnexpectedProviderAbortError.isInstance(error)) {
+          slog.warn("model.abort.unexpected_provider_abort", {
+            ...(error.data.diagnostics ?? diagnostics()),
+            abortSource: error.data.abortSource,
+            phase: error.data.phase,
+          })
+        }
+        if (MessageV2.AbortedError.isInstance(error)) {
+          slog.info("model.abort.user_cancel", { ...diagnostics(), abortSource: error.data.abortSource ?? "user_cancel" })
+        }
         if (MessageV2.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
           yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
@@ -784,19 +860,88 @@ export const layer = Layer.effect(
         slog.info("process")
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
-
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            activity = {
+              requestStartedAt: Date.now(),
+              firstStreamEventAt: undefined,
+              lastStreamEventAt: undefined,
+              firstVisiblePartAt: undefined,
+              lastVisiblePartAt: undefined,
+              partCount: 0,
+              tokenCount: 0,
+              isPostToolContinuation: streamInput.internal?.postToolContinuation === true,
+              retryAttempt,
+            }
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
+            const firstStreamEvent = yield* Deferred.make<void>()
+            const firstEventTimeoutMs = streamInput.internal?.postToolFirstEventTimeoutMs ?? POST_TOOL_FIRST_EVENT_TIMEOUT_MS
 
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+            const drain = stream.pipe(
+              Stream.tap((event) =>
+                Effect.sync(() => {
+                  const now = Date.now()
+                  activity.firstStreamEventAt ??= now
+                  activity.lastStreamEventAt = now
+                }).pipe(
+                  Effect.andThen(Deferred.succeed(firstStreamEvent, undefined).pipe(Effect.ignore)),
+                  Effect.andThen(handleEvent(event)),
+                ),
+              ),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
+
+            const postToolFirstEventTimeout = activity.isPostToolContinuation
+              ? Deferred.await(firstStreamEvent).pipe(
+                  Effect.timeoutOrElse({
+                    duration: firstEventTimeoutMs,
+                    orElse: () =>
+                      Effect.sync(() => {
+                        slog.warn("model.no_response.post_tool_first_event_timeout", {
+                          ...diagnostics(),
+                          abortSource: "post_tool_first_event_timeout",
+                          phase: "post_tool_continuation",
+                        })
+                        return new MessageV2.PostToolContinuationTimeoutError({
+                          message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation`,
+                          abortSource: "post_tool_first_event_timeout",
+                          phase: "post_tool_continuation",
+                          retryable: true,
+                          diagnostics: diagnostics(),
+                        })
+                      }).pipe(Effect.flatMap((error) => Effect.fail(error))),
+                  }),
+                  Effect.andThen(Effect.never),
+                )
+              : Effect.never
+
+            yield* drain.pipe(Effect.raceFirst(postToolFirstEventTimeout))
+
+            if (ctx.assistantMessage.role === "assistant") {
+              const parts = MessageV2.parts(ctx.assistantMessage.id)
+              const noParts = parts.length === 0 || parts.every((part) => part.type === "step-start")
+              const noTokens = activity.tokenCount === 0 && ctx.assistantMessage.tokens.output === 0
+              if (noParts && noTokens) {
+                slog.warn("model.no_response.zero_part_assistant_turn", {
+                  ...diagnostics(),
+                  abortSource: "unknown",
+                  phase: "message_finalization",
+                })
+                return yield* Effect.fail(
+                  new MessageV2.EmptyAssistantResponseError({
+                    message: "Assistant stream ended without content",
+                    abortSource: "unknown",
+                    phase: "message_finalization",
+                    retryable: true,
+                    diagnostics: diagnostics(),
+                  }),
+                )
+              }
+            }
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {
@@ -817,8 +962,19 @@ export const layer = Layer.effect(
                 context: () => ({
                   aborted,
                   empty: assistantOutputEmpty(),
+                  postToolContinuation: activity.isPostToolContinuation,
                 }),
                 set: (info) => {
+                  retryAttempt = info.attempt
+                  activity.retryAttempt = info.attempt
+                  if (activity.isPostToolContinuation) {
+                    slog.warn("model.no_response.retrying_continuation", {
+                      ...diagnostics(),
+                      abortSource: "post_tool_first_event_timeout",
+                      phase: "post_tool_continuation",
+                      attempt: info.attempt,
+                    })
+                  }
                   // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = flags.experimentalEventSystem
                     ? events.publish(SessionEvent.Retried, {

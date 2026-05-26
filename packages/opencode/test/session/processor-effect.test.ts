@@ -231,6 +231,18 @@ function abortStream(...events: LLMEvent[]) {
   )
 }
 
+function delayedFirstEventStream(delayMs: number) {
+  return Stream.fromAsyncIterable(
+    {
+      async *[Symbol.asyncIterator]() {
+        await Bun.sleep(delayMs)
+        yield LLMEvent.stepStart({ index: 0 })
+      },
+    },
+    (error) => error,
+  )
+}
+
 function llmMock(...streams: Stream.Stream<LLMEvent, unknown>[]) {
   let calls = 0
   return {
@@ -716,7 +728,150 @@ partialAbortIt.live("session.processor effect tests do not retry unexpected abor
         expect(value).toBe("stop")
         expect(partialAbortLLM.calls()).toBe(1)
         expect(parts.some((part) => part.type === "text" && part.text === "partial")).toBe(true)
-        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(handle.message.error?.name).toBe("UnexpectedProviderAbortError")
+      }),
+    { config: cfg },
+  ),
+)
+
+const postToolTimeoutRetryLLM = llmMock(delayedFirstEventStream(50), assistantSuccessStream("after-timeout"))
+const postToolTimeoutRetryIt = testEffect(processorEnv(postToolTimeoutRetryLLM.layer))
+
+postToolTimeoutRetryIt.live("session.processor effect tests retry stalled post-tool continuation once", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "post-tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "post-tool" }],
+          tools: {},
+          internal: {
+            postToolContinuation: true,
+            postToolFirstEventTimeoutMs: 10,
+          },
+        })
+
+        const parts = MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(postToolTimeoutRetryLLM.calls()).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after-timeout")).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
+const postToolTimeoutExhaustLLM = llmMock(delayedFirstEventStream(50), delayedFirstEventStream(50))
+const postToolTimeoutExhaustIt = testEffect(processorEnv(postToolTimeoutExhaustLLM.layer))
+
+postToolTimeoutExhaustIt.live("session.processor effect tests stop with typed timeout after post-tool retry exhaustion", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "post-tool fail")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "post-tool fail" }],
+          tools: {},
+          internal: {
+            postToolContinuation: true,
+            postToolFirstEventTimeoutMs: 10,
+          },
+        })
+
+        expect(value).toBe("stop")
+        expect(postToolTimeoutExhaustLLM.calls()).toBe(2)
+        expect(handle.message.error?.name).toBe("PostToolContinuationTimeoutError")
+      }),
+    { config: cfg },
+  ),
+)
+
+const emptyAssistantLLM = llmMock(Stream.empty, Stream.empty)
+const emptyAssistantIt = testEffect(processorEnv(emptyAssistantLLM.layer))
+
+emptyAssistantIt.live("session.processor effect tests classify zero-part assistant finalization", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "empty assistant")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "empty assistant" }],
+          tools: {},
+        })
+
+        expect(value).toBe("stop")
+        expect(emptyAssistantLLM.calls()).toBe(2)
+        expect(MessageV2.parts(msg.id)).toHaveLength(0)
+        expect(handle.message.error?.name).toBe("EmptyAssistantResponseError")
       }),
     { config: cfg },
   ),
