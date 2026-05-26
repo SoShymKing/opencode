@@ -2,6 +2,7 @@ import { NodeFileSystem } from "@effect/platform-node"
 import { expect } from "bun:test"
 import { tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import * as Stream from "effect/Stream"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -23,12 +24,13 @@ import { SessionSummary } from "../../src/session/summary"
 import { Snapshot } from "../../src/snapshot"
 import * as Log from "@opencode-ai/core/util/log"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import { provideTmpdirServer } from "../fixture/fixture"
+import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { SyncEvent } from "@/sync"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { LLMEvent, Usage } from "@opencode-ai/llm"
 
 void Log.init({ print: false })
 
@@ -172,19 +174,19 @@ const assistant = Effect.fn("TestSession.assistant")(function* (
 
 const status = SessionStatus.layer.pipe(Layer.provideMerge(Bus.layer))
 const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
-const deps = Layer.mergeAll(
+const depsWithoutLLM = Layer.mergeAll(
   Session.defaultLayer,
   Snapshot.defaultLayer,
   AgentSvc.defaultLayer,
   Permission.defaultLayer,
   Plugin.defaultLayer,
   Config.defaultLayer,
-  LLM.defaultLayer,
   Provider.defaultLayer,
   status,
   SyncEvent.defaultLayer,
   EventV2Bridge.defaultLayer,
 ).pipe(Layer.provideMerge(infra))
+const deps = Layer.mergeAll(LLM.defaultLayer, depsWithoutLLM)
 const env = Layer.mergeAll(
   TestLLMServer.layer,
   SessionProcessor.layer.pipe(
@@ -204,6 +206,57 @@ const boot = Effect.fn("test.boot")(function* () {
   return { processors, session, provider }
 })
 
+const basicUsage = () => new Usage({ inputTokens: 1, outputTokens: 1, totalTokens: 2 })
+
+function assistantSuccessStream(text: string) {
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id: "txt-0" }),
+    LLMEvent.textDelta({ id: "txt-0", text }),
+    LLMEvent.textEnd({ id: "txt-0" }),
+    LLMEvent.stepFinish({ index: 0, reason: "stop", usage: basicUsage() }),
+    LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
+  )
+}
+
+function abortStream(...events: LLMEvent[]) {
+  return Stream.fromAsyncIterable(
+    {
+      async *[Symbol.asyncIterator]() {
+        yield* events
+        throw new DOMException("The operation was aborted.", "AbortError")
+      },
+    },
+    (error) => error,
+  )
+}
+
+function llmMock(...streams: Stream.Stream<LLMEvent, unknown>[]) {
+  let calls = 0
+  return {
+    calls: () => calls,
+    layer: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () => {
+          calls += 1
+          return streams.shift() ?? Stream.empty
+        },
+      }),
+    ),
+  }
+}
+
+function processorEnv(llmLayer: Layer.Layer<LLM.Service>) {
+  return SessionProcessor.layer.pipe(
+    Layer.provide(summary),
+    Layer.provide(Image.defaultLayer),
+    Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+
+    Layer.provideMerge(depsWithoutLLM),
+    Layer.provide(llmLayer),
+  )
+}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -565,6 +618,107 @@ it.live("session.processor effect tests retry recognized structured json errors"
         expect(handle.message.error).toBeUndefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+const unexpectedAbortLLM = llmMock(abortStream(LLMEvent.stepStart({ index: 0 })), assistantSuccessStream("after"))
+const unexpectedAbortIt = testEffect(processorEnv(unexpectedAbortLLM.layer))
+
+unexpectedAbortIt.live("session.processor effect tests retry unexpected aborts before assistant output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry abort")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry abort" }],
+          tools: {},
+        })
+
+        const parts = MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(unexpectedAbortLLM.calls()).toBe(2)
+        expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
+        expect(handle.message.error).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+const partialAbortLLM = llmMock(
+  abortStream(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.textStart({ id: "txt-0" }),
+    LLMEvent.textDelta({ id: "txt-0", text: "partial" }),
+  ),
+  assistantSuccessStream("after"),
+)
+const partialAbortIt = testEffect(processorEnv(partialAbortLLM.layer))
+
+partialAbortIt.live("session.processor effect tests do not retry unexpected aborts after text output", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "partial abort")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "partial abort" }],
+          tools: {},
+        })
+
+        const parts = MessageV2.parts(msg.id)
+
+        expect(value).toBe("stop")
+        expect(partialAbortLLM.calls()).toBe(1)
+        expect(parts.some((part) => part.type === "text" && part.text === "partial")).toBe(true)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+      }),
+    { config: cfg },
   ),
 )
 

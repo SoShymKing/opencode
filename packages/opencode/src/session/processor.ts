@@ -777,6 +777,9 @@ export const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const assistantOutputEmpty = () =>
+        MessageV2.parts(ctx.assistantMessage.id).every((part) => part.type === "step-start")
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
         ctx.needsCompaction = false
@@ -811,6 +814,10 @@ export const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                context: () => ({
+                  aborted,
+                  empty: assistantOutputEmpty(),
+                }),
                 set: (info) => {
                   // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = flags.experimentalEventSystem

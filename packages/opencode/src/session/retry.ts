@@ -10,6 +10,12 @@ export const GO_UPSELL_MESSAGE = "Free usage exceeded, subscribe to Go"
 export const GO_UPSELL_URL = "https://opencode.ai/go"
 export type RetryReason = "free_tier_limit" | "account_rate_limit" | (string & {})
 
+export type RetryContext = {
+  aborted?: boolean
+  empty?: boolean
+  attempt?: number
+}
+
 export type Retryable = {
   message: string
   action?: {
@@ -26,6 +32,7 @@ export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const RETRY_UNEXPECTED_ABORT_LIMIT = 1
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -64,9 +71,15 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
-export function retryable(error: Err, provider: string) {
+export function retryable(error: Err, provider: string, context?: RetryContext) {
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
+  if (MessageV2.AbortedError.isInstance(error)) {
+    if (context?.aborted) return undefined
+    if (context?.empty === false) return undefined
+    if ((context?.attempt ?? 1) > RETRY_UNEXPECTED_ABORT_LIMIT) return undefined
+    return { message: error.data.message }
+  }
   if (MessageV2.APIError.isInstance(error)) {
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
@@ -176,11 +189,12 @@ export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  context?: () => RetryContext
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider)
+      const retry = retryable(error, opts.provider, { ...opts.context?.(), attempt: meta.attempt })
       if (!retry) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)

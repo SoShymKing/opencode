@@ -30,6 +30,10 @@ function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
   return { name: "", data: { message } }
 }
 
+function abortedError(message = "The operation was aborted."): ReturnType<NamedError["toObject"]> {
+  return new MessageV2.AbortedError({ message }).toObject()
+}
+
 describe("session.retry.delay", () => {
   test("caps delay at 30 seconds when headers missing", () => {
     const error = apiError()
@@ -170,6 +174,38 @@ describe("session.retry.retryable", () => {
     }).toObject()
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("retries unexpected aborted errors before output starts", () => {
+    const error = abortedError()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: true })).toEqual({
+      message: "The operation was aborted.",
+    })
+  })
+
+  test("does not retry repeated unexpected aborted errors", () => {
+    const error = abortedError()
+
+    expect(
+      SessionRetry.retryable(error, retryProvider, {
+        aborted: false,
+        empty: true,
+        attempt: SessionRetry.RETRY_UNEXPECTED_ABORT_LIMIT + 1,
+      }),
+    ).toBeUndefined()
+  })
+
+  test("does not retry intentional aborts", () => {
+    const error = abortedError()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: true, empty: true })).toBeUndefined()
+  })
+
+  test("does not retry aborts after output starts", () => {
+    const error = abortedError()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: false })).toBeUndefined()
   })
 
   test("retries 500 errors even when isRetryable is false", () => {
