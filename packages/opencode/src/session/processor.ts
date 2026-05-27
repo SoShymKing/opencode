@@ -906,7 +906,7 @@ export const layer = Layer.effect(
                           phase: "post_tool_continuation",
                         })
                         return new MessageV2.PostToolContinuationTimeoutError({
-                          message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation`,
+                          message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation (retry attempt ${activity.retryAttempt})`,
                           abortSource: "post_tool_first_event_timeout",
                           phase: "post_tool_continuation",
                           retryable: true,
@@ -962,6 +962,7 @@ export const layer = Layer.effect(
                   aborted,
                   empty: assistantOutputEmpty(),
                   postToolContinuation: activity.isPostToolContinuation,
+                  subagent: streamInput.parentSessionID !== undefined,
                 }),
                 set: (info) => {
                   retryAttempt = info.attempt

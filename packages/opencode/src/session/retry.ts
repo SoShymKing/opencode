@@ -15,6 +15,7 @@ export type RetryContext = {
   empty?: boolean
   attempt?: number
   postToolContinuation?: boolean
+  subagent?: boolean
 }
 
 export type Retryable = {
@@ -35,6 +36,7 @@ export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_UNEXPECTED_ABORT_LIMIT = 1
 export const RETRY_NO_RESPONSE_LIMIT = 1
+export const RETRY_MAIN_SESSION_NO_RESPONSE_LIMIT = 10
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -96,9 +98,10 @@ export function retryable(error: Err, provider: string, context?: RetryContext) 
   ) {
     if (context?.aborted) return undefined
     if (context?.empty === false) return undefined
-    if (MessageV2.PostToolContinuationTimeoutError.isInstance(error) && context?.postToolContinuation !== true)
-      return undefined
-    if ((context?.attempt ?? 1) > RETRY_NO_RESPONSE_LIMIT) return undefined
+    const isPostToolContinuationTimeout = MessageV2.PostToolContinuationTimeoutError.isInstance(error)
+    if (isPostToolContinuationTimeout && context?.postToolContinuation !== true) return undefined
+    const limit = context?.subagent === true ? RETRY_NO_RESPONSE_LIMIT : RETRY_MAIN_SESSION_NO_RESPONSE_LIMIT
+    if ((context?.attempt ?? 1) > limit) return undefined
     return { message: error.data.message }
   }
   if (MessageV2.APIError.isInstance(error)) {
