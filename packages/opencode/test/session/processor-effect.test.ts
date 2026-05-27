@@ -243,6 +243,14 @@ function delayedFirstEventStream(delayMs: number) {
   )
 }
 
+function structuralEmptyAssistantStream() {
+  return Stream.make(
+    LLMEvent.stepStart({ index: 0 }),
+    LLMEvent.stepFinish({ index: 0, reason: "unknown", usage: new Usage({}) }),
+    LLMEvent.finish({ reason: "unknown", usage: new Usage({}) }),
+  )
+}
+
 function llmMock(...streams: Stream.Stream<LLMEvent, unknown>[]) {
   let calls = 0
   return {
@@ -871,6 +879,53 @@ emptyAssistantIt.live("session.processor effect tests classify zero-part assista
         expect(value).toBe("stop")
         expect(emptyAssistantLLM.calls()).toBe(2)
         expect(MessageV2.parts(msg.id)).toHaveLength(0)
+        expect(handle.message.error?.name).toBe("EmptyAssistantResponseError")
+      }),
+    { config: cfg },
+  ),
+)
+
+const structuralEmptyAssistantLLM = llmMock(structuralEmptyAssistantStream(), structuralEmptyAssistantStream())
+const structuralEmptyAssistantIt = testEffect(processorEnv(structuralEmptyAssistantLLM.layer))
+
+structuralEmptyAssistantIt.live("session.processor effect tests classify structural-only assistant finalization", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "empty assistant")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies MessageV2.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "empty assistant" }],
+          tools: {},
+        })
+
+        const parts = MessageV2.parts(msg.id)
+
+        expect(value).toBe("stop")
+        expect(structuralEmptyAssistantLLM.calls()).toBe(2)
+        expect(parts.every((part) => part.type === "step-start" || part.type === "step-finish")).toBe(true)
         expect(handle.message.error?.name).toBe("EmptyAssistantResponseError")
       }),
     { config: cfg },

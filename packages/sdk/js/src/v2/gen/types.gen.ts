@@ -224,6 +224,162 @@ export type MessageAbortedError = {
   name: "MessageAbortedError"
   data: {
     message: string
+    abortSource?:
+      | "user_cancel"
+      | "session_cancel"
+      | "provider_abort"
+      | "network_abort"
+      | "first_byte_timeout"
+      | "stream_idle_timeout"
+      | "post_tool_first_event_timeout"
+      | "no_visible_part_timeout"
+      | "server_restart"
+      | "client_disconnect"
+      | "unknown"
+  }
+}
+
+export type UnexpectedProviderAbortError = {
+  name: "UnexpectedProviderAbortError"
+  data: {
+    message: string
+    abortSource:
+      | "user_cancel"
+      | "session_cancel"
+      | "provider_abort"
+      | "network_abort"
+      | "first_byte_timeout"
+      | "stream_idle_timeout"
+      | "post_tool_first_event_timeout"
+      | "no_visible_part_timeout"
+      | "server_restart"
+      | "client_disconnect"
+      | "unknown"
+    phase: "model_stream" | "post_tool_continuation" | "message_finalization" | "unknown"
+    retryable: boolean
+    diagnostics?: {
+      providerID?: string
+      modelID?: string
+      sessionID?: string
+      messageID?: string
+      elapsedMs?: number
+      isPostToolContinuation?: boolean
+      retryAttempt?: number
+      firstStreamEventAt?: number
+      lastStreamEventAt?: number
+      firstVisiblePartAt?: number
+      lastVisiblePartAt?: number
+      partCount?: number
+      tokenCount?: number
+    }
+  }
+}
+
+export type PostToolContinuationTimeoutError = {
+  name: "PostToolContinuationTimeoutError"
+  data: {
+    message: string
+    abortSource:
+      | "user_cancel"
+      | "session_cancel"
+      | "provider_abort"
+      | "network_abort"
+      | "first_byte_timeout"
+      | "stream_idle_timeout"
+      | "post_tool_first_event_timeout"
+      | "no_visible_part_timeout"
+      | "server_restart"
+      | "client_disconnect"
+      | "unknown"
+    phase: "model_stream" | "post_tool_continuation" | "message_finalization" | "unknown"
+    retryable: boolean
+    diagnostics?: {
+      providerID?: string
+      modelID?: string
+      sessionID?: string
+      messageID?: string
+      elapsedMs?: number
+      isPostToolContinuation?: boolean
+      retryAttempt?: number
+      firstStreamEventAt?: number
+      lastStreamEventAt?: number
+      firstVisiblePartAt?: number
+      lastVisiblePartAt?: number
+      partCount?: number
+      tokenCount?: number
+    }
+  }
+}
+
+export type EmptyAssistantResponseError = {
+  name: "EmptyAssistantResponseError"
+  data: {
+    message: string
+    abortSource:
+      | "user_cancel"
+      | "session_cancel"
+      | "provider_abort"
+      | "network_abort"
+      | "first_byte_timeout"
+      | "stream_idle_timeout"
+      | "post_tool_first_event_timeout"
+      | "no_visible_part_timeout"
+      | "server_restart"
+      | "client_disconnect"
+      | "unknown"
+    phase: "model_stream" | "post_tool_continuation" | "message_finalization" | "unknown"
+    retryable: boolean
+    diagnostics?: {
+      providerID?: string
+      modelID?: string
+      sessionID?: string
+      messageID?: string
+      elapsedMs?: number
+      isPostToolContinuation?: boolean
+      retryAttempt?: number
+      firstStreamEventAt?: number
+      lastStreamEventAt?: number
+      firstVisiblePartAt?: number
+      lastVisiblePartAt?: number
+      partCount?: number
+      tokenCount?: number
+    }
+  }
+}
+
+export type NoResponseError = {
+  name: "NoResponseError"
+  data: {
+    message: string
+    abortSource:
+      | "user_cancel"
+      | "session_cancel"
+      | "provider_abort"
+      | "network_abort"
+      | "first_byte_timeout"
+      | "stream_idle_timeout"
+      | "post_tool_first_event_timeout"
+      | "no_visible_part_timeout"
+      | "server_restart"
+      | "client_disconnect"
+      | "unknown"
+    phase: "model_stream" | "post_tool_continuation" | "message_finalization" | "unknown"
+    retryable: boolean
+    diagnostics?: {
+      providerID?: string
+      modelID?: string
+      sessionID?: string
+      messageID?: string
+      elapsedMs?: number
+      isPostToolContinuation?: boolean
+      retryAttempt?: number
+      firstStreamEventAt?: number
+      lastStreamEventAt?: number
+      firstVisiblePartAt?: number
+      lastVisiblePartAt?: number
+      partCount?: number
+      tokenCount?: number
+    }
   }
 }
 
@@ -440,6 +596,10 @@ export type AssistantMessage = {
     | UnknownError
     | MessageOutputLengthError
     | MessageAbortedError
+    | UnexpectedProviderAbortError
+    | PostToolContinuationTimeoutError
+    | EmptyAssistantResponseError
+    | NoResponseError
     | StructuredOutputError
     | ContextOverflowError
     | ApiError
@@ -2604,6 +2764,10 @@ export type EventSessionError = {
       | UnknownError
       | MessageOutputLengthError
       | MessageAbortedError
+      | UnexpectedProviderAbortError
+      | PostToolContinuationTimeoutError
+      | EmptyAssistantResponseError
+      | NoResponseError
       | StructuredOutputError
       | ContextOverflowError
       | ApiError

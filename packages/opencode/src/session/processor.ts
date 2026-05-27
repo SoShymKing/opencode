@@ -30,7 +30,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
-export const POST_TOOL_FIRST_EVENT_TIMEOUT_MS = 10_000
+export const POST_TOOL_FIRST_EVENT_TIMEOUT_MS = 100_000
 const log = Log.create({ service: "session.processor" })
 
 export type Result = "compact" | "stop" | "continue"
@@ -853,8 +853,7 @@ export const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const assistantOutputEmpty = () =>
-        MessageV2.parts(ctx.assistantMessage.id).every((part) => part.type === "step-start")
+      const assistantOutputEmpty = () => MessageV2.parts(ctx.assistantMessage.id).every(isStructuralAssistantPart)
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
@@ -923,7 +922,7 @@ export const layer = Layer.effect(
 
             if (ctx.assistantMessage.role === "assistant") {
               const parts = MessageV2.parts(ctx.assistantMessage.id)
-              const noParts = parts.length === 0 || parts.every((part) => part.type === "step-start")
+              const noParts = isEmptyAssistantOutput(parts)
               const noTokens = activity.tokenCount === 0 && ctx.assistantMessage.tokens.output === 0
               if (noParts && noTokens) {
                 slog.warn("model.no_response.zero_part_assistant_turn", {
@@ -1042,5 +1041,16 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(EventV2Bridge.defaultLayer),
   ),
 )
+
+function isEmptyAssistantOutput(parts: MessageV2.Part[]) {
+  if (parts.length === 0) return true
+  if (parts.every((part) => part.type === "step-start")) return true
+  if (!parts.every(isStructuralAssistantPart)) return false
+  return parts.some((part) => part.type === "step-finish") && parts.every((part) => part.type !== "step-finish" || part.reason === "unknown")
+}
+
+function isStructuralAssistantPart(part: MessageV2.Part) {
+  return part.type === "step-start" || part.type === "step-finish"
+}
 
 export * as SessionProcessor from "./processor"
