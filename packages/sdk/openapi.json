@@ -11165,9 +11165,421 @@
             "properties": {
               "message": {
                 "type": "string"
+              },
+              "abortSource": {
+                "type": "string",
+                "enum": [
+                  "user_cancel",
+                  "session_cancel",
+                  "provider_abort",
+                  "network_abort",
+                  "first_byte_timeout",
+                  "stream_idle_timeout",
+                  "post_tool_first_event_timeout",
+                  "no_visible_part_timeout",
+                  "server_restart",
+                  "client_disconnect",
+                  "unknown"
+                ]
               }
             },
             "required": ["message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
+      "UnexpectedProviderAbortError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["UnexpectedProviderAbortError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "abortSource": {
+                "type": "string",
+                "enum": [
+                  "user_cancel",
+                  "session_cancel",
+                  "provider_abort",
+                  "network_abort",
+                  "first_byte_timeout",
+                  "stream_idle_timeout",
+                  "post_tool_first_event_timeout",
+                  "no_visible_part_timeout",
+                  "server_restart",
+                  "client_disconnect",
+                  "unknown"
+                ]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["model_stream", "post_tool_continuation", "message_finalization", "unknown"]
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "diagnostics": {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "modelID": {
+                    "type": "string"
+                  },
+                  "sessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
+                  "messageID": {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  "elapsedMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "isPostToolContinuation": {
+                    "type": "boolean"
+                  },
+                  "retryAttempt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "partCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "tokenCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["message", "abortSource", "phase", "retryable"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
+      "PostToolContinuationTimeoutError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["PostToolContinuationTimeoutError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "abortSource": {
+                "type": "string",
+                "enum": [
+                  "user_cancel",
+                  "session_cancel",
+                  "provider_abort",
+                  "network_abort",
+                  "first_byte_timeout",
+                  "stream_idle_timeout",
+                  "post_tool_first_event_timeout",
+                  "no_visible_part_timeout",
+                  "server_restart",
+                  "client_disconnect",
+                  "unknown"
+                ]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["model_stream", "post_tool_continuation", "message_finalization", "unknown"]
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "diagnostics": {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "modelID": {
+                    "type": "string"
+                  },
+                  "sessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
+                  "messageID": {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  "elapsedMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "isPostToolContinuation": {
+                    "type": "boolean"
+                  },
+                  "retryAttempt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "partCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "tokenCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["message", "abortSource", "phase", "retryable"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
+      "EmptyAssistantResponseError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["EmptyAssistantResponseError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "abortSource": {
+                "type": "string",
+                "enum": [
+                  "user_cancel",
+                  "session_cancel",
+                  "provider_abort",
+                  "network_abort",
+                  "first_byte_timeout",
+                  "stream_idle_timeout",
+                  "post_tool_first_event_timeout",
+                  "no_visible_part_timeout",
+                  "server_restart",
+                  "client_disconnect",
+                  "unknown"
+                ]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["model_stream", "post_tool_continuation", "message_finalization", "unknown"]
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "diagnostics": {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "modelID": {
+                    "type": "string"
+                  },
+                  "sessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
+                  "messageID": {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  "elapsedMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "isPostToolContinuation": {
+                    "type": "boolean"
+                  },
+                  "retryAttempt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "partCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "tokenCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["message", "abortSource", "phase", "retryable"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["name", "data"],
+        "additionalProperties": false
+      },
+      "NoResponseError": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["NoResponseError"]
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "abortSource": {
+                "type": "string",
+                "enum": [
+                  "user_cancel",
+                  "session_cancel",
+                  "provider_abort",
+                  "network_abort",
+                  "first_byte_timeout",
+                  "stream_idle_timeout",
+                  "post_tool_first_event_timeout",
+                  "no_visible_part_timeout",
+                  "server_restart",
+                  "client_disconnect",
+                  "unknown"
+                ]
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["model_stream", "post_tool_continuation", "message_finalization", "unknown"]
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "diagnostics": {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "modelID": {
+                    "type": "string"
+                  },
+                  "sessionID": {
+                    "type": "string",
+                    "pattern": "^ses"
+                  },
+                  "messageID": {
+                    "type": "string",
+                    "pattern": "^msg"
+                  },
+                  "elapsedMs": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "isPostToolContinuation": {
+                    "type": "boolean"
+                  },
+                  "retryAttempt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastStreamEventAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "firstVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "lastVisiblePartAt": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "partCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "tokenCount": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["message", "abortSource", "phase", "retryable"],
             "additionalProperties": false
           }
         },
@@ -11751,6 +12163,18 @@
               },
               {
                 "$ref": "#/components/schemas/MessageAbortedError"
+              },
+              {
+                "$ref": "#/components/schemas/UnexpectedProviderAbortError"
+              },
+              {
+                "$ref": "#/components/schemas/PostToolContinuationTimeoutError"
+              },
+              {
+                "$ref": "#/components/schemas/EmptyAssistantResponseError"
+              },
+              {
+                "$ref": "#/components/schemas/NoResponseError"
               },
               {
                 "$ref": "#/components/schemas/StructuredOutputError"
@@ -18405,6 +18829,18 @@
                   },
                   {
                     "$ref": "#/components/schemas/MessageAbortedError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/UnexpectedProviderAbortError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PostToolContinuationTimeoutError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EmptyAssistantResponseError"
+                  },
+                  {
+                    "$ref": "#/components/schemas/NoResponseError"
                   },
                   {
                     "$ref": "#/components/schemas/StructuredOutputError"

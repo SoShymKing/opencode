@@ -43,6 +43,10 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  internal?: {
+    postToolContinuation?: boolean
+    postToolFirstEventTimeoutMs?: number
+  }
 }
 
 export type StreamRequest = StreamInput & {

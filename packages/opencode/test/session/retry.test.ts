@@ -34,6 +34,15 @@ function abortedError(message = "The operation was aborted."): ReturnType<NamedE
   return new MessageV2.AbortedError({ message }).toObject()
 }
 
+function unexpectedProviderAbortError(message = "The operation was aborted."): ReturnType<NamedError["toObject"]> {
+  return new MessageV2.UnexpectedProviderAbortError({
+    message,
+    abortSource: "provider_abort",
+    phase: "model_stream",
+    retryable: true,
+  }).toObject()
+}
+
 describe("session.retry.delay", () => {
   test("caps delay at 30 seconds when headers missing", () => {
     const error = apiError()
@@ -202,10 +211,130 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider, { aborted: true, empty: true })).toBeUndefined()
   })
 
+  test("does not retry aborts with user provenance", () => {
+    const error = new MessageV2.AbortedError({ message: "Aborted", abortSource: "user_cancel" }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: true })).toBeUndefined()
+  })
+
+  test("retries unexpected provider aborts before output starts", () => {
+    const error = unexpectedProviderAbortError()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: true })).toEqual({
+      message: "The operation was aborted.",
+    })
+  })
+
   test("does not retry aborts after output starts", () => {
     const error = abortedError()
 
     expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: false })).toBeUndefined()
+  })
+
+  test("does not retry explicit user-cancel aborted errors", () => {
+    const error = new MessageV2.AbortedError({
+      message: "Aborted",
+      abortSource: "user_cancel",
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: true, empty: true })).toBeUndefined()
+  })
+
+  test("main sessions retry no-response errors up to ten attempts", () => {
+    const errors = [
+      new MessageV2.PostToolContinuationTimeoutError({
+        message: "No stream event",
+        abortSource: "post_tool_first_event_timeout",
+        phase: "post_tool_continuation",
+        retryable: true,
+      }).toObject(),
+      new MessageV2.EmptyAssistantResponseError({
+        message: "Assistant stream ended without content",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject(),
+      new MessageV2.NoResponseError({
+        message: "Provider returned no response",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject(),
+    ]
+
+    for (const error of errors) {
+      expect(
+        SessionRetry.retryable(error, retryProvider, {
+          aborted: false,
+          empty: true,
+          postToolContinuation: true,
+          attempt: 10,
+        }),
+      ).toEqual({ message: error.data.message })
+      expect(
+        SessionRetry.retryable(error, retryProvider, {
+          aborted: false,
+          empty: true,
+          postToolContinuation: true,
+          attempt: 11,
+        }),
+      ).toBeUndefined()
+    }
+  })
+
+  test("subagent sessions retry no-response errors once", () => {
+    const errors = [
+      new MessageV2.PostToolContinuationTimeoutError({
+        message: "No stream event",
+        abortSource: "post_tool_first_event_timeout",
+        phase: "post_tool_continuation",
+        retryable: true,
+      }).toObject(),
+      new MessageV2.EmptyAssistantResponseError({
+        message: "Assistant stream ended without content",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject(),
+      new MessageV2.NoResponseError({
+        message: "Provider returned no response",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject(),
+    ]
+
+    for (const error of errors) {
+      expect(
+        SessionRetry.retryable(error, retryProvider, {
+          aborted: false,
+          empty: true,
+          postToolContinuation: true,
+          subagent: true,
+          attempt: 1,
+        }),
+      ).toEqual({ message: error.data.message })
+      expect(
+        SessionRetry.retryable(error, retryProvider, {
+          aborted: false,
+          empty: true,
+          postToolContinuation: true,
+          subagent: true,
+          attempt: 2,
+        }),
+      ).toBeUndefined()
+    }
+  })
+
+  test("does not retry post-tool timeout outside post-tool continuation", () => {
+    const error = new MessageV2.PostToolContinuationTimeoutError({
+      message: "No stream event",
+      abortSource: "post_tool_first_event_timeout",
+      phase: "post_tool_continuation",
+      retryable: true,
+    }).toObject()
+
+    expect(SessionRetry.retryable(error, retryProvider, { aborted: false, empty: true, postToolContinuation: false })).toBeUndefined()
   })
 
   test("retries 500 errors even when isRetryable is false", () => {
