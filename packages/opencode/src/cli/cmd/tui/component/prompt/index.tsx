@@ -370,6 +370,7 @@ export function Prompt(props: PromptProps) {
     extmarkToPartIndex: new Map(),
     interrupt: 0,
   })
+  let abortingSessionID: string | undefined
 
   createEffect(
     on(
@@ -479,17 +480,29 @@ export function Prompt(props: PromptProps) {
           if (!props.sessionID) return
           const sessionID = props.sessionID
 
-          setStore("interrupt", store.interrupt + 1)
+          const nextInterrupt = store.interrupt + 1
+          setStore("interrupt", nextInterrupt)
 
           setTimeout(() => {
             setStore("interrupt", 0)
           }, 5000)
 
-          if (store.interrupt >= 2) {
+          if (nextInterrupt >= 2) {
+            setStore("interrupt", 0)
+            if (abortingSessionID === sessionID) {
+              log.info("abort already in flight", {
+                sessionID,
+                status: status().type,
+                interrupt: nextInterrupt,
+              })
+              dialog.clear()
+              return
+            }
+            abortingSessionID = sessionID
             log.info("abort requested", {
               sessionID,
               status: status().type,
-              interrupt: store.interrupt,
+              interrupt: nextInterrupt,
             })
             void sdk.client.session
               .abort({
@@ -514,9 +527,14 @@ export function Prompt(props: PromptProps) {
                   sessionID,
                   error: errorMessage(error),
                 })
-                throw error
+                toast.show({
+                  message: "Interrupt request failed",
+                  variant: "error",
+                })
               })
-            setStore("interrupt", 0)
+              .finally(() => {
+                if (abortingSessionID === sessionID) abortingSessionID = undefined
+              })
           }
           dialog.clear()
         },
