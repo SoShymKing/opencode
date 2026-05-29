@@ -13,6 +13,7 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { errorMessage } from "@/util/error"
 
 ensureProcessMetadata("worker")
 
@@ -45,25 +46,69 @@ GlobalBus.on("event", (event) => {
 })
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
+const log = Log.create({ service: "tui.worker" })
+
+function abortSessionID(pathname: string) {
+  return /^\/session\/([^/]+)\/abort$/.exec(pathname)?.[1]
+}
 
 export const rpc = {
-  async fetch(input: { url: string; method: string; headers: Record<string, string>; body?: string }) {
+  async fetch(input: { requestID?: string; url: string; method: string; headers: Record<string, string>; body?: string }) {
     const headers = { ...input.headers }
     const auth = ServerAuth.header()
     if (auth && !headers["authorization"] && !headers["Authorization"]) {
       headers["Authorization"] = auth
+    }
+    const url = new URL(input.url)
+    const sessionID = abortSessionID(url.pathname)
+    const started = Date.now()
+    if (sessionID) {
+      log.info("fetch received", {
+        requestID: input.requestID,
+        sessionID,
+        method: input.method,
+        pathname: url.pathname,
+        hasAuthorization: Boolean(headers.authorization || headers.Authorization),
+        hasBody: input.body !== undefined,
+        bodyLength: input.body?.length ?? 0,
+      })
     }
     const request = new Request(input.url, {
       method: input.method,
       headers,
       body: input.body,
     })
-    const response = await Server.Default().app.fetch(request)
-    const body = await response.text()
-    return {
-      status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body,
+    try {
+      const response = await Server.Default().app.fetch(request)
+      const body = await response.text()
+      if (sessionID) {
+        log.info("fetch response", {
+          requestID: input.requestID,
+          sessionID,
+          method: input.method,
+          pathname: url.pathname,
+          status: response.status,
+          bodyLength: body.length,
+          elapsed: Date.now() - started,
+        })
+      }
+      return {
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        body,
+      }
+    } catch (error) {
+      if (sessionID) {
+        log.warn("fetch failed", {
+          requestID: input.requestID,
+          sessionID,
+          method: input.method,
+          pathname: url.pathname,
+          error: errorMessage(error),
+          elapsed: Date.now() - started,
+        })
+      }
+      throw error
     }
   },
   snapshot() {

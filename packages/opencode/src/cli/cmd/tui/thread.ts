@@ -26,22 +26,81 @@ declare global {
   const OPENCODE_WORKER_PATH: string
 }
 
+type WorkerFetchInput = Parameters<typeof rpc.fetch>[0]
+type WorkerFetchOutput = Awaited<ReturnType<typeof rpc.fetch>>
+type WorkerFetchCallOutput = WorkerFetchOutput | Promise<WorkerFetchOutput>
+type WorkerFetchClient = {
+  call(method: "fetch", input: WorkerFetchInput): Promise<WorkerFetchCallOutput>
+}
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
+const ABORT_FETCH_TIMEOUT = 3000
+const log = Log.create({ service: "tui.thread" })
 
-function createWorkerFetch(client: RpcClient): typeof fetch {
+function abortSessionID(pathname: string) {
+  return /^\/session\/([^/]+)\/abort$/.exec(pathname)?.[1]
+}
+
+export function createWorkerFetch(client: WorkerFetchClient, options: { abortTimeout?: number } = {}): typeof fetch {
+  let requestCount = 0
+  const abortTimeout = options.abortTimeout ?? ABORT_FETCH_TIMEOUT
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
+    const url = new URL(request.url)
+    const sessionID = abortSessionID(url.pathname)
+    const requestID = sessionID ? `abort-${requestCount++}` : undefined
+    const started = Date.now()
     const body = request.body ? await request.text() : undefined
-    const result = await client.call("fetch", {
-      url: request.url,
-      method: request.method,
-      headers: Object.fromEntries(request.headers.entries()),
-      body,
-    })
-    return new Response(result.body, {
-      status: result.status,
-      headers: result.headers,
-    })
+    if (sessionID) {
+      log.info("worker fetch request", {
+        requestID,
+        sessionID,
+        method: request.method,
+        pathname: url.pathname,
+        hasBody: body !== undefined,
+        bodyLength: body?.length ?? 0,
+        timeout: abortTimeout,
+      })
+    }
+    try {
+      const response = client.call("fetch", {
+        requestID,
+        url: request.url,
+        method: request.method,
+        headers: Object.fromEntries(request.headers.entries()),
+        body,
+      })
+      const result = await (sessionID
+        ? withTimeout(response, abortTimeout, `Abort request timed out after ${abortTimeout}ms`)
+        : response)
+      if (sessionID) {
+        log.info("worker fetch response", {
+          requestID,
+          sessionID,
+          method: request.method,
+          pathname: url.pathname,
+          status: result.status,
+          bodyLength: result.body.length,
+          elapsed: Date.now() - started,
+        })
+      }
+      return new Response(result.body, {
+        status: result.status,
+        headers: result.headers,
+      })
+    } catch (error) {
+      if (sessionID) {
+        log.warn("worker fetch failed", {
+          requestID,
+          sessionID,
+          method: request.method,
+          pathname: url.pathname,
+          error: errorMessage(error),
+          elapsed: Date.now() - started,
+          timeout: abortTimeout,
+        })
+      }
+      throw error
+    }
   }
   return fn as typeof fetch
 }
