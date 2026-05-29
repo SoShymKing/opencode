@@ -27,21 +27,67 @@ declare global {
 }
 
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
+const log = Log.create({ service: "tui.thread" })
+
+function abortSessionID(pathname: string) {
+  return /^\/session\/([^/]+)\/abort$/.exec(pathname)?.[1]
+}
 
 function createWorkerFetch(client: RpcClient): typeof fetch {
+  let requestCount = 0
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
+    const url = new URL(request.url)
+    const sessionID = abortSessionID(url.pathname)
+    const requestID = sessionID ? `abort-${requestCount++}` : undefined
+    const started = Date.now()
     const body = request.body ? await request.text() : undefined
-    const result = await client.call("fetch", {
-      url: request.url,
-      method: request.method,
-      headers: Object.fromEntries(request.headers.entries()),
-      body,
-    })
-    return new Response(result.body, {
-      status: result.status,
-      headers: result.headers,
-    })
+    if (sessionID) {
+      log.info("worker fetch request", {
+        requestID,
+        sessionID,
+        method: request.method,
+        pathname: url.pathname,
+        hasBody: body !== undefined,
+        bodyLength: body?.length ?? 0,
+      })
+    }
+    try {
+      const result = await client.call("fetch", {
+        requestID,
+        url: request.url,
+        method: request.method,
+        headers: Object.fromEntries(request.headers.entries()),
+        body,
+      })
+      if (sessionID) {
+        log.info("worker fetch response", {
+          requestID,
+          sessionID,
+          method: request.method,
+          pathname: url.pathname,
+          status: result.status,
+          bodyLength: result.body.length,
+          elapsed: Date.now() - started,
+        })
+      }
+      return new Response(result.body, {
+        status: result.status,
+        headers: result.headers,
+      })
+    } catch (error) {
+      if (sessionID) {
+        log.warn("worker fetch failed", {
+          requestID,
+          sessionID,
+          method: request.method,
+          pathname: url.pathname,
+          error: errorMessage(error),
+          elapsed: Date.now() - started,
+        })
+      }
+      throw error
+    }
   }
   return fn as typeof fetch
 }

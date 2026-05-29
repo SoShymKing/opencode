@@ -37,10 +37,12 @@ import * as Editor from "@tui/util/editor"
 import { useExit } from "../../context/exit"
 import * as Clipboard from "../../util/clipboard"
 import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v2"
+import * as Log from "@opencode-ai/core/util/log"
 import { TuiEvent } from "../../event"
 import { iife } from "@/util/iife"
 import { Locale } from "@/util/locale"
 import { formatDuration } from "@/util/format"
+import { errorMessage } from "@/util/error"
 import { createColors, createFrames } from "../../ui/spinner.ts"
 import { useDialog } from "@tui/ui/dialog"
 import { DialogProvider as DialogProviderConnect } from "../dialog-provider"
@@ -93,6 +95,7 @@ const money = new Intl.NumberFormat("en-US", {
 })
 
 const DRAFT_RETENTION_MIN_CHARS = 20
+const log = Log.create({ service: "tui.prompt" })
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -474,6 +477,7 @@ export function Prompt(props: PromptProps) {
             return
           }
           if (!props.sessionID) return
+          const sessionID = props.sessionID
 
           setStore("interrupt", store.interrupt + 1)
 
@@ -482,9 +486,36 @@ export function Prompt(props: PromptProps) {
           }, 5000)
 
           if (store.interrupt >= 2) {
-            void sdk.client.session.abort({
-              sessionID: props.sessionID,
+            log.info("abort requested", {
+              sessionID,
+              status: status().type,
+              interrupt: store.interrupt,
             })
+            void sdk.client.session
+              .abort({
+                sessionID,
+              })
+              .then((result) => {
+                if (result.error) {
+                  log.warn("abort response error", {
+                    sessionID,
+                    status: result.response?.status,
+                    error: errorMessage(result.error),
+                  })
+                  return
+                }
+                log.info("abort response", {
+                  sessionID,
+                  status: result.response.status,
+                })
+              })
+              .catch((error) => {
+                log.warn("abort failed", {
+                  sessionID,
+                  error: errorMessage(error),
+                })
+                throw error
+              })
             setStore("interrupt", 0)
           }
           dialog.clear()
