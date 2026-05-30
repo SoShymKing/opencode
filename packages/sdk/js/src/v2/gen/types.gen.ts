@@ -77,6 +77,7 @@ export type Event =
   | EventSessionNextCompactionStarted
   | EventSessionNextCompactionDelta
   | EventSessionNextCompactionEnded
+  | EventPluginAdded
   | EventCatalogModelUpdated
   | EventModelsDevRefreshed
   | EventAccountAdded
@@ -1038,6 +1039,7 @@ export type GlobalEvent = {
     | EventSessionNextCompactionStarted
     | EventSessionNextCompactionDelta
     | EventSessionNextCompactionEnded
+    | EventPluginAdded
     | EventCatalogModelUpdated
     | EventModelsDevRefreshed
     | EventAccountAdded
@@ -1209,11 +1211,15 @@ export type ProviderConfig = {
     enterpriseUrl?: string
     setCacheKey?: boolean
     /**
-     * Timeout in milliseconds for requests to this provider. Default is 300000 (5 minutes). Set to false to disable timeout.
+     * Timeout in milliseconds for full requests to this provider. Set to false to disable timeout.
      */
     timeout?: number | false
+    /**
+     * Timeout in milliseconds to wait for response headers. Provider integrations may set defaults. Set to false to disable timeout.
+     */
+    headerTimeout?: number | false
     chunkTimeout?: number
-    [key: string]: unknown | string | boolean | number | false | number | undefined
+    [key: string]: unknown | string | boolean | number | false | number | false | number | undefined
   }
   models?: {
     [key: string]: {
@@ -1472,6 +1478,7 @@ export type Config = {
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
+    policies?: Array<ConfigV2ExperimentalPolicy>
   }
 }
 
@@ -2116,6 +2123,13 @@ export type Workspace = {
   timeUsed: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
+export type WorkspaceCreateError = {
+  name: "WorkspaceCreateError"
+  data: {
+    message: string
+  }
+}
+
 export type WorkspaceWarpError = {
   name: "WorkspaceWarpError"
   data: {
@@ -2286,7 +2300,7 @@ export type SyncEventSessionNextModelSwitched = {
     model: {
       id: string
       providerID: string
-      variant: string
+      variant?: string
     }
   }
 }
@@ -2358,7 +2372,7 @@ export type SyncEventSessionNextStepStarted = {
     model: {
       id: string
       providerID: string
-      variant: string
+      variant?: string
     }
     snapshot?: string
   }
@@ -3043,7 +3057,7 @@ export type EventSessionNextModelSwitched = {
     model: {
       id: string
       providerID: string
-      variant: string
+      variant?: string
     }
   }
 }
@@ -3131,7 +3145,7 @@ export type EventSessionNextStepStarted = {
     model: {
       id: string
       providerID: string
-      variant: string
+      variant?: string
     }
     snapshot?: string
   }
@@ -3405,6 +3419,14 @@ export type EventSessionNextCompactionEnded = {
   }
 }
 
+export type EventPluginAdded = {
+  id: string
+  type: "plugin.added"
+  properties: {
+    id: string
+  }
+}
+
 export type ModelV2Info = {
   id: string
   apiID: string
@@ -3569,6 +3591,14 @@ export type EventAccountSwitched = {
   }
 }
 
+export type PolicyEffect = "allow" | "deny"
+
+export type ConfigV2ExperimentalPolicy = {
+  action: "provider.use"
+  effect: PolicyEffect
+  resource: string
+}
+
 export type SessionInfo = {
   id: string
   parentID?: string
@@ -3579,7 +3609,7 @@ export type SessionInfo = {
   model?: {
     id: string
     providerID: string
-    variant: string
+    variant?: string
   }
   cost: number
   tokens: {
@@ -3625,7 +3655,7 @@ export type SessionMessageModelSwitched = {
   model: {
     id: string
     providerID: string
-    variant: string
+    variant?: string
   }
 }
 
@@ -3760,7 +3790,7 @@ export type SessionMessageAssistant = {
   model: {
     id: string
     providerID: string
-    variant: string
+    variant?: string
   }
   content: Array<SessionMessageAssistantText | SessionMessageAssistantReasoning | SessionMessageAssistantTool>
   snapshot?: {
@@ -8202,9 +8232,9 @@ export type ExperimentalWorkspaceCreateData = {
 
 export type ExperimentalWorkspaceCreateErrors = {
   /**
-   * BadRequest | InvalidRequestError
+   * WorkspaceCreateError | BadRequest | InvalidRequestError
    */
-  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  400: WorkspaceCreateError | EffectHttpApiErrorBadRequest | InvalidRequestError
 }
 
 export type ExperimentalWorkspaceCreateError =
@@ -8360,6 +8390,8 @@ export type PtyConnectData = {
   query?: {
     directory?: string
     workspace?: string
+    cursor?: string
+    ticket?: string
   }
   url: "/pty/{ptyID}/connect"
 }
