@@ -96,6 +96,18 @@ const money = new Intl.NumberFormat("en-US", {
 
 const DRAFT_RETENTION_MIN_CHARS = 20
 const log = Log.create({ service: "tui.prompt" })
+const INTERRUPT_TIMEOUT_PREFIX = "Abort request timed out after"
+
+function isInterruptTimeoutError(error: unknown) {
+  return errorMessage(error).startsWith(INTERRUPT_TIMEOUT_PREFIX)
+}
+
+function interruptFailedMessage(error: unknown) {
+  if (isInterruptTimeoutError(error)) {
+    return "Interrupt timed out before reaching the worker. TUI worker was restarted. Press Esc twice again if still busy."
+  }
+  return "Interrupt request failed"
+}
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -515,6 +527,10 @@ export function Prompt(props: PromptProps) {
                     status: result.response?.status,
                     error: errorMessage(result.error),
                   })
+                  toast.show({
+                    message: interruptFailedMessage(result.error),
+                    variant: "error",
+                  })
                   return
                 }
                 log.info("abort response", {
@@ -528,7 +544,7 @@ export function Prompt(props: PromptProps) {
                   error: errorMessage(error),
                 })
                 toast.show({
-                  message: "Interrupt request failed",
+                  message: interruptFailedMessage(error),
                   variant: "error",
                 })
               })

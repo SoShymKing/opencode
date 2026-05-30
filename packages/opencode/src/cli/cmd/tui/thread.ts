@@ -32,6 +32,12 @@ type WorkerFetchCallOutput = WorkerFetchOutput | Promise<WorkerFetchOutput>
 type WorkerFetchClient = {
   call(method: "fetch", input: WorkerFetchInput): Promise<WorkerFetchCallOutput>
 }
+type WorkerFetchClientInput = WorkerFetchClient | (() => WorkerFetchClient)
+type AbortTimeoutInput = { sessionID: string; requestID?: string; error: unknown }
+type WorkerFetchOptions = {
+  abortTimeout?: number
+  onAbortTimeout?: (input: AbortTimeoutInput) => void | Promise<void>
+}
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
 const ABORT_FETCH_TIMEOUT = 3000
 const log = Log.create({ service: "tui.thread" })
@@ -40,9 +46,18 @@ function abortSessionID(pathname: string) {
   return /^\/session\/([^/]+)\/abort$/.exec(pathname)?.[1]
 }
 
-export function createWorkerFetch(client: WorkerFetchClient, options: { abortTimeout?: number } = {}): typeof fetch {
+function abortTimeoutMessage(abortTimeout: number) {
+  return `Abort request timed out after ${abortTimeout}ms`
+}
+
+function workerFetchClient(client: WorkerFetchClientInput) {
+  return typeof client === "function" ? client() : client
+}
+
+export function createWorkerFetch(client: WorkerFetchClientInput, options: WorkerFetchOptions = {}): typeof fetch {
   let requestCount = 0
   const abortTimeout = options.abortTimeout ?? ABORT_FETCH_TIMEOUT
+  const timeoutMessage = abortTimeoutMessage(abortTimeout)
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
     const url = new URL(request.url)
@@ -62,16 +77,14 @@ export function createWorkerFetch(client: WorkerFetchClient, options: { abortTim
       })
     }
     try {
-      const response = client.call("fetch", {
+      const response = workerFetchClient(client).call("fetch", {
         requestID,
         url: request.url,
         method: request.method,
         headers: Object.fromEntries(request.headers.entries()),
         body,
       })
-      const result = await (sessionID
-        ? withTimeout(response, abortTimeout, `Abort request timed out after ${abortTimeout}ms`)
-        : response)
+      const result = await (sessionID ? withTimeout(response, abortTimeout, timeoutMessage) : response)
       if (sessionID) {
         log.info("worker fetch response", {
           requestID,
@@ -88,15 +101,25 @@ export function createWorkerFetch(client: WorkerFetchClient, options: { abortTim
         headers: result.headers,
       })
     } catch (error) {
+      const message = errorMessage(error)
       if (sessionID) {
         log.warn("worker fetch failed", {
           requestID,
           sessionID,
           method: request.method,
           pathname: url.pathname,
-          error: errorMessage(error),
+          error: message,
           elapsed: Date.now() - started,
           timeout: abortTimeout,
+        })
+      }
+      if (sessionID && message === timeoutMessage) {
+        await Promise.resolve(options.onAbortTimeout?.({ sessionID, requestID, error })).catch((restartError) => {
+          log.warn("worker restart after abort timeout failed", {
+            requestID,
+            sessionID,
+            error: errorMessage(restartError),
+          })
         })
       }
       throw error
@@ -105,12 +128,25 @@ export function createWorkerFetch(client: WorkerFetchClient, options: { abortTim
   return fn as typeof fetch
 }
 
-function createEventSource(client: RpcClient): EventSource {
+function createEventSource(
+  client: () => RpcClient,
+  onRestart: (handler: () => void) => () => void,
+): EventSource {
   return {
     subscribe: async (handler) => {
-      return client.on<GlobalEvent>("global.event", (e) => {
+      let unsubscribeEvent = client().on<GlobalEvent>("global.event", (e) => {
         handler(e)
       })
+      const unsubscribeRestart = onRestart(() => {
+        unsubscribeEvent()
+        unsubscribeEvent = client().on<GlobalEvent>("global.event", (e) => {
+          handler(e)
+        })
+      })
+      return () => {
+        unsubscribeRestart()
+        unsubscribeEvent()
+      }
     },
   }
 }
@@ -202,25 +238,59 @@ export const TuiThreadCommand = cmd({
         [OPENCODE_RUN_ID]: ensureRunID(),
       })
 
-      const worker = new Worker(file, {
-        env,
-      })
-      worker.onerror = (e) => {
-        Log.Default.error("thread error", {
-          message: e.message,
-          filename: e.filename,
-          lineno: e.lineno,
-          colno: e.colno,
-          error: e.error,
-        })
+      function startWorker() {
+        const worker = new Worker(file, { env })
+        worker.onerror = (e) => {
+          Log.Default.error("thread error", {
+            message: e.message,
+            filename: e.filename,
+            lineno: e.lineno,
+            colno: e.colno,
+            error: e.error,
+          })
+        }
+        return { worker, client: Rpc.client<typeof rpc>(worker) }
       }
 
-      const client = Rpc.client<typeof rpc>(worker)
+      const restartListeners = new Set<() => void>()
+      let current = startWorker()
+      let stopped = false
+      let restarting: Promise<void> | undefined
+      const currentClient = () => current.client
+      const onWorkerRestart = (handler: () => void) => {
+        restartListeners.add(handler)
+        return () => {
+          restartListeners.delete(handler)
+        }
+      }
+      const restartWorker = async (input: AbortTimeoutInput) => {
+        if (stopped) return
+        if (restarting) return restarting
+        restarting = (async () => {
+          const previous = current
+          log.warn("abort timeout reached before worker fetch, restarting worker", {
+            requestID: input.requestID,
+            sessionID: input.sessionID,
+            error: errorMessage(input.error),
+          })
+          current = startWorker()
+          for (const listener of restartListeners) listener()
+          previous.worker.terminate()
+          log.info("worker restarted after abort timeout", {
+            requestID: input.requestID,
+            sessionID: input.sessionID,
+          })
+        })().finally(() => {
+          restarting = undefined
+        })
+        return restarting
+      }
+
       const error = (e: unknown) => {
         Log.Default.error("process error", { error: errorMessage(e) })
       }
       const reload = () => {
-        client.call("reload", undefined).catch((err) => {
+        currentClient().call("reload", undefined).catch((err) => {
           Log.Default.warn("worker reload failed", {
             error: errorMessage(err),
           })
@@ -230,19 +300,19 @@ export const TuiThreadCommand = cmd({
       process.on("unhandledRejection", error)
       process.on("SIGUSR2", reload)
 
-      let stopped = false
       const stop = async () => {
         if (stopped) return
         stopped = true
         process.off("uncaughtException", error)
         process.off("unhandledRejection", error)
         process.off("SIGUSR2", reload)
-        await withTimeout(client.call("shutdown", undefined), 5000).catch((error) => {
+        const active = current
+        await withTimeout(active.client.call("shutdown", undefined), 5000).catch((error) => {
           Log.Default.warn("worker shutdown failed", {
             error: errorMessage(error),
           })
         })
-        worker.terminate()
+        active.worker.terminate()
       }
 
       const prompt = await input(args.prompt)
@@ -259,14 +329,14 @@ export const TuiThreadCommand = cmd({
 
       const transport = external
         ? {
-            url: (await client.call("server", network)).url,
+            url: (await currentClient().call("server", network)).url,
             fetch: undefined,
             events: undefined,
           }
         : {
             url: "http://opencode.internal",
-            fetch: createWorkerFetch(client),
-            events: createEventSource(client),
+            fetch: createWorkerFetch(currentClient, { onAbortTimeout: restartWorker }),
+            events: createEventSource(currentClient, onWorkerRestart),
           }
 
       try {
@@ -283,7 +353,7 @@ export const TuiThreadCommand = cmd({
       }
 
       setTimeout(() => {
-        client.call("checkUpgrade", { directory: cwd }).catch(() => {})
+        currentClient().call("checkUpgrade", { directory: cwd }).catch(() => {})
       }, 1000).unref?.()
 
       try {
@@ -292,7 +362,7 @@ export const TuiThreadCommand = cmd({
           url: transport.url,
           async onSnapshot() {
             const tui = writeHeapSnapshot("tui.heapsnapshot")
-            const server = await client.call("snapshot", undefined)
+            const server = await currentClient().call("snapshot", undefined)
             return [tui, server]
           },
           config,
@@ -317,4 +387,3 @@ export const TuiThreadCommand = cmd({
     process.exit(0)
   },
 })
-// scratch
