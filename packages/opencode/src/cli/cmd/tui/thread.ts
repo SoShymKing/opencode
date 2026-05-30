@@ -40,6 +40,7 @@ type WorkerFetchOptions = {
 }
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
 const ABORT_FETCH_TIMEOUT = 3000
+const ABORT_RETRY_HEADER = "x-opencode-abort-retried-after-worker-restart"
 const log = Log.create({ service: "tui.thread" })
 
 function abortSessionID(pathname: string) {
@@ -52,6 +53,15 @@ function abortTimeoutMessage(abortTimeout: number) {
 
 function workerFetchClient(client: WorkerFetchClientInput) {
   return typeof client === "function" ? client() : client
+}
+
+function workerFetchResponse(result: WorkerFetchOutput, retried = false) {
+  const headers = new Headers(result.headers)
+  if (retried) headers.set(ABORT_RETRY_HEADER, "true")
+  return new Response(result.body, {
+    status: result.status,
+    headers,
+  })
 }
 
 export function createWorkerFetch(client: WorkerFetchClientInput, options: WorkerFetchOptions = {}): typeof fetch {
@@ -76,14 +86,16 @@ export function createWorkerFetch(client: WorkerFetchClientInput, options: Worke
         timeout: abortTimeout,
       })
     }
+    const workerInput = {
+      requestID,
+      url: request.url,
+      method: request.method,
+      headers: Object.fromEntries(request.headers.entries()),
+      body,
+    }
+    const call = () => workerFetchClient(client).call("fetch", workerInput)
     try {
-      const response = workerFetchClient(client).call("fetch", {
-        requestID,
-        url: request.url,
-        method: request.method,
-        headers: Object.fromEntries(request.headers.entries()),
-        body,
-      })
+      const response = call()
       const result = await (sessionID ? withTimeout(response, abortTimeout, timeoutMessage) : response)
       if (sessionID) {
         log.info("worker fetch response", {
@@ -96,10 +108,7 @@ export function createWorkerFetch(client: WorkerFetchClientInput, options: Worke
           elapsed: Date.now() - started,
         })
       }
-      return new Response(result.body, {
-        status: result.status,
-        headers: result.headers,
-      })
+      return workerFetchResponse(result)
     } catch (error) {
       const message = errorMessage(error)
       if (sessionID) {
@@ -113,14 +122,35 @@ export function createWorkerFetch(client: WorkerFetchClientInput, options: Worke
           timeout: abortTimeout,
         })
       }
-      if (sessionID && message === timeoutMessage) {
-        await Promise.resolve(options.onAbortTimeout?.({ sessionID, requestID, error })).catch((restartError) => {
-          log.warn("worker restart after abort timeout failed", {
+      if (sessionID && message === timeoutMessage && options.onAbortTimeout) {
+        const retryStarted = Date.now()
+        try {
+          await options.onAbortTimeout({ sessionID, requestID, error })
+          log.info("retrying abort after worker restart", {
             requestID,
             sessionID,
-            error: errorMessage(restartError),
           })
-        })
+          const result = await withTimeout(call(), abortTimeout, timeoutMessage)
+          log.info("worker fetch retry response", {
+            requestID,
+            sessionID,
+            method: request.method,
+            pathname: url.pathname,
+            status: result.status,
+            bodyLength: result.body.length,
+            elapsed: Date.now() - retryStarted,
+            totalElapsed: Date.now() - started,
+          })
+          return workerFetchResponse(result, true)
+        } catch (retryError) {
+          log.warn("abort retry after worker restart failed", {
+            requestID,
+            sessionID,
+            error: errorMessage(retryError),
+            elapsed: Date.now() - retryStarted,
+            totalElapsed: Date.now() - started,
+          })
+        }
       }
       throw error
     }
