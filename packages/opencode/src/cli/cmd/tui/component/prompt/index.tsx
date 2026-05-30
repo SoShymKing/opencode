@@ -97,6 +97,7 @@ const money = new Intl.NumberFormat("en-US", {
 const DRAFT_RETENTION_MIN_CHARS = 20
 const log = Log.create({ service: "tui.prompt" })
 const INTERRUPT_TIMEOUT_PREFIX = "Abort request timed out after"
+const INTERRUPT_RETRY_HEADER = "x-opencode-abort-retried-after-worker-restart"
 
 function isInterruptTimeoutError(error: unknown) {
   return errorMessage(error).startsWith(INTERRUPT_TIMEOUT_PREFIX)
@@ -537,6 +538,12 @@ export function Prompt(props: PromptProps) {
                   sessionID,
                   status: result.response.status,
                 })
+                if (result.response.headers.get(INTERRUPT_RETRY_HEADER) === "true") {
+                  toast.show({
+                    message: "Worker restarted and session was interrupted.",
+                    variant: "success",
+                  })
+                }
               })
               .catch((error) => {
                 log.warn("abort failed", {

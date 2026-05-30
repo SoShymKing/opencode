@@ -39,11 +39,15 @@ describe("tui thread", () => {
     )
   })
 
-  test("calls onAbortTimeout only for session abort timeout and rethrows", async () => {
+  test("calls onAbortTimeout only once when automatic retry also times out", async () => {
     let timeoutCount = 0
+    let callCount = 0
     const fetch = createWorkerFetch(
       {
-        call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
+        call: () => {
+          callCount += 1
+          return new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {})
+        },
       },
       {
         abortTimeout: 10,
@@ -57,6 +61,7 @@ describe("tui thread", () => {
       "Abort request timed out after 10ms",
     )
     expect(timeoutCount).toBe(1)
+    expect(callCount).toBe(2)
   })
 
   test("does not apply abort timeout to other worker fetches", async () => {
@@ -80,9 +85,13 @@ describe("tui thread", () => {
     expect(timeoutCount).toBe(0)
   })
 
-  test("uses the replacement client after abort timeout recovery", async () => {
+  test("automatically retries abort with the replacement client after timeout recovery", async () => {
+    let firstAbortCalls = 0
     const firstClient = {
-      call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
+      call: () => {
+        firstAbortCalls += 1
+        return new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {})
+      },
     }
     let secondAbortCalls = 0
     const secondClient = {
@@ -99,13 +108,11 @@ describe("tui thread", () => {
       },
     })
 
-    await expect(fetch("http://opencode.internal/session/ses_test/abort", { method: "POST" })).rejects.toThrow(
-      "Abort request timed out after 10ms",
-    )
-
     const response = await fetch("http://opencode.internal/session/ses_test/abort", { method: "POST" })
     expect(response.status).toBe(200)
     expect(await response.text()).toBe("true")
+    expect(response.headers.get("x-opencode-abort-retried-after-worker-restart")).toBe("true")
+    expect(firstAbortCalls).toBe(1)
     expect(secondAbortCalls).toBe(1)
   })
 
