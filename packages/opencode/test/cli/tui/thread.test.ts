@@ -29,7 +29,7 @@ describe("tui thread", () => {
   test("times out session abort fetch when worker RPC does not respond", async () => {
     const fetch = createWorkerFetch(
       {
-        call: () => new Promise(() => {}),
+        call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
       },
       { abortTimeout: 10 },
     )
@@ -39,7 +39,28 @@ describe("tui thread", () => {
     )
   })
 
+  test("calls onAbortTimeout only for session abort timeout and rethrows", async () => {
+    let timeoutCount = 0
+    const fetch = createWorkerFetch(
+      {
+        call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
+      },
+      {
+        abortTimeout: 10,
+        onAbortTimeout: () => {
+          timeoutCount += 1
+        },
+      },
+    )
+
+    await expect(fetch("http://opencode.internal/session/ses_test/abort", { method: "POST" })).rejects.toThrow(
+      "Abort request timed out after 10ms",
+    )
+    expect(timeoutCount).toBe(1)
+  })
+
   test("does not apply abort timeout to other worker fetches", async () => {
+    let timeoutCount = 0
     const fetch = createWorkerFetch(
       {
         call: async () => {
@@ -47,16 +68,51 @@ describe("tui thread", () => {
           return { status: 200, headers: {}, body: "ok" }
         },
       },
-      { abortTimeout: 1 },
+      {
+        abortTimeout: 1,
+        onAbortTimeout: () => {
+          timeoutCount += 1
+        },
+      },
     )
 
     expect(await (await fetch("http://opencode.internal/session/ses_test", { method: "GET" })).text()).toBe("ok")
+    expect(timeoutCount).toBe(0)
+  })
+
+  test("uses the replacement client after abort timeout recovery", async () => {
+    const firstClient = {
+      call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
+    }
+    let secondAbortCalls = 0
+    const secondClient = {
+      call: async () => {
+        secondAbortCalls += 1
+        return { status: 200, headers: {}, body: "true" }
+      },
+    }
+    let currentClient = firstClient
+    const fetch = createWorkerFetch(() => currentClient, {
+      abortTimeout: 10,
+      onAbortTimeout: () => {
+        currentClient = secondClient
+      },
+    })
+
+    await expect(fetch("http://opencode.internal/session/ses_test/abort", { method: "POST" })).rejects.toThrow(
+      "Abort request timed out after 10ms",
+    )
+
+    const response = await fetch("http://opencode.internal/session/ses_test/abort", { method: "POST" })
+    expect(response.status).toBe(200)
+    expect(await response.text()).toBe("true")
+    expect(secondAbortCalls).toBe(1)
   })
 
   test("returns successful session abort worker fetch responses", async () => {
     const fetch = createWorkerFetch(
       {
-        call: async (method, input) => {
+        call: async (method: "fetch", input: { requestID?: string }) => {
           expect(method).toBe("fetch")
           expect(input.requestID).toBe("abort-0")
           return { status: 200, headers: {}, body: "true" }
