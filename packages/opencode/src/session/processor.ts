@@ -1,13 +1,14 @@
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
-import { Bus } from "@/bus"
 import { Config } from "@/config/config"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
-import * as Session from "./session"
+import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
@@ -19,10 +20,11 @@ import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
-import * as Log from "@opencode-ai/core/util/log"
+import { Log } from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { SessionEvent } from "@opencode-ai/core/session-event"
+import { Database } from "@opencode-ai/core/database/database"
+import { SessionEvent } from "@opencode-ai/core/session/event"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -36,25 +38,25 @@ const log = Log.create({ service: "session.processor" })
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
-  readonly message: MessageV2.Assistant
+  readonly message: SessionV1.Assistant
   readonly updateToolCall: (
     toolCallID: string,
-    update: (part: MessageV2.ToolPart) => MessageV2.ToolPart,
-  ) => Effect.Effect<MessageV2.ToolPart | undefined>
+    update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
+  ) => Effect.Effect<SessionV1.ToolPart | undefined>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
       title: string
       metadata: Record<string, any>
       output: string
-      attachments?: MessageV2.FilePart[]
+      attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
 type Input = {
-  assistantMessage: MessageV2.Assistant
+  assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
 }
@@ -64,9 +66,9 @@ export interface Interface {
 }
 
 type ToolCall = {
-  partID: MessageV2.ToolPart["id"]
-  messageID: MessageV2.ToolPart["messageID"]
-  sessionID: MessageV2.ToolPart["sessionID"]
+  partID: SessionV1.ToolPart["id"]
+  messageID: SessionV1.ToolPart["messageID"]
+  sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
   inputEnded: boolean
 }
@@ -77,8 +79,8 @@ interface ProcessorContext extends Input {
   snapshot: string | undefined
   blocked: boolean
   needsCompaction: boolean
-  currentText: MessageV2.TextPart | undefined
-  reasoningMap: Record<string, MessageV2.ReasoningPart>
+  currentText: SessionV1.TextPart | undefined
+  reasoningMap: Record<string, SessionV1.ReasoningPart>
 }
 
 type StreamEvent = LLMEvent
@@ -102,7 +104,6 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const session = yield* Session.Service
     const config = yield* Config.Service
-    const bus = yield* Bus.Service
     const snapshot = yield* Snapshot.Service
     const agents = yield* Agent.Service
     const llm = yield* LLM.Service
@@ -114,6 +115,7 @@ export const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const database = yield* Database.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -145,6 +147,7 @@ export const layer = Layer.effect(
         isPostToolContinuation: false,
         retryAttempt,
       }
+      let assistantOutputIsEmpty = true
       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 
       const diagnostics = (): MessageV2.NoResponseDiagnostics => ({
@@ -195,7 +198,7 @@ export const layer = Layer.effect(
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
-        update: (part: MessageV2.ToolPart) => MessageV2.ToolPart,
+        update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
         const match = yield* readToolCall(toolCallID)
         if (!match) return undefined
@@ -215,7 +218,7 @@ export const layer = Layer.effect(
           title: string
           metadata: Record<string, any>
           output: string
-          attachments?: MessageV2.FilePart[]
+          attachments?: SessionV1.FilePart[]
         },
       ) {
         const match = yield* readToolCall(toolCallID)
@@ -247,7 +250,7 @@ export const layer = Layer.effect(
             time: { start: match.part.state.time.start, end: Date.now() },
           },
         })
-        if (error instanceof Permission.RejectedError || error instanceof Question.RejectedError) {
+        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
         yield* settleToolCall(toolCallID)
@@ -310,7 +313,7 @@ export const layer = Layer.effect(
           callID: input.id,
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
-        } satisfies MessageV2.ToolPart)
+        } satisfies SessionV1.ToolPart)
         ctx.toolcalls[input.id] = {
           done: yield* Deferred.make<void>(),
           partID: part.id,
@@ -321,11 +324,11 @@ export const layer = Layer.effect(
         return { call: ctx.toolcalls[input.id], part }
       })
 
-      const isFilePart = (value: unknown): value is MessageV2.FilePart => Schema.is(MessageV2.FilePart)(value)
+      const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
 
       const toolResultOutput = (
         value: Extract<StreamEvent, { type: "tool-result" }>,
-      ): { title: string; metadata: Record<string, any>; output: string; attachments?: MessageV2.FilePart[] } => {
+      ): { title: string; metadata: Record<string, any>; output: string; attachments?: SessionV1.FilePart[] } => {
         if (isRecord(value.result.value) && typeof value.result.value.output === "string") {
           return {
             title: typeof value.result.value.title === "string" ? value.result.value.title : value.name,
@@ -351,9 +354,10 @@ export const layer = Layer.effect(
         activity.firstVisiblePartAt ??= now
         activity.lastVisiblePartAt = now
         if (increment) activity.partCount++
+        assistantOutputIsEmpty = false
       }
 
-      const tokenTotal = (tokens: MessageV2.Assistant["tokens"]) =>
+      const tokenTotal = (tokens: SessionV1.Assistant["tokens"]) =>
         tokens.total ?? tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
@@ -437,7 +441,7 @@ export const layer = Layer.effect(
             }
             markVisiblePart(false)
             const toolCall = yield* ensureToolCall(value)
-            const input = toolInput(value.input)
+            const input = isRecord(value.input) ? value.input : { value: value.input }
             if (!toolCall.call.inputEnded) {
               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (flags.experimentalEventSystem) {
@@ -479,7 +483,9 @@ export const layer = Layer.effect(
                 : value.providerMetadata,
             }))
 
-            const parts = MessageV2.parts(ctx.assistantMessage.id)
+            const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+              Effect.provideService(Database.Service, database),
+            )
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
 
             if (
@@ -520,7 +526,7 @@ export const layer = Layer.effect(
                     ),
                     Effect.exit,
                   )
-                : Effect.succeed(Exit.succeed<MessageV2.FilePart>(attachment)),
+                : Effect.succeed(Exit.succeed<SessionV1.FilePart>(attachment)),
             )
             const omitted = normalized.filter(Exit.isFailure).length
             const attachments = normalized.filter(Exit.isSuccess).map((item) => item.value)
@@ -543,7 +549,7 @@ export const layer = Layer.effect(
                     type: "text",
                     text: output.output,
                   },
-                  ...(output.attachments?.map((item: MessageV2.FilePart) => ({
+                  ...(output.attachments?.map((item: SessionV1.FilePart) => ({
                     type: "file" as const,
                     uri: item.url,
                     mime: item.mime,
@@ -825,11 +831,14 @@ export const layer = Layer.effect(
           })
         }
         if (MessageV2.AbortedError.isInstance(error)) {
-          slog.info("model.abort.user_cancel", { ...diagnostics(), abortSource: error.data.abortSource ?? "user_cancel" })
+          slog.info("model.abort.user_cancel", {
+            ...diagnostics(),
+            abortSource: error.data.abortSource ?? "user_cancel",
+          })
         }
-        if (MessageV2.ContextOverflowError.isInstance(error)) {
+        if (SessionV1.ContextOverflowError.isInstance(error)) {
           ctx.needsCompaction = true
-          yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
           return
         }
         if (!ctx.assistantMessage.summary) {
@@ -846,14 +855,20 @@ export const layer = Layer.effect(
           }
         }
         ctx.assistantMessage.error = error
-        yield* bus.publish(Session.Event.Error, {
+        yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
         })
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
-      const assistantOutputEmpty = () => MessageV2.parts(ctx.assistantMessage.id).every(isStructuralAssistantPart)
+      const readAssistantOutputIsEmpty = Effect.fnUntraced(function* () {
+        const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        assistantOutputIsEmpty = isEmptyAssistantOutput(parts)
+        return assistantOutputIsEmpty
+      })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         slog.info("process")
@@ -875,9 +890,11 @@ export const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
+            assistantOutputIsEmpty = yield* readAssistantOutputIsEmpty()
             const stream = llm.stream(streamInput)
             const firstStreamEvent = yield* Deferred.make<void>()
-            const firstEventTimeoutMs = streamInput.internal?.postToolFirstEventTimeoutMs ?? POST_TOOL_FIRST_EVENT_TIMEOUT_MS
+            const firstEventTimeoutMs =
+              streamInput.internal?.postToolFirstEventTimeoutMs ?? POST_TOOL_FIRST_EVENT_TIMEOUT_MS
 
             const drain = stream.pipe(
               Stream.tap((event) =>
@@ -921,8 +938,7 @@ export const layer = Layer.effect(
             yield* drain.pipe(Effect.raceFirst(postToolFirstEventTimeout))
 
             if (ctx.assistantMessage.role === "assistant") {
-              const parts = MessageV2.parts(ctx.assistantMessage.id)
-              const noParts = isEmptyAssistantOutput(parts)
+              const noParts = yield* readAssistantOutputIsEmpty()
               const noTokens = activity.tokenCount === 0 && ctx.assistantMessage.tokens.output === 0
               if (noParts && noTokens) {
                 slog.warn("model.no_response.zero_part_assistant_turn", {
@@ -960,7 +976,7 @@ export const layer = Layer.effect(
                 parse,
                 context: () => ({
                   aborted,
-                  empty: assistantOutputEmpty(),
+                  empty: assistantOutputIsEmpty,
                   postToolContinuation: activity.isPostToolContinuation,
                   subagent: streamInput.parentSessionID !== undefined,
                 }),
@@ -1036,9 +1052,9 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(SessionSummary.defaultLayer),
     Layer.provide(SessionStatus.defaultLayer),
     Layer.provide(Image.defaultLayer),
-    Layer.provide(Bus.layer),
     Layer.provide(Config.defaultLayer),
     Layer.provide(RuntimeFlags.defaultLayer),
+    Layer.provide(Database.defaultLayer),
     Layer.provide(EventV2Bridge.defaultLayer),
   ),
 )
@@ -1047,7 +1063,10 @@ function isEmptyAssistantOutput(parts: MessageV2.Part[]) {
   if (parts.length === 0) return true
   if (parts.every((part) => part.type === "step-start")) return true
   if (!parts.every(isStructuralAssistantPart)) return false
-  return parts.some((part) => part.type === "step-finish") && parts.every((part) => part.type !== "step-finish" || part.reason === "unknown")
+  return (
+    parts.some((part) => part.type === "step-finish") &&
+    parts.every((part) => part.type !== "step-finish" || part.reason === "unknown")
+  )
 }
 
 function isStructuralAssistantPart(part: MessageV2.Part) {
