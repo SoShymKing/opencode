@@ -119,9 +119,10 @@ describe("tui thread", () => {
   test("returns successful session abort worker fetch responses", async () => {
     const fetch = createWorkerFetch(
       {
-        call: async (method: "fetch", input: { requestID?: string }) => {
+        call: async (method: "fetch", input: { url: string; method: string }) => {
           expect(method).toBe("fetch")
-          expect(input.requestID).toBe("abort-0")
+          expect(input.url).toBe("http://opencode.internal/session/ses_test/abort")
+          expect(input.method).toBe("POST")
           return { status: 200, headers: {}, body: "true" }
         },
       },

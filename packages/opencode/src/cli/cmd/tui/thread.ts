@@ -32,7 +32,7 @@ type WorkerFetchClient = {
   call(method: "fetch", input: WorkerFetchInput): Promise<WorkerFetchCallOutput>
 }
 type WorkerFetchClientInput = WorkerFetchClient | (() => WorkerFetchClient)
-type AbortTimeoutInput = { sessionID: string; requestID?: string; error: unknown }
+type AbortTimeoutInput = { sessionID: string }
 type WorkerFetchOptions = {
   abortTimeout?: number
   onAbortTimeout?: (input: AbortTimeoutInput) => void | Promise<void>
@@ -40,7 +40,6 @@ type WorkerFetchOptions = {
 type RpcClient = ReturnType<typeof Rpc.client<typeof rpc>>
 const ABORT_FETCH_TIMEOUT = 3000
 const ABORT_RETRY_HEADER = "x-opencode-abort-retried-after-worker-restart"
-const log = Log.create({ service: "tui.thread" })
 
 function abortSessionID(pathname: string) {
   return /^\/session\/([^/]+)\/abort$/.exec(pathname)?.[1]
@@ -64,29 +63,14 @@ function workerFetchResponse(result: WorkerFetchOutput, retried = false) {
 }
 
 export function createWorkerFetch(client: WorkerFetchClientInput, options: WorkerFetchOptions = {}): typeof fetch {
-  let requestCount = 0
   const abortTimeout = options.abortTimeout ?? ABORT_FETCH_TIMEOUT
   const timeoutMessage = abortTimeoutMessage(abortTimeout)
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
     const url = new URL(request.url)
     const sessionID = abortSessionID(url.pathname)
-    const requestID = sessionID ? `abort-${requestCount++}` : undefined
-    const started = Date.now()
     const body = request.body ? await request.text() : undefined
-    if (sessionID) {
-      log.info("worker fetch request", {
-        requestID,
-        sessionID,
-        method: request.method,
-        pathname: url.pathname,
-        hasBody: body !== undefined,
-        bodyLength: body?.length ?? 0,
-        timeout: abortTimeout,
-      })
-    }
     const workerInput = {
-      requestID,
       url: request.url,
       method: request.method,
       headers: Object.fromEntries(request.headers.entries()),
@@ -96,59 +80,15 @@ export function createWorkerFetch(client: WorkerFetchClientInput, options: Worke
     try {
       const response = call()
       const result = await (sessionID ? withTimeout(response, abortTimeout, timeoutMessage) : response)
-      if (sessionID) {
-        log.info("worker fetch response", {
-          requestID,
-          sessionID,
-          method: request.method,
-          pathname: url.pathname,
-          status: result.status,
-          bodyLength: result.body.length,
-          elapsed: Date.now() - started,
-        })
-      }
       return workerFetchResponse(result)
     } catch (error) {
       const message = errorMessage(error)
-      if (sessionID) {
-        log.warn("worker fetch failed", {
-          requestID,
-          sessionID,
-          method: request.method,
-          pathname: url.pathname,
-          error: message,
-          elapsed: Date.now() - started,
-          timeout: abortTimeout,
-        })
-      }
       if (sessionID && message === timeoutMessage && options.onAbortTimeout) {
-        const retryStarted = Date.now()
-        try {
-          await options.onAbortTimeout({ sessionID, requestID, error })
-          log.info("retrying abort after worker restart", {
-            requestID,
-            sessionID,
-          })
-          const result = await withTimeout(call(), abortTimeout, timeoutMessage)
-          log.info("worker fetch retry response", {
-            requestID,
-            sessionID,
-            method: request.method,
-            pathname: url.pathname,
-            status: result.status,
-            bodyLength: result.body.length,
-            elapsed: Date.now() - retryStarted,
-            totalElapsed: Date.now() - started,
-          })
+        const result = await Promise.resolve(options.onAbortTimeout({ sessionID }))
+          .then(() => withTimeout(call(), abortTimeout, timeoutMessage))
+          .catch(() => undefined)
+        if (result) {
           return workerFetchResponse(result, true)
-        } catch (retryError) {
-          log.warn("abort retry after worker restart failed", {
-            requestID,
-            sessionID,
-            error: errorMessage(retryError),
-            elapsed: Date.now() - retryStarted,
-            totalElapsed: Date.now() - started,
-          })
         }
       }
       throw error
@@ -293,23 +233,14 @@ export const TuiThreadCommand = cmd({
           restartListeners.delete(handler)
         }
       }
-      const restartWorker = async (input: AbortTimeoutInput) => {
+      const restartWorker = async () => {
         if (stopped) return
         if (restarting) return restarting
         restarting = (async () => {
           const previous = current
-          log.warn("abort timeout reached before worker fetch, restarting worker", {
-            requestID: input.requestID,
-            sessionID: input.sessionID,
-            error: errorMessage(input.error),
-          })
           current = startWorker()
           for (const listener of restartListeners) listener()
           previous.worker.terminate()
-          log.info("worker restarted after abort timeout", {
-            requestID: input.requestID,
-            sessionID: input.sessionID,
-          })
         })().finally(() => {
           restarting = undefined
         })
