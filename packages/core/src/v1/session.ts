@@ -59,7 +59,7 @@ export type RequestPhase = Schema.Schema.Type<typeof RequestPhase>
 
 export const NoResponseDiagnostics = Schema.Struct({
   providerID: Schema.optional(ProviderV2.ID),
-  modelID: Schema.optional(ProviderV2.ModelID),
+  modelID: Schema.optional(ModelV2.ID),
   sessionID: Schema.optional(SessionSchema.ID),
   messageID: Schema.optional(MessageID),
   elapsedMs: Schema.optional(NonNegativeInt),
