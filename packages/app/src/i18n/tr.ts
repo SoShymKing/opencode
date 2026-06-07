@@ -35,6 +35,7 @@ export const dict = {
   "command.session.previous.unseen": "Önceki okunmamış oturum",
   "command.session.next.unseen": "Sonraki okunmamış oturum",
   "command.session.archive": "Oturumu arşivle",
+  "command.session.archived.list": "Arşivlenmiş oturumlar",
 
   "command.palette": "Komut paleti",
 
@@ -308,6 +309,13 @@ export const dict = {
   "mcp.status.disabled": "devre dışı",
 
   "dialog.fork.empty": "Dallandırılacak mesaj yok",
+  "dialog.archivedSessions.search.placeholder": "Arşivlenmiş oturumlarda ara",
+  "dialog.archivedSessions.empty": "Arşivlenmiş oturum yok",
+  "dialog.archivedSessions.loading": "Arşivlenmiş oturumlar yükleniyor",
+  "dialog.archivedSessions.archived": "{{time}} arşivlendi",
+  "dialog.archivedSessions.updated": "{{time}} güncellendi",
+  "dialog.archivedSessions.restore": "Geri yükle",
+  "dialog.archivedSessions.restoring": "Geri yükleniyor...",
 
   "dialog.directory.search.placeholder": "Klasör ara",
   "dialog.directory.empty": "Klasör bulunamadı",
@@ -435,6 +443,8 @@ export const dict = {
   "toast.session.share.success.title": "Oturum paylaşıldı",
   "toast.session.share.success.description": "Paylaşım URL'si panoya kopyalandı!",
   "toast.session.share.failed.title": "Oturum paylaşılamadı",
+  "toast.session.restore.success.title": "Oturum geri yüklendi",
+  "toast.session.restore.failed.title": "Oturum geri yüklenemedi",
   "toast.session.share.failed.description": "Oturum paylaşılırken bir hata oluştu",
 
   "toast.session.unshare.success.title": "Oturum paylaşımı kaldırıldı",

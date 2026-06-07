@@ -34,6 +34,7 @@ export const dict = {
   "command.session.previous.unseen": "Попередня непрочитана сесія",
   "command.session.next.unseen": "Наступна непрочитана сесія",
   "command.session.archive": "Архівувати сесію",
+  "command.session.archived.list": "Архівовані сесії",
 
   "command.palette": "Палітра команд",
 
@@ -310,6 +311,13 @@ export const dict = {
   "mcp.auth.clickToAuthenticate": "Натисніть для автентифікації",
 
   "dialog.fork.empty": "Немає повідомлень для відгалуження",
+  "dialog.archivedSessions.search.placeholder": "Пошук архівованих сесій",
+  "dialog.archivedSessions.empty": "Немає архівованих сесій",
+  "dialog.archivedSessions.loading": "Завантаження архівованих сесій",
+  "dialog.archivedSessions.archived": "Архівовано {{time}}",
+  "dialog.archivedSessions.updated": "Оновлено {{time}}",
+  "dialog.archivedSessions.restore": "Відновити",
+  "dialog.archivedSessions.restoring": "Відновлення...",
 
   "dialog.directory.search.placeholder": "Пошук папок",
   "dialog.directory.empty": "Папок не знайдено",
@@ -451,6 +459,8 @@ export const dict = {
   "toast.session.share.success.title": "Сесію опубліковано",
   "toast.session.share.success.description": "Посилання скопійовано в буфер обміну!",
   "toast.session.share.failed.title": "Не вдалося опублікувати сесію",
+  "toast.session.restore.success.title": "Сесію відновлено",
+  "toast.session.restore.failed.title": "Не вдалося відновити сесію",
   "toast.session.share.failed.description": "Під час публікації сесії сталася помилка",
 
   "toast.session.unshare.success.title": "Поширення сесії припинено",

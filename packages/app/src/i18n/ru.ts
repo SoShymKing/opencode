@@ -31,6 +31,7 @@ export const dict = {
   "command.session.previous.unseen": "Предыдущая непрочитанная сессия",
   "command.session.next.unseen": "Следующая непрочитанная сессия",
   "command.session.archive": "Архивировать сессию",
+  "command.session.archived.list": "Архивированные сессии",
 
   "command.palette": "Палитра команд",
 
@@ -303,6 +304,13 @@ export const dict = {
   "mcp.status.disabled": "отключено",
 
   "dialog.fork.empty": "Нет сообщений для ответвления",
+  "dialog.archivedSessions.search.placeholder": "Поиск архивированных сессий",
+  "dialog.archivedSessions.empty": "Нет архивированных сессий",
+  "dialog.archivedSessions.loading": "Загрузка архивированных сессий",
+  "dialog.archivedSessions.archived": "Архивировано {{time}}",
+  "dialog.archivedSessions.updated": "Обновлено {{time}}",
+  "dialog.archivedSessions.restore": "Восстановить",
+  "dialog.archivedSessions.restoring": "Восстановление...",
 
   "dialog.directory.search.placeholder": "Поиск папок",
   "dialog.directory.empty": "Папки не найдены",
@@ -431,6 +439,8 @@ export const dict = {
   "toast.session.share.success.title": "Сессия опубликована",
   "toast.session.share.success.description": "URL скопирован в буфер обмена!",
   "toast.session.share.failed.title": "Не удалось опубликовать сессию",
+  "toast.session.restore.success.title": "Сессия восстановлена",
+  "toast.session.restore.failed.title": "Не удалось восстановить сессию",
   "toast.session.share.failed.description": "Произошла ошибка при публикации сессии",
 
   "toast.session.unshare.success.title": "Публикация отменена",

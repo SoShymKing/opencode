@@ -31,6 +31,7 @@ export const dict = {
   "command.session.previous.unseen": "Prethodna nepročitana sesija",
   "command.session.next.unseen": "Sljedeća nepročitana sesija",
   "command.session.archive": "Arhiviraj sesiju",
+  "command.session.archived.list": "Arhivirane sesije",
 
   "command.palette": "Paleta komandi",
 
@@ -304,6 +305,13 @@ export const dict = {
   "mcp.status.disabled": "onemogućeno",
 
   "dialog.fork.empty": "Nema poruka za fork",
+  "dialog.archivedSessions.search.placeholder": "Pretraži arhivirane sesije",
+  "dialog.archivedSessions.empty": "Nema arhiviranih sesija",
+  "dialog.archivedSessions.loading": "Učitavanje arhiviranih sesija",
+  "dialog.archivedSessions.archived": "Arhivirano {{time}}",
+  "dialog.archivedSessions.updated": "Ažurirano {{time}}",
+  "dialog.archivedSessions.restore": "Vrati",
+  "dialog.archivedSessions.restoring": "Vraćanje...",
 
   "dialog.directory.search.placeholder": "Pretraži foldere",
   "dialog.directory.empty": "Nema pronađenih foldera",
@@ -432,6 +440,8 @@ export const dict = {
   "toast.session.share.success.title": "Sesija podijeljena",
   "toast.session.share.success.description": "URL za dijeljenje je kopiran u međuspremnik!",
   "toast.session.share.failed.title": "Neuspjelo dijeljenje sesije",
+  "toast.session.restore.success.title": "Sesija vraćena",
+  "toast.session.restore.failed.title": "Vraćanje sesije nije uspjelo",
   "toast.session.share.failed.description": "Došlo je do greške prilikom dijeljenja sesije",
 
   "toast.session.unshare.success.title": "Dijeljenje sesije ukinuto",
