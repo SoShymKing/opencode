@@ -34,6 +34,7 @@ export const dict = {
   "command.session.previous.unseen": "Previous unread session",
   "command.session.next.unseen": "Next unread session",
   "command.session.archive": "Archive session",
+  "command.session.archived.list": "Archived sessions",
 
   "command.palette": "Command palette",
 
@@ -311,6 +312,14 @@ export const dict = {
 
   "dialog.fork.empty": "No messages to fork from",
 
+  "dialog.archivedSessions.search.placeholder": "Search archived sessions",
+  "dialog.archivedSessions.empty": "No archived sessions",
+  "dialog.archivedSessions.loading": "Loading archived sessions",
+  "dialog.archivedSessions.archived": "Archived {{time}}",
+  "dialog.archivedSessions.updated": "Updated {{time}}",
+  "dialog.archivedSessions.restore": "Restore",
+  "dialog.archivedSessions.restoring": "Restoring...",
+
   "dialog.directory.search.placeholder": "Search folders",
   "dialog.directory.empty": "No folders found",
 
@@ -509,6 +518,8 @@ export const dict = {
   "toast.session.unshare.success.description": "Session unshared successfully!",
   "toast.session.unshare.failed.title": "Failed to unshare session",
   "toast.session.unshare.failed.description": "An error occurred while unsharing the session",
+  "toast.session.restore.success.title": "Session restored",
+  "toast.session.restore.failed.title": "Failed to restore session",
 
   "toast.session.listFailed.title": "Failed to load sessions for {{project}}",
   "toast.project.reloadFailed.title": "Failed to reload {{project}}",
