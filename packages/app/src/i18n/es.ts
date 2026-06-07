@@ -31,6 +31,7 @@ export const dict = {
   "command.session.previous.unseen": "Sesión no leída anterior",
   "command.session.next.unseen": "Siguiente sesión no leída",
   "command.session.archive": "Archivar sesión",
+  "command.session.archived.list": "Sesiones archivadas",
 
   "command.palette": "Paleta de comandos",
 
@@ -303,6 +304,13 @@ export const dict = {
   "mcp.status.disabled": "deshabilitado",
 
   "dialog.fork.empty": "No hay mensajes desde donde bifurcar",
+  "dialog.archivedSessions.search.placeholder": "Buscar sesiones archivadas",
+  "dialog.archivedSessions.empty": "No hay sesiones archivadas",
+  "dialog.archivedSessions.loading": "Cargando sesiones archivadas",
+  "dialog.archivedSessions.archived": "Archivada {{time}}",
+  "dialog.archivedSessions.updated": "Actualizada {{time}}",
+  "dialog.archivedSessions.restore": "Restaurar",
+  "dialog.archivedSessions.restoring": "Restaurando...",
 
   "dialog.directory.search.placeholder": "Buscar carpetas",
   "dialog.directory.empty": "No se encontraron carpetas",
@@ -432,6 +440,8 @@ export const dict = {
   "toast.session.share.success.title": "Sesión compartida",
   "toast.session.share.success.description": "¡URL compartida copiada al portapapeles!",
   "toast.session.share.failed.title": "Fallo al compartir sesión",
+  "toast.session.restore.success.title": "Sesión restaurada",
+  "toast.session.restore.failed.title": "No se pudo restaurar la sesión",
   "toast.session.share.failed.description": "Ocurrió un error al compartir la sesión",
 
   "toast.session.unshare.success.title": "Sesión dejó de compartirse",

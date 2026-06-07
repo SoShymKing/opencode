@@ -1,5 +1,6 @@
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import type { InternalTuiPlugin } from "../../plugin/internal"
+import { DialogArchivedSessionList } from "@tui/component/dialog-archived-session-list"
 import { SessionSwitcherDialog } from "./dialog"
 
 const id = "internal:session-switcher"
@@ -18,6 +19,15 @@ const tui: TuiPlugin = async (api) => {
         slashAliases: ["resume", "continue"],
         run() {
           api.ui.dialog.replace(() => <SessionSwitcherDialog />)
+        },
+      },
+      {
+        name: "session.archived.list",
+        title: "Archived sessions",
+        category: "Session",
+        namespace: "palette",
+        run() {
+          api.ui.dialog.replace(() => <DialogArchivedSessionList />)
         },
       },
     ],

@@ -40,6 +40,7 @@ export const dict = {
   "command.session.previous.unseen": "上一个未读会话",
   "command.session.next.unseen": "下一个未读会话",
   "command.session.archive": "归档会话",
+  "command.session.archived.list": "已归档会话",
 
   "command.palette": "命令面板",
 
@@ -323,6 +324,13 @@ export const dict = {
   "mcp.status.disabled": "已禁用",
 
   "dialog.fork.empty": "没有可用于分叉的消息",
+  "dialog.archivedSessions.search.placeholder": "搜索已归档会话",
+  "dialog.archivedSessions.empty": "没有已归档会话",
+  "dialog.archivedSessions.loading": "正在加载已归档会话",
+  "dialog.archivedSessions.archived": "已于 {{time}} 归档",
+  "dialog.archivedSessions.updated": "已于 {{time}} 更新",
+  "dialog.archivedSessions.restore": "恢复",
+  "dialog.archivedSessions.restoring": "正在恢复...",
 
   "dialog.directory.search.placeholder": "搜索文件夹",
   "dialog.directory.empty": "未找到文件夹",
@@ -438,6 +446,8 @@ export const dict = {
   "toast.session.share.success.title": "会话已分享",
   "toast.session.share.success.description": "分享链接已复制到剪贴板",
   "toast.session.share.failed.title": "分享会话失败",
+  "toast.session.restore.success.title": "会话已恢复",
+  "toast.session.restore.failed.title": "恢复会话失败",
   "toast.session.share.failed.description": "分享会话时发生错误",
   "toast.session.unshare.success.title": "已取消分享会话",
   "toast.session.unshare.success.description": "会话已成功取消分享",

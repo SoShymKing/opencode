@@ -34,6 +34,7 @@ export const dict = {
   "command.session.previous.unseen": "Forrige uleste økt",
   "command.session.next.unseen": "Neste uleste økt",
   "command.session.archive": "Arkiver sesjon",
+  "command.session.archived.list": "Arkiverte økter",
 
   "command.palette": "Kommandopalett",
 
@@ -306,6 +307,13 @@ export const dict = {
   "mcp.status.disabled": "deaktivert",
 
   "dialog.fork.empty": "Ingen meldinger å forgrene fra",
+  "dialog.archivedSessions.search.placeholder": "Søk i arkiverte økter",
+  "dialog.archivedSessions.empty": "Ingen arkiverte økter",
+  "dialog.archivedSessions.loading": "Laster arkiverte økter",
+  "dialog.archivedSessions.archived": "Arkivert {{time}}",
+  "dialog.archivedSessions.updated": "Oppdatert {{time}}",
+  "dialog.archivedSessions.restore": "Gjenopprett",
+  "dialog.archivedSessions.restoring": "Gjenoppretter...",
 
   "dialog.directory.search.placeholder": "Søk etter mapper",
   "dialog.directory.empty": "Ingen mapper funnet",
@@ -433,6 +441,8 @@ export const dict = {
   "toast.session.share.success.title": "Sesjon delt",
   "toast.session.share.success.description": "Delings-URL kopiert til utklippstavlen!",
   "toast.session.share.failed.title": "Kunne ikke dele sesjon",
+  "toast.session.restore.success.title": "Økt gjenopprettet",
+  "toast.session.restore.failed.title": "Kunne ikke gjenopprette økt",
   "toast.session.share.failed.description": "Det oppstod en feil under deling av sesjonen",
 
   "toast.session.unshare.success.title": "Deling av sesjon stoppet",

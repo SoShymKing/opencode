@@ -1103,6 +1103,13 @@ export default function Layout(props: ParentProps) {
         },
       },
       {
+        id: "session.archived.list",
+        title: language.t("command.session.archived.list"),
+        category: language.t("command.category.session"),
+        disabled: !currentProject(),
+        onSelect: () => openArchivedSessions(),
+      },
+      {
         id: "workspace.new",
         title: language.t("workspace.new"),
         category: language.t("command.category.workspace"),
@@ -1227,6 +1234,14 @@ export default function Layout(props: ParentProps) {
     void import("@/components/dialog-select-server").then((x) => {
       if (dialogDead || dialogRun !== run) return
       dialog.show(() => <x.DialogSelectServer />)
+    })
+  }
+
+  function openArchivedSessions() {
+    const run = ++dialogRun
+    void import("@/components/dialog-archived-sessions").then((x) => {
+      if (dialogDead || dialogRun !== run) return
+      dialog.show(() => <x.DialogArchivedSessions />)
     })
   }
 

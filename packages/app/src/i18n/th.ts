@@ -31,6 +31,7 @@ export const dict = {
   "command.session.previous.unseen": "เซสชันที่ยังไม่ได้อ่านก่อนหน้า",
   "command.session.next.unseen": "เซสชันที่ยังไม่ได้อ่านถัดไป",
   "command.session.archive": "จัดเก็บเซสชัน",
+  "command.session.archived.list": "เซสชันที่จัดเก็บแล้ว",
 
   "command.palette": "คำสั่งค้นหา",
 
@@ -303,6 +304,13 @@ export const dict = {
   "mcp.status.disabled": "ปิดใช้งาน",
 
   "dialog.fork.empty": "ไม่มีข้อความให้แตกแขนง",
+  "dialog.archivedSessions.search.placeholder": "ค้นหาเซสชันที่จัดเก็บแล้ว",
+  "dialog.archivedSessions.empty": "ไม่มีเซสชันที่จัดเก็บแล้ว",
+  "dialog.archivedSessions.loading": "กำลังโหลดเซสชันที่จัดเก็บแล้ว",
+  "dialog.archivedSessions.archived": "จัดเก็บเมื่อ {{time}}",
+  "dialog.archivedSessions.updated": "อัปเดตเมื่อ {{time}}",
+  "dialog.archivedSessions.restore": "กู้คืน",
+  "dialog.archivedSessions.restoring": "กำลังกู้คืน...",
 
   "dialog.directory.search.placeholder": "ค้นหาโฟลเดอร์",
   "dialog.directory.empty": "ไม่พบโฟลเดอร์",
@@ -430,6 +438,8 @@ export const dict = {
   "toast.session.share.success.title": "แชร์เซสชันแล้ว",
   "toast.session.share.success.description": "คัดลอก URL แชร์ไปยังคลิปบอร์ดแล้ว!",
   "toast.session.share.failed.title": "ไม่สามารถแชร์เซสชัน",
+  "toast.session.restore.success.title": "กู้คืนเซสชันแล้ว",
+  "toast.session.restore.failed.title": "กู้คืนเซสชันไม่สำเร็จ",
   "toast.session.share.failed.description": "เกิดข้อผิดพลาดระหว่างการแชร์เซสชัน",
 
   "toast.session.unshare.success.title": "ยกเลิกการแชร์เซสชันแล้ว",

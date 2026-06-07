@@ -35,6 +35,7 @@ export const dict = {
   "command.session.previous.unseen": "上一個未讀會話",
   "command.session.next.unseen": "下一個未讀會話",
   "command.session.archive": "封存工作階段",
+  "command.session.archived.list": "已封存工作階段",
 
   "command.palette": "命令面板",
 
@@ -303,6 +304,13 @@ export const dict = {
   "mcp.status.disabled": "已停用",
 
   "dialog.fork.empty": "沒有可用於分支的訊息",
+  "dialog.archivedSessions.search.placeholder": "搜尋已封存工作階段",
+  "dialog.archivedSessions.empty": "沒有已封存工作階段",
+  "dialog.archivedSessions.loading": "正在載入已封存工作階段",
+  "dialog.archivedSessions.archived": "已於 {{time}} 封存",
+  "dialog.archivedSessions.updated": "已於 {{time}} 更新",
+  "dialog.archivedSessions.restore": "還原",
+  "dialog.archivedSessions.restoring": "正在還原...",
 
   "dialog.directory.search.placeholder": "搜尋資料夾",
   "dialog.directory.empty": "找不到資料夾",
@@ -428,6 +436,8 @@ export const dict = {
   "toast.session.share.success.title": "工作階段已分享",
   "toast.session.share.success.description": "分享連結已複製到剪貼簿",
   "toast.session.share.failed.title": "分享工作階段失敗",
+  "toast.session.restore.success.title": "工作階段已還原",
+  "toast.session.restore.failed.title": "還原工作階段失敗",
   "toast.session.share.failed.description": "分享工作階段時發生錯誤",
 
   "toast.session.unshare.success.title": "已取消分享工作階段",

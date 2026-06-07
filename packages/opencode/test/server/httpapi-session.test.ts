@@ -826,15 +826,30 @@ describe("session HttpApi", () => {
         const test = yield* TestInstance
         const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
         const session = yield* createSession({ title: "archived" })
-        const body = JSON.stringify({ time: { archived: -1 } })
 
         const response = yield* request(pathFor(SessionPaths.update, { sessionID: session.id }), {
           method: "PATCH",
           headers,
-          body,
+          body: JSON.stringify({ time: { archived: -1 } }),
         })
         expect(response.status).toBe(200)
         expect((yield* json<Session.Info>(response)).time.archived).toBe(-1)
+
+        const titleOnlyResponse = yield* request(pathFor(SessionPaths.update, { sessionID: session.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ title: "still archived" }),
+        })
+        expect(titleOnlyResponse.status).toBe(200)
+        expect((yield* json<Session.Info>(titleOnlyResponse)).time.archived).toBe(-1)
+
+        const unarchiveResponse = yield* request(pathFor(SessionPaths.update, { sessionID: session.id }), {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({ time: { archived: null } }),
+        })
+        expect(unarchiveResponse.status).toBe(200)
+        expect((yield* json<Session.Info>(unarchiveResponse)).time.archived).toBeUndefined()
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

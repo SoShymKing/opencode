@@ -41,6 +41,7 @@ import { DialogThemeList } from "@tui/component/dialog-theme-list"
 import { DialogHelp } from "./ui/dialog-help"
 import { DialogAgent } from "@tui/component/dialog-agent"
 import { DialogSessionList } from "@tui/component/dialog-session-list"
+import { DialogArchivedSessionList } from "@tui/component/dialog-archived-session-list"
 import { DialogWorkspaceList } from "@tui/component/dialog-workspace-list"
 import { DialogConsoleOrg } from "@tui/component/dialog-console-org"
 import { ThemeProvider, useTheme } from "@tui/context/theme"
@@ -578,6 +579,14 @@ function App(props: { onSnapshot?: () => Promise<string[]> }) {
         slashAliases: ["resume", "continue"],
         run: () => {
           dialog.replace(() => <DialogSessionList />)
+        },
+      },
+      {
+        name: "session.archived.list",
+        title: "Archived sessions",
+        category: "Session",
+        run: () => {
+          dialog.replace(() => <DialogArchivedSessionList />)
         },
       },
       {

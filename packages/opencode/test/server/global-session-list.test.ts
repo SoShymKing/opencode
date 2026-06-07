@@ -104,4 +104,36 @@ describe("session.listGlobal", () => {
       }),
     { git: true },
   )
+
+  it.instance(
+    "paginates archived-inclusive results",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const archived = yield* withSession({ title: "archived-page" })
+        yield* SessionNs.Service.use((session) => session.setArchived({ sessionID: archived.id, time: Date.now() }))
+
+        const ready = yield* Deferred.make<void>()
+        yield* Deferred.succeed(ready, undefined).pipe(Effect.delay("5 millis"), Effect.forkScoped)
+        yield* Deferred.await(ready).pipe(
+          Effect.timeoutOrElse({
+            duration: "1 second",
+            orElse: () => Effect.fail(new Error("timed out waiting between session creates")),
+          }),
+        )
+        const active = yield* withSession({ title: "active-page" })
+
+        const page = yield* SessionNs.Service.use((session) =>
+          session.listGlobal({ directory: test.directory, limit: 1, archived: true }),
+        )
+        expect(page).toHaveLength(1)
+        expect(page[0].id).toBe(active.id)
+
+        const next = yield* SessionNs.Service.use((session) =>
+          session.listGlobal({ directory: test.directory, limit: 10, archived: true, cursor: page[0].time.updated }),
+        )
+        expect(next.map((session) => session.id)).toContain(archived.id)
+      }),
+    { git: true },
+  )
 })

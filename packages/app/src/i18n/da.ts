@@ -31,6 +31,7 @@ export const dict = {
   "command.session.previous.unseen": "Forrige ulæste session",
   "command.session.next.unseen": "Næste ulæste session",
   "command.session.archive": "Arkivér session",
+  "command.session.archived.list": "Arkiverede sessioner",
 
   "command.palette": "Kommandopalette",
 
@@ -302,6 +303,13 @@ export const dict = {
   "mcp.status.disabled": "deaktiveret",
 
   "dialog.fork.empty": "Ingen beskeder at forgrene fra",
+  "dialog.archivedSessions.search.placeholder": "Søg i arkiverede sessioner",
+  "dialog.archivedSessions.empty": "Ingen arkiverede sessioner",
+  "dialog.archivedSessions.loading": "Indlæser arkiverede sessioner",
+  "dialog.archivedSessions.archived": "Arkiveret {{time}}",
+  "dialog.archivedSessions.updated": "Opdateret {{time}}",
+  "dialog.archivedSessions.restore": "Gendan",
+  "dialog.archivedSessions.restoring": "Gendanner...",
 
   "dialog.directory.search.placeholder": "Søg mapper",
   "dialog.directory.empty": "Ingen mapper fundet",
@@ -429,6 +437,8 @@ export const dict = {
   "toast.session.share.success.title": "Session delt",
   "toast.session.share.success.description": "Delings-URL kopieret til udklipsholder!",
   "toast.session.share.failed.title": "Kunne ikke dele session",
+  "toast.session.restore.success.title": "Session gendannet",
+  "toast.session.restore.failed.title": "Kunne ikke gendanne session",
   "toast.session.share.failed.description": "Der opstod en fejl under deling af sessionen",
 
   "toast.session.unshare.success.title": "Deling af session stoppet",
