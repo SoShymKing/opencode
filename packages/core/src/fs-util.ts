@@ -1,5 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { dirname, join, relative, resolve as pathResolve } from "path"
+import { dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from "path"
 import { realpathSync } from "fs"
 import * as NFS from "fs/promises"
 import { lookup } from "mime-types"
@@ -7,6 +7,8 @@ import { Context, Effect, FileSystem, Layer, Schema } from "effect"
 import type { PlatformError } from "effect/PlatformError"
 import { Glob } from "./util/glob"
 import { serviceUse } from "./effect/service-use"
+import { LayerNode } from "./effect/layer-node"
+import { filesystem } from "./effect/layer-node-platform"
 
 export namespace FSUtil {
   export class FileSystemError extends Schema.TaggedErrorClass<FileSystemError>()("FileSystemError", {
@@ -84,7 +86,10 @@ export namespace FSUtil {
 
       const readJson = Effect.fn("FileSystem.readJson")(function* (path: string) {
         const text = yield* fs.readFileString(path)
-        return JSON.parse(text)
+        return yield* Effect.try({
+          try: () => JSON.parse(text),
+          catch: (cause) => new FileSystemError({ method: "readJson", cause }),
+        })
       })
 
       const writeJson = Effect.fn("FileSystem.writeJson")(function* (path: string, data: unknown, mode?: number) {
@@ -191,6 +196,7 @@ export namespace FSUtil {
   )
 
   export const defaultLayer = layer.pipe(Layer.provide(NodeFileSystem.layer))
+  export const node = LayerNode.make(layer, [filesystem])
 
   // Pure helpers that don't need Effect (path manipulation, sync operations)
   export function mimeType(p: string): string {
@@ -236,12 +242,11 @@ export namespace FSUtil {
   }
 
   export function overlaps(a: string, b: string) {
-    const relA = relative(a, b)
-    const relB = relative(b, a)
-    return !relA || !relA.startsWith("..") || !relB || !relB.startsWith("..")
+    return contains(a, b) || contains(b, a)
   }
 
   export function contains(parent: string, child: string) {
-    return !relative(parent, child).startsWith("..")
+    const result = relative(parent, child)
+    return result === "" || (!isAbsolute(result) && result !== ".." && !result.startsWith(`..${sep}`))
   }
 }
