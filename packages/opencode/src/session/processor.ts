@@ -696,7 +696,7 @@ export const layer = Layer.effect(
                   sessionID: ctx.sessionID,
                   assistantMessageID,
                   callID: value.id,
-                  structured: toolOutput.structured,
+                  structured: isRecord(toolOutput.structured) ? toolOutput.structured : { value: toolOutput.structured },
                   content: toolOutput.content,
                   result: value.result,
                   provider: {
@@ -1105,13 +1105,15 @@ export const layer = Layer.effect(
                           abortSource: "post_tool_first_event_timeout",
                           phase: "post_tool_continuation",
                         })
-                        return yield* new MessageV2.PostToolContinuationTimeoutError({
-                          message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation (retry attempt ${activity.retryAttempt})`,
-                          abortSource: "post_tool_first_event_timeout",
-                          phase: "post_tool_continuation",
-                          retryable: true,
-                          diagnostics: diagnostics(),
-                        })
+                        return yield* Effect.fail(
+                          new MessageV2.PostToolContinuationTimeoutError({
+                            message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation (retry attempt ${activity.retryAttempt})`,
+                            abortSource: "post_tool_first_event_timeout",
+                            phase: "post_tool_continuation",
+                            retryable: true,
+                            diagnostics: diagnostics(),
+                          }),
+                        )
                       }),
                   }),
                   Effect.andThen(Effect.never),
