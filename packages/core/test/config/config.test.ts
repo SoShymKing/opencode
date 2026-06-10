@@ -449,6 +449,7 @@ describe("Config", () => {
                 permission: {
                   bash: "ask",
                   edit: { "*.md": "allow", "*": "deny" },
+                  question: "deny",
                 },
                 agent: {
                   reviewer: {
@@ -463,7 +464,9 @@ describe("Config", () => {
                   ["@my-org/audit-plugin", { endpoint: "https://audit.example.com" }],
                 ],
                 skills: { paths: ["./skills"], urls: ["https://example.com/.well-known/skills/"] },
-                reference: { docs: { path: "../docs" } },
+                references: {
+                  docs: { path: "../docs", description: "Use for product documentation", hidden: true },
+                },
                 attachment: { image: { auto_resize: false, max_width: 1200 } },
                 provider: {
                   custom: {
@@ -526,6 +529,7 @@ describe("Config", () => {
               { action: "bash", resource: "*", effect: "ask" },
               { action: "edit", resource: "*.md", effect: "allow" },
               { action: "edit", resource: "*", effect: "deny" },
+              { action: "question", resource: "*", effect: "deny" },
             ])
             expect(documents[0]?.info.agents?.reviewer).toMatchObject({
               system: "Review changes.",
@@ -538,7 +542,9 @@ describe("Config", () => {
               { package: "@my-org/audit-plugin", options: { endpoint: "https://audit.example.com" } },
             ])
             expect(documents[0]?.info.skills).toEqual(["./skills", "https://example.com/.well-known/skills/"])
-            expect(documents[0]?.info.references).toEqual({ docs: { path: "../docs" } })
+            expect(documents[0]?.info.references).toEqual({
+              docs: { path: "../docs", description: "Use for product documentation", hidden: true },
+            })
             expect(documents[0]?.info.attachments).toEqual({ image: { auto_resize: false, max_width: 1200 } })
             expect(documents[0]?.info.providers?.custom).toMatchObject({
               request: { body: { apiKey: "secret" } },
