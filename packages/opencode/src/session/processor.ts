@@ -1,3 +1,4 @@
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -20,7 +21,6 @@ import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
-import { Log } from "@opencode-ai/core/util/log"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -30,13 +30,10 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
-import { toolFileSourceFromUri, Usage, type LLMEvent } from "@opencode-ai/llm"
-import { ToolOutput } from "@opencode-ai/core/tool-output"
+import { ToolOutput, Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
 export const POST_TOOL_FIRST_EVENT_TIMEOUT_MS = 100_000
-const log = Log.create({ service: "session.processor" })
-
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -157,7 +154,6 @@ export const layer = Layer.effect(
         retryAttempt,
       }
       let assistantOutputIsEmpty = true
-      const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 
       const diagnostics = (): MessageV2.NoResponseDiagnostics => ({
         providerID: input.model.providerID,
@@ -662,20 +658,22 @@ export const layer = Layer.effect(
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
               const content = [
-                ToolOutput.text({ type: "text", text: output.output }),
-                ...(output.attachments?.map((item: SessionV1.FilePart) =>
-                  ToolOutput.file({
-                    type: "file",
-                    source: toolFileSourceFromUri(item.url),
-                    mime: item.mime,
-                    name: item.filename,
-                  }),
+                { type: "text" as const, text: output.output },
+                ...(output.attachments?.map(
+                  (item: SessionV1.FilePart) =>
+                    ({
+                      type: "file",
+                      uri: item.url,
+                      mime: item.mime,
+                      name: item.filename,
+                    }) as const,
                 ) ?? []),
               ]
-              const unsupported = content.find((item) => item.type === "file" && item.source.type !== "data")
+              const toolOutput = ToolOutput.make(output.metadata, content)
+              const unsupported = toolOutput.content.find((item) => item.type === "file" && !item.uri.startsWith("data:"))
               if (unsupported?.type === "file") {
                 const error = new Error(
-                  `Tool attachment source "${unsupported.source.type}" must be materialized before durable V2 settlement`,
+                  `Tool attachment URI "${unsupported.uri}" must be materialized before durable V2 settlement`,
                 )
                 yield* events.publish(SessionEvent.Tool.Failed, {
                   sessionID: ctx.sessionID,
@@ -698,8 +696,8 @@ export const layer = Layer.effect(
                   sessionID: ctx.sessionID,
                   assistantMessageID,
                   callID: value.id,
-                  structured: output.metadata,
-                  content,
+                  structured: isRecord(toolOutput.structured) ? toolOutput.structured : { value: toolOutput.structured },
+                  content: toolOutput.content,
                   result: value.result,
                   provider: {
                     executed: value.providerExecuted === true || toolCall?.part.metadata?.providerExecuted === true,
@@ -988,17 +986,22 @@ export const layer = Layer.effect(
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
-        slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
+        yield* Effect.logError("process", {
+          "session.id": input.sessionID,
+          messageID: input.assistantMessage.id,
+          error: errorMessage(e),
+          stack: e instanceof Error ? e.stack : undefined,
+        })
         const error = parse(e)
         if (MessageV2.UnexpectedProviderAbortError.isInstance(error)) {
-          slog.warn("model.abort.unexpected_provider_abort", {
+          yield* Effect.logWarning("model.abort.unexpected_provider_abort", {
             ...(error.data.diagnostics ?? diagnostics()),
             abortSource: error.data.abortSource,
             phase: error.data.phase,
           })
         }
         if (MessageV2.AbortedError.isInstance(error)) {
-          slog.info("model.abort.user_cancel", {
+          yield* Effect.logInfo("model.abort.user_cancel", {
             ...diagnostics(),
             abortSource: error.data.abortSource ?? "user_cancel",
           })
@@ -1047,7 +1050,10 @@ export const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
-        slog.info("process")
+        yield* Effect.logInfo("process", {
+          "session.id": input.sessionID,
+          messageID: input.assistantMessage.id,
+        })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
         return yield* Effect.gen(function* () {
@@ -1093,20 +1099,22 @@ export const layer = Layer.effect(
                   Effect.timeoutOrElse({
                     duration: firstEventTimeoutMs,
                     orElse: () =>
-                      Effect.sync(() => {
-                        slog.warn("model.no_response.post_tool_first_event_timeout", {
+                      Effect.gen(function* () {
+                        yield* Effect.logWarning("model.no_response.post_tool_first_event_timeout", {
                           ...diagnostics(),
                           abortSource: "post_tool_first_event_timeout",
                           phase: "post_tool_continuation",
                         })
-                        return new MessageV2.PostToolContinuationTimeoutError({
-                          message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation (retry attempt ${activity.retryAttempt})`,
-                          abortSource: "post_tool_first_event_timeout",
-                          phase: "post_tool_continuation",
-                          retryable: true,
-                          diagnostics: diagnostics(),
-                        })
-                      }).pipe(Effect.flatMap((error) => Effect.fail(error))),
+                        return yield* Effect.fail(
+                          new MessageV2.PostToolContinuationTimeoutError({
+                            message: `No stream event within ${firstEventTimeoutMs}ms after tool continuation (retry attempt ${activity.retryAttempt})`,
+                            abortSource: "post_tool_first_event_timeout",
+                            phase: "post_tool_continuation",
+                            retryable: true,
+                            diagnostics: diagnostics(),
+                          }),
+                        )
+                      }),
                   }),
                   Effect.andThen(Effect.never),
                 )
@@ -1118,7 +1126,7 @@ export const layer = Layer.effect(
               const noParts = yield* readAssistantOutputIsEmpty()
               const noTokens = activity.tokenCount === 0 && ctx.assistantMessage.tokens.output === 0
               if (noParts && noTokens) {
-                slog.warn("model.no_response.zero_part_assistant_turn", {
+                yield* Effect.logWarning("model.no_response.zero_part_assistant_turn", {
                   ...diagnostics(),
                   abortSource: "unknown",
                   phase: "message_finalization",
@@ -1160,14 +1168,6 @@ export const layer = Layer.effect(
                 set: (info) => {
                   retryAttempt = info.attempt
                   activity.retryAttempt = info.attempt
-                  if (activity.isPostToolContinuation) {
-                    slog.warn("model.no_response.retrying_continuation", {
-                      ...diagnostics(),
-                      abortSource: "post_tool_first_event_timeout",
-                      phase: "post_tool_continuation",
-                      attempt: info.attempt,
-                    })
-                  }
                   // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = mirrorAssistant
                     ? events.publish(SessionEvent.Retried, {
@@ -1180,18 +1180,28 @@ export const layer = Layer.effect(
                         timestamp: DateTime.makeUnsafe(Date.now()),
                       })
                     : Effect.void
-                  return flushV2Fragments().pipe(
-                    Effect.andThen(event),
-                    Effect.andThen(
-                      status.set(ctx.sessionID, {
-                        type: "retry",
+                  return Effect.gen(function* () {
+                    if (activity.isPostToolContinuation) {
+                      yield* Effect.logWarning("model.no_response.retrying_continuation", {
+                        ...diagnostics(),
+                        abortSource: "post_tool_first_event_timeout",
+                        phase: "post_tool_continuation",
                         attempt: info.attempt,
-                        message: info.message,
-                        action: info.action,
-                        next: info.next,
-                      }),
-                    ),
-                  )
+                      })
+                    }
+                    return yield* flushV2Fragments().pipe(
+                      Effect.andThen(event),
+                      Effect.andThen(
+                        status.set(ctx.sessionID, {
+                          type: "retry",
+                          attempt: info.attempt,
+                          message: info.message,
+                          action: info.action,
+                          next: info.next,
+                        }),
+                      ),
+                    )
+                  })
                 },
               }),
             ),
@@ -1250,5 +1260,21 @@ function isEmptyAssistantOutput(parts: MessageV2.Part[]) {
 function isStructuralAssistantPart(part: MessageV2.Part) {
   return part.type === "step-start" || part.type === "step-finish"
 }
+
+export const node = LayerNode.make(layer, [
+  Session.node,
+  Config.node,
+  Snapshot.node,
+  Agent.node,
+  LLM.node,
+  Permission.node,
+  Plugin.node,
+  SessionSummary.node,
+  SessionStatus.node,
+  Image.node,
+  EventV2Bridge.node,
+  RuntimeFlags.node,
+  Database.node,
+])
 
 export * as SessionProcessor from "./processor"
