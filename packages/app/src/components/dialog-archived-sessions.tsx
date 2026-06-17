@@ -75,8 +75,8 @@ export function DialogArchivedSessions() {
       current && pathKey(session.directory) === pathKey(current.worktree)
         ? language.t("workspace.type.local")
         : language.t("workspace.type.sandbox")
-    const [child] = serverSync.child(session.directory, { bootstrap: false })
-    const home = serverSync.data.path.home
+    const [child] = serverSync().child(session.directory, { bootstrap: false })
+    const home = serverSync().data.path.home
     const path = home ? session.directory.replace(home, "~") : session.directory
     const name = child.vcs?.branch ?? getFilename(session.directory)
     return `${projectLabel} / ${kind} : ${name || path}`
@@ -108,7 +108,7 @@ export function DialogArchivedSessions() {
 
       let cursor: number | undefined
       while (true) {
-        const result = await serverSDK.client.experimental.session.list({
+        const result = await serverSDK().client.experimental.session.list({
           archived: true,
           roots: true,
           directory,
@@ -158,11 +158,11 @@ export function DialogArchivedSessions() {
     if (!session) return
     if (store.restoring) return
     setStore("restoring", session.id)
-    void serverSDK.client.session
+    void serverSDK().client.session
       .update({ sessionID: session.id, time: { archived: null } })
       .then(() => {
         showToast({ title: language.t("toast.session.restore.success.title") })
-        return Promise.all([loadArchivedSessions(), serverSync.project.loadSessions(session.directory)]).catch(
+        return Promise.all([loadArchivedSessions(), serverSync().project.loadSessions(session.directory)]).catch(
           (error: unknown) => {
             showToast({
               variant: "error",
