@@ -1,13 +1,12 @@
 /// <reference lib="webworker" />
 
-import { ShikiStreamTokenizer } from "@shikijs/stream"
+import { ShikiStreamTokenizer, type ThemedToken } from "@pierre/diffs"
 import {
   bundledLanguages,
   createHighlighter,
   getTokenStyleObject,
   stringifyTokenStyle,
   type BundledLanguage,
-  type ThemedToken,
 } from "shiki"
 import type { MarkdownToken, MarkdownWorkerRequest, MarkdownWorkerResponse } from "./markdown-worker-protocol"
 import { createLatestWorkerQueue } from "./markdown-worker-queue"
