@@ -838,7 +838,7 @@ export function RunFooterView(props: RunFooterViewProps) {
                   backgroundColor="transparent"
                 >
                   <Show when={busy() && !exiting()}>
-                    <box flexShrink={0}>
+                    <box width={1} flexShrink={0} overflow="hidden">
                       <SpinnerIcon color={spin().color} frames={spin().frames} interval={40} />
                     </box>
                   </Show>
