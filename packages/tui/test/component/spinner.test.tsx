@@ -44,6 +44,15 @@ test("spinner renders when the opentui-spinner solid extension is unavailable", 
   }
 })
 
+test("prompt running status spinner uses one-cell frames", async () => {
+  const source = await Bun.file(new URL("../../src/component/prompt/index.tsx", import.meta.url)).text()
+
+  expect(source).toContain("frames={SPINNER_FRAMES}")
+  expect(source).not.toContain("createFrames")
+  expect(source).not.toContain("createColors")
+  expect(source).not.toContain('style: "blocks"')
+})
+
 async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
   for (let attempt = 0; attempt < 5; attempt++) {
     await app.renderOnce()
