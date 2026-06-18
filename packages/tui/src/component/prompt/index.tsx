@@ -10,7 +10,6 @@ import {
 } from "@opentui/core"
 import type { CommandContext } from "@opentui/keymap"
 import { createEffect, createMemo, onMount, createSignal, onCleanup, on, Show, Switch, Match } from "solid-js"
-import "opentui-spinner/solid"
 import path from "path"
 import { fileURLToPath } from "url"
 import { useLocal } from "../../context/local"
@@ -19,7 +18,7 @@ import { tint, useTheme } from "../../context/theme"
 import { EmptyBorder, SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { useClipboard } from "../../context/clipboard"
-import { Spinner } from "../spinner"
+import { Spinner, SpinnerIcon } from "../spinner"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useProject } from "../../context/project"
@@ -1511,7 +1510,7 @@ export function Prompt(props: PromptProps) {
                 <box flexShrink={0} flexDirection="row" gap={1}>
                   <box marginLeft={1}>
                     <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
-                      <spinner color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
+                      <SpinnerIcon color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
                     </Show>
                   </box>
                   <box flexDirection="row" gap={1} flexShrink={0}>
