@@ -18,7 +18,7 @@ import { tint, useTheme } from "../../context/theme"
 import { EmptyBorder, SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { useClipboard } from "../../context/clipboard"
-import { Spinner, SpinnerIcon } from "../spinner"
+import { SPINNER_FRAMES, Spinner, SpinnerIcon } from "../spinner"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useProject } from "../../context/project"
@@ -40,7 +40,6 @@ import type { AssistantMessage, FilePart, UserMessage } from "@opencode-ai/sdk/v
 import { Locale } from "../../util/locale"
 import { errorMessage } from "../../util/error"
 import { formatDuration } from "../../util/format"
-import { createColors, createFrames } from "../../ui/spinner"
 import { useDialog } from "../../ui/dialog"
 import { DialogProvider as DialogProviderConnect } from "../dialog-provider"
 import { DialogAlert } from "../../ui/dialog-alert"
@@ -1312,28 +1311,12 @@ export function Prompt(props: PromptProps) {
     return `Ask anything... "${list()[store.placeholder % list().length]}"`
   })
 
-  const spinnerDef = createMemo(() => {
+  const spinnerColor = createMemo(() => {
     const agent =
       status().type !== "idle"
         ? (local.agent.list().find((a) => a.name === lastUserMessage()?.agent) ?? local.agent.current())
         : local.agent.current()
-    const color = agent ? local.agent.color(agent.name) : theme.border
-    return {
-      frames: createFrames({
-        color,
-        style: "blocks",
-        inactiveFactor: 0.6,
-        // enableFading: false,
-        minAlpha: 0.3,
-      }),
-      color: createColors({
-        color,
-        style: "blocks",
-        inactiveFactor: 0.6,
-        // enableFading: false,
-        minAlpha: 0.3,
-      }),
-    }
+    return agent ? local.agent.color(agent.name) : theme.border
   })
   const maxHeight = createMemo(() => tuiConfig.prompt?.max_height ?? Math.max(6, Math.floor(dimensions().height / 3)))
   const moveLabelWidth = createMemo(() => Math.max(12, Math.min(44, dimensions().width - 48)))
@@ -1510,7 +1493,7 @@ export function Prompt(props: PromptProps) {
                 <box flexShrink={0} flexDirection="row" gap={1}>
                   <box marginLeft={1}>
                     <Show when={kv.get("animations_enabled", true)} fallback={<text fg={theme.textMuted}>[⋯]</text>}>
-                      <SpinnerIcon color={spinnerDef().color} frames={spinnerDef().frames} interval={40} />
+                      <SpinnerIcon color={spinnerColor()} frames={SPINNER_FRAMES} interval={80} />
                     </Show>
                   </box>
                   <box flexDirection="row" gap={1} flexShrink={0}>
