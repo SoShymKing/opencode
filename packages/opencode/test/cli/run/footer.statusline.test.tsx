@@ -29,6 +29,7 @@ test("running footer keeps interrupt hint beside a one-cell spinner", async () =
       const interruptStart = statusline.indexOf("esc interrupt")
       positions.push(interruptStart)
       gaps.push(interruptStart - modeEnd)
+      expect(statusline.slice(modeEnd, interruptStart)).not.toMatch(/[■⬝]/)
       await Bun.sleep(45)
     }
 
