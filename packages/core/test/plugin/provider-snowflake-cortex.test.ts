@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { SnowflakeCortexPlugin, cortexFetch } from "@opencode-ai/core/plugin/provider/snowflake-cortex"
 import { ProviderPlugins } from "@opencode-ai/core/plugin/provider"
-import { expectPluginRegistered, it, model, withEnv } from "./provider-helper"
+import { addPlugin, expectPluginRegistered, it, model, withEnv } from "./provider-helper"
 
 describe("SnowflakeCortexPlugin", () => {
   it.effect("is registered in ProviderPlugins before OpenAICompatiblePlugin", () =>
@@ -20,7 +20,7 @@ describe("SnowflakeCortexPlugin", () => {
   it.effect("ignores non-snowflake-cortex providers", () =>
     Effect.gen(function* () {
       const plugin = yield* PluginV2.Service
-      yield* plugin.add(SnowflakeCortexPlugin)
+      yield* addPlugin(plugin, SnowflakeCortexPlugin)
       const result = yield* plugin.trigger(
         "aisdk.sdk",
         { model: model("openai", "gpt-4"), package: "@ai-sdk/openai", options: { name: "openai" } },
@@ -34,7 +34,7 @@ describe("SnowflakeCortexPlugin", () => {
     withEnv({ SNOWFLAKE_CORTEX_PAT: "test-pat" }, () =>
       Effect.gen(function* () {
         const plugin = yield* PluginV2.Service
-        yield* plugin.add(SnowflakeCortexPlugin)
+        yield* addPlugin(plugin, SnowflakeCortexPlugin)
         const result = yield* plugin.trigger(
           "aisdk.sdk",
           {
@@ -53,7 +53,7 @@ describe("SnowflakeCortexPlugin", () => {
     withEnv({ SNOWFLAKE_CORTEX_PAT: undefined }, () =>
       Effect.gen(function* () {
         const plugin = yield* PluginV2.Service
-        yield* plugin.add(SnowflakeCortexPlugin)
+        yield* addPlugin(plugin, SnowflakeCortexPlugin)
         const result = yield* plugin.trigger(
           "aisdk.sdk",
           {
@@ -72,12 +72,54 @@ describe("SnowflakeCortexPlugin", () => {
     ),
   )
 
+  it.effect("uses SNOWFLAKE_CORTEX_TOKEN env var", () =>
+    withEnv({ SNOWFLAKE_CORTEX_TOKEN: "oauth-token", SNOWFLAKE_CORTEX_PAT: undefined }, () =>
+      Effect.gen(function* () {
+        const plugin = yield* PluginV2.Service
+        yield* addPlugin(plugin, SnowflakeCortexPlugin)
+        const result = yield* plugin.trigger(
+          "aisdk.sdk",
+          {
+            model: model("snowflake-cortex", "claude-sonnet-4-6"),
+            package: "@ai-sdk/openai-compatible",
+            options: { name: "snowflake-cortex", baseURL: "https://test.snowflakecomputing.com/api/v2/cortex/v1" },
+          },
+          {},
+        )
+        expect(result.sdk).toBeDefined()
+      }),
+    ),
+  )
+
+  it.effect("falls back to options.token when no Snowflake env token is set", () =>
+    withEnv({ SNOWFLAKE_CORTEX_TOKEN: undefined, SNOWFLAKE_CORTEX_PAT: undefined }, () =>
+      Effect.gen(function* () {
+        const plugin = yield* PluginV2.Service
+        yield* addPlugin(plugin, SnowflakeCortexPlugin)
+        const result = yield* plugin.trigger(
+          "aisdk.sdk",
+          {
+            model: model("snowflake-cortex", "claude-sonnet-4-6"),
+            package: "@ai-sdk/openai-compatible",
+            options: {
+              name: "snowflake-cortex",
+              baseURL: "https://test.snowflakecomputing.com/api/v2/cortex/v1",
+              token: "options-token",
+            },
+          },
+          {},
+        )
+        expect(result.sdk).toBeDefined()
+      }),
+    ),
+  )
+
   it.effect("sets includeUsage on the SDK options", () =>
     withEnv({ SNOWFLAKE_CORTEX_PAT: "test-pat" }, () =>
       Effect.gen(function* () {
         const plugin = yield* PluginV2.Service
         const captured: Record<string, unknown>[] = []
-        yield* plugin.add(SnowflakeCortexPlugin)
+        yield* addPlugin(plugin, SnowflakeCortexPlugin)
         yield* plugin.add({
           id: PluginV2.ID.make("inspector"),
           effect: Effect.succeed({

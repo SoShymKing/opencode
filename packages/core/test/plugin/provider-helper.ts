@@ -1,8 +1,11 @@
 import { Npm } from "@opencode-ai/core/npm"
+import type { Plugin } from "@opencode-ai/plugin/v2/effect"
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { expect } from "bun:test"
 import { Effect, Layer, Option } from "effect"
 import { Catalog } from "@opencode-ai/core/catalog"
+import { Integration } from "@opencode-ai/core/integration"
+import { Credential } from "@opencode-ai/core/credential"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -11,8 +14,15 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { location } from "../fixture/location"
 import { testEffect } from "../lib/effect"
+import { aisdkHost, catalogHost, host, integrationHost } from "./host"
 
 export const fixtureProvider = new URL("./fixtures/provider-factory.ts", import.meta.url).href
+
+export function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("Expected value")
+  return value
+}
+
 const locationLayer = Layer.succeed(
   Location.Service,
   Location.Service.of(location({ directory: AbsolutePath.make("test") })),
@@ -21,16 +31,17 @@ const locationLayer = Layer.succeed(
 export const npmLayer = Layer.succeed(
   Npm.Service,
   Npm.Service.of({
-    add: () => Effect.succeed({ directory: "", entrypoint: Option.none<string>() }),
+    add: () => Effect.succeed({ directory: "", entrypoint: undefined }),
     install: () => Effect.void,
-    which: () => Effect.succeed(Option.none<string>()),
+    which: () => Effect.succeed(undefined),
   }),
 )
 
 export const catalogLayer = Layer.succeed(
   Catalog.Service,
   Catalog.Service.of({
-    transform: () => Effect.die("unexpected catalog.transform"),
+    transform: (_transform) => Effect.die("unexpected catalog.transform"),
+    rebuild: () => Effect.die("unexpected catalog.rebuild"),
     provider: {
       get: () => Effect.die("unexpected provider.get"),
       all: () => Effect.succeed([]),
@@ -40,19 +51,57 @@ export const catalogLayer = Layer.succeed(
       get: () => Effect.die("unexpected model.get"),
       all: () => Effect.succeed([]),
       available: () => Effect.succeed([]),
-      default: () => Effect.succeed(Option.none<ModelV2.Info>()),
-      small: () => Effect.succeed(Option.none<ModelV2.Info>()),
+      default: () => Effect.succeed(undefined),
+      small: () => Effect.succeed(undefined),
     },
   }),
 )
 
+const integrations = Integration.locationLayer.pipe(
+  Layer.provide(EventV2.defaultLayer),
+  Layer.provide(
+    Layer.mock(Credential.Service)({
+      create: () => Effect.die("unexpected credential creation"),
+      all: () => Effect.succeed([]),
+      list: () => Effect.succeed([]),
+    }),
+  ),
+)
+
 export const it = testEffect(
   Catalog.locationLayer.pipe(
+    Layer.provideMerge(integrations),
+    Layer.provideMerge(
+      Layer.mock(Credential.Service)({
+        all: () => Effect.succeed([]),
+      }),
+    ),
     Layer.provideMerge(EventV2.defaultLayer),
     Layer.provideMerge(locationLayer),
     Layer.provideMerge(npmLayer),
+    Layer.provideMerge(PluginV2.locationLayer.pipe(Layer.provide(EventV2.defaultLayer))),
   ),
 )
+
+export function addPlugin(plugin: PluginV2.Interface, definition: Plugin<any>) {
+  return Effect.gen(function* () {
+    const catalog = yield* Effect.serviceOption(Catalog.Service)
+    const integration = yield* Effect.serviceOption(Integration.Service)
+    const npm = yield* Effect.serviceOption(Npm.Service)
+    const effect =
+      typeof definition.effect === "function"
+        ? definition.effect(
+            host({
+              aisdk: aisdkHost(plugin),
+              ...(Option.isSome(catalog) ? { catalog: catalogHost(catalog.value) } : {}),
+              ...(Option.isSome(integration) ? { integration: integrationHost(integration.value) } : {}),
+              ...(Option.isSome(npm) ? { npm: npm.value } : {}),
+            }),
+          )
+        : definition.effect
+    yield* plugin.add({ id: definition.id, effect })
+  })
+}
 
 type ProviderInput = Partial<Omit<ProviderV2.Info, "api" | "request">> & {
   api?: ProviderV2.Api
