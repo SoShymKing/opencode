@@ -569,7 +569,7 @@ export type WithParts = {
 }
 
 const options = {
-  sync: {
+  durable: {
     aggregate: "sessionID",
     version: 1,
   },
