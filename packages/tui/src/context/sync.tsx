@@ -31,6 +31,7 @@ import { useArgs } from "./args"
 import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
+import { SESSION_LIST_REQUEST_WINDOW_KEY, sessionListRequestStart } from "../util/session-list-window"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -159,9 +160,14 @@ export const {
       }
     }
 
+    function sessionListRequestQuery() {
+      const start = sessionListRequestStart(kv.get(SESSION_LIST_REQUEST_WINDOW_KEY))
+      return { ...(start === undefined ? {} : { start }), ...sessionListQuery() }
+    }
+
     function listSessions() {
       return sdk.client.session
-        .list({ start: Date.now() - 30 * 24 * 60 * 60 * 1000, ...sessionListQuery() })
+        .list(sessionListRequestQuery())
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
@@ -558,7 +564,7 @@ export const {
           return undefined
         },
         query() {
-          return sessionListQuery()
+          return sessionListRequestQuery()
         },
         async refresh() {
           const list = await listSessions()

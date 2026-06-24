@@ -83,6 +83,11 @@ import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
+import {
+  SESSION_LIST_REQUEST_WINDOW_KEY,
+  nextSessionListRequestWindow,
+  sessionListRequestWindowLabel,
+} from "./util/session-list-window"
 
 const appGlobalBindingCommands = [
   "session.list",
@@ -130,6 +135,7 @@ const appBindingCommands = [
   "app.toggle.diffwrap",
   "app.toggle.paste_summary",
   "app.toggle.session_directory_filter",
+  "app.cycle.session_list_request_window",
 ] as const
 
 export type TuiInput = {
@@ -919,6 +925,18 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         category: "System",
         run: async () => {
           kv.set("session_directory_filter_enabled", !kv.get("session_directory_filter_enabled", true))
+          await sync.session.refresh()
+          dialog.clear()
+        },
+      },
+      {
+        name: "app.cycle.session_list_request_window",
+        title: `Set session list window to ${sessionListRequestWindowLabel(
+          nextSessionListRequestWindow(kv.get(SESSION_LIST_REQUEST_WINDOW_KEY)),
+        )}`,
+        category: "System",
+        run: async () => {
+          kv.set(SESSION_LIST_REQUEST_WINDOW_KEY, nextSessionListRequestWindow(kv.get(SESSION_LIST_REQUEST_WINDOW_KEY)))
           await sync.session.refresh()
           dialog.clear()
         },
