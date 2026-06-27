@@ -56,6 +56,7 @@ import { FrecencyProvider } from "./component/prompt/frecency"
 import { PromptStashProvider } from "./component/prompt/stash"
 import { DialogAlert } from "./ui/dialog-alert"
 import { DialogConfirm } from "./ui/dialog-confirm"
+import { DialogPrompt } from "./ui/dialog-prompt"
 import { ToastProvider, useToast } from "./ui/toast"
 import { isDefaultTitle } from "./util/session"
 import { KVProvider, useKV } from "./context/kv"
@@ -84,6 +85,12 @@ import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
 import { destroyRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
+import {
+  SESSION_LIST_REQUEST_WINDOW_KEY,
+  parseSessionListRequestWindowInput,
+  sessionListRequestWindowInput,
+  sessionListRequestWindowLabel,
+} from "./util/session-list-window"
 
 const appGlobalBindingCommands = [
   "session.list",
@@ -375,6 +382,37 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
   const pluginRuntime = usePluginRuntime()
   const attention = createTuiAttention({ renderer, config: tuiConfig, kv })
   const clipboard = useClipboard()
+
+  async function promptSessionListRequestWindow(value = sessionListRequestWindowInput(kv.get(SESSION_LIST_REQUEST_WINDOW_KEY))) {
+    const input = await DialogPrompt.show(dialog, "Set session window days", {
+      value,
+      placeholder: "30 or all",
+      description: () => (
+        <text fg={theme.textMuted}>
+          Current: {sessionListRequestWindowLabel(kv.get(SESSION_LIST_REQUEST_WINDOW_KEY))}. Enter a whole number of
+          days, or all.
+        </text>
+      ),
+    })
+    if (input === null) return
+
+    const window = parseSessionListRequestWindowInput(input)
+    if (window === undefined) {
+      toast.show({
+        variant: "error",
+        message: "Enter a whole number of days, or all.",
+      })
+      return promptSessionListRequestWindow(input)
+    }
+
+    kv.set(SESSION_LIST_REQUEST_WINDOW_KEY, window)
+    await sync.session.refresh()
+    dialog.clear()
+    toast.show({
+      variant: "success",
+      message: `Session window set to ${sessionListRequestWindowLabel(window)}.`,
+    })
+  }
 
   const api = createTuiApi(
     createTuiApiAdapters({
@@ -932,6 +970,12 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           await sync.session.refresh()
           dialog.clear()
         },
+      },
+      {
+        name: "app.set.session_window_days",
+        title: "Set session window days",
+        category: "System",
+        run: () => promptSessionListRequestWindow(),
       },
     ].map((command) => ({
       namespace: "palette",
