@@ -43,6 +43,20 @@
 
 ---
 
+### Sobre a branch `ws`
+
+Este README documenta a branch `ws` como uma branch em estilo de distribuição enquanto suas mudanças continuam fora do `dev` upstream.
+
+Destaques em relação ao `dev`:
+
+- Tratamento de sessões sem resposta e retentativas após abort.
+- Recuperação após reinício do TUI interrupt worker e estabilidade de spinner/renderização.
+- Restauração de sessões arquivadas nos fluxos TUI, Web, API e SDK.
+- Intervalo de tempo configurável para a lista de sessões do TUI.
+- Limpeza local de smoke/config em `.opencode`.
+
+Os comandos de instalação abaixo não foram alterados; use o código-fonte da branch `ws` se quiser essas mudanças específicas da branch.
+
 ### Instalação
 
 ```bash

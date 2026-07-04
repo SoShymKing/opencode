@@ -43,6 +43,20 @@
 
 ---
 
+### Om `ws`-branchen
+
+Denne README-en beskriver `ws`-branchen som en distribusjonslignende branch mens endringene fortsatt er utenfor upstream `dev`.
+
+Høydepunkter sammenlignet med `dev`:
+
+- Håndtering av sessions uten svar og abort-retry.
+- TUI interrupt worker restart-recovery og mer stabil spinner/rendering.
+- Gjenoppretting av arkiverte sessions i TUI-, Web-, API- og SDK-flyter.
+- Konfigurerbart tidsrom for TUI-sessionlisten.
+- Opprydding av lokale `.opencode` smoke/config-filer.
+
+Installasjonskommandoene nedenfor er uendret; bruk kildekoden fra `ws`-branchen hvis du vil ha disse branch-spesifikke endringene.
+
 ### Installasjon
 
 ```bash

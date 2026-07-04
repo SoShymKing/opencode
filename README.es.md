@@ -43,6 +43,20 @@
 
 ---
 
+### Acerca de la rama `ws`
+
+Este README documenta la rama `ws` como una rama de estilo distribución mientras sus cambios siguen fuera del `dev` upstream.
+
+Aspectos destacados frente a `dev`:
+
+- Manejo de sesiones sin respuesta y reintentos de abort.
+- Recuperación al reiniciar el TUI interrupt worker y mayor estabilidad de spinner/renderizado.
+- Restauración de sesiones archivadas en flujos TUI, Web, API y SDK.
+- Rango de tiempo configurable para la lista de sesiones del TUI.
+- Limpieza local de smoke/config en `.opencode`.
+
+Los comandos de instalación de abajo no cambian; usa el código fuente de la rama `ws` si quieres estos cambios específicos de la rama.
+
 ### Instalación
 
 ```bash

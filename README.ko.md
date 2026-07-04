@@ -43,6 +43,20 @@
 
 ---
 
+### `ws` 브랜치 안내
+
+이 README는 변경사항이 upstream `dev`에 아직 반영되지 않은 동안 `ws` 브랜치를 배포형 브랜치처럼 설명합니다.
+
+`dev`와 비교한 주요 내용:
+
+- 세션 무응답 및 abort 재시도 처리.
+- TUI interrupt worker 재시작 복구와 spinner/렌더링 안정화.
+- TUI, Web, API, SDK 흐름의 보관 세션 복원.
+- TUI 세션 목록 조회 기간 설정.
+- 로컬 `.opencode` smoke/config 정리.
+
+아래 설치 명령은 변경하지 않았습니다. 이 브랜치 전용 변경사항이 필요하면 `ws` 브랜치 소스를 사용하세요.
+
 ### 설치
 
 ```bash

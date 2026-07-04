@@ -43,6 +43,20 @@
 
 ---
 
+### Về nhánh `ws`
+
+README này ghi lại nhánh `ws` như một nhánh kiểu phân phối trong khi các thay đổi của nó vẫn chưa nằm trong upstream `dev`.
+
+Điểm nổi bật so với `dev`:
+
+- Xử lý session không phản hồi và retry sau abort.
+- Khôi phục sau khi TUI interrupt worker restart và ổn định spinner/rendering.
+- Khôi phục session đã lưu trữ trong các luồng TUI, Web, API và SDK.
+- Khoảng thời gian có thể cấu hình cho danh sách session của TUI.
+- Dọn dẹp smoke/config cục bộ trong `.opencode`.
+
+Các lệnh cài đặt bên dưới không thay đổi; hãy dùng mã nguồn từ nhánh `ws` nếu bạn muốn các thay đổi riêng của nhánh này.
+
 ### Cài đặt
 
 ```bash

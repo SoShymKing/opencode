@@ -43,6 +43,20 @@
 
 ---
 
+### `ws` dalı hakkında
+
+Bu README, değişiklikleri upstream `dev` dışında kaldığı sürece `ws` dalını dağıtım benzeri bir dal olarak belgeler.
+
+`dev` ile karşılaştırıldığında öne çıkanlar:
+
+- Session yanıt vermeme ve abort retry işleme.
+- TUI interrupt worker yeniden başlatma kurtarması ve spinner/rendering kararlılığı.
+- TUI, Web, API ve SDK akışlarında arşivlenmiş session geri yükleme.
+- TUI session listesi için yapılandırılabilir zaman aralığı.
+- Yerel `.opencode` smoke/config temizliği.
+
+Aşağıdaki kurulum komutları değişmedi; bu dala özel değişiklikleri istiyorsanız `ws` dalının kaynak kodunu kullanın.
+
 ### Kurulum
 
 ```bash

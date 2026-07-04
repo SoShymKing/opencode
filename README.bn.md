@@ -43,6 +43,20 @@
 
 ---
 
+### `ws` ব্রাঞ্চ সম্পর্কে
+
+এই README `ws` ব্রাঞ্চকে একটি distribution-style ব্রাঞ্চ হিসেবে নথিভুক্ত করে, যতক্ষণ এর পরিবর্তনগুলো upstream `dev`-এ নেই।
+
+`dev` এর তুলনায় প্রধান পরিবর্তন:
+
+- Session no-response এবং abort retry handling.
+- TUI interrupt worker restart recovery এবং spinner/rendering stability.
+- TUI, Web, API, এবং SDK flow-তে archived session restoration.
+- TUI session list-এর জন্য configurable time range.
+- Local `.opencode` smoke/config cleanup.
+
+নিচের ইনস্টলেশন কমান্ডগুলো অপরিবর্তিত আছে; এই branch-specific পরিবর্তনগুলো চাইলে `ws` ব্রাঞ্চের source ব্যবহার করুন।
+
 ### ইনস্টলেশন (Installation)
 
 ```bash

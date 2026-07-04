@@ -43,6 +43,20 @@
 
 ---
 
+### 關於 `ws` 分支
+
+在這些變更尚未進入上游 `dev` 期間，本 README 將 `ws` 分支作為類似發行版的分支來說明。
+
+相較於 `dev` 的主要內容：
+
+- Session 無回應與 abort 重試處理。
+- TUI interrupt worker 重新啟動復原，以及 spinner/渲染穩定性改進。
+- TUI、Web、API、SDK 流程中的封存 session 復原。
+- 可設定的 TUI session 清單查詢時間範圍。
+- 本機 `.opencode` smoke/config 清理。
+
+下方安裝指令保持不變；如果需要這些分支專屬變更，請使用 `ws` 分支原始碼。
+
 ### 安裝
 
 ```bash

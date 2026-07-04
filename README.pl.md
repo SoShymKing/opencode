@@ -43,6 +43,20 @@
 
 ---
 
+### O gałęzi `ws`
+
+Ten README opisuje gałąź `ws` jako gałąź w stylu dystrybucji, dopóki jej zmiany pozostają poza upstreamowym `dev`.
+
+Najważniejsze zmiany względem `dev`:
+
+- Obsługa braku odpowiedzi sesji i ponowień po abort.
+- Odzyskiwanie po restarcie TUI interrupt worker oraz stabilniejsze spinner/rendering.
+- Przywracanie zarchiwizowanych sesji w przepływach TUI, Web, API i SDK.
+- Konfigurowalny zakres czasu dla listy sesji TUI.
+- Lokalne porządki w plikach smoke/config `.opencode`.
+
+Poniższe komendy instalacyjne pozostają bez zmian; użyj źródeł z gałęzi `ws`, jeśli chcesz korzystać z tych zmian specyficznych dla gałęzi.
+
 ### Instalacja
 
 ```bash

@@ -43,6 +43,20 @@
 
 ---
 
+### O `ws` branchu
+
+Ovaj README opisuje `ws` branch kao branch u stilu distribucije dok njegove izmjene još nisu u upstream `dev`.
+
+Glavne razlike u odnosu na `dev`:
+
+- Obrada sesija bez odgovora i abort retry logike.
+- Oporavak nakon restartovanja TUI interrupt workera i stabilniji spinner/rendering.
+- Vraćanje arhiviranih sesija u TUI, Web, API i SDK tokovima.
+- Podesiv vremenski raspon za TUI listu sesija.
+- Lokalno čišćenje `.opencode` smoke/config datoteka.
+
+Instalacijske komande ispod nisu promijenjene; koristi source iz `ws` brancha ako želiš ove branch-specifične izmjene.
+
 ### Instalacija
 
 ```bash
