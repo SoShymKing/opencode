@@ -49,12 +49,8 @@ import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionEvent } from "@opencode-ai/core/session/event"
-import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { AgentAttachment, FileAttachment, Prompt, Source } from "@opencode-ai/core/session/prompt"
-import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
@@ -123,7 +119,7 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
 
-export const layer = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const status = yield* SessionStatus.Service
@@ -529,15 +525,6 @@ export const layer = Layer.effect(
               },
             }
             yield* sessions.updatePart(part)
-            if (flags.experimentalEventSystem) {
-              yield* events.publish(SessionEvent.Shell.Started, {
-                sessionID: input.sessionID,
-                messageID: SessionMessage.ID.create(),
-                timestamp: DateTime.makeUnsafe(started),
-                callID: part.callID,
-                command: input.command,
-              })
-            }
             return { msg, part, cwd: ctx.directory }
           }).pipe(Effect.ensuring(markReady))
 
@@ -553,14 +540,6 @@ export const layer = Layer.effect(
                 output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
               }
               const completed = Date.now()
-              if (flags.experimentalEventSystem) {
-                yield* events.publish(SessionEvent.Shell.Ended, {
-                  sessionID: input.sessionID,
-                  timestamp: DateTime.makeUnsafe(completed),
-                  callID: part.callID,
-                  output,
-                })
-              }
               if (!msg.time.completed) {
                 msg.time.completed = completed
                 yield* sessions.updateMessage(msg)
@@ -673,12 +652,6 @@ export const layer = Layer.effect(
         throw error
       }
 
-      const current = yield* db
-        .select({ agent: SessionTable.agent, model: SessionTable.model })
-        .from(SessionTable)
-        .where(eq(SessionTable.id, input.sessionID))
-        .get()
-        .pipe(Effect.orDie)
       const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
@@ -705,28 +678,22 @@ export const layer = Layer.effect(
         format: input.format,
       }
 
-      if (current?.agent !== info.agent) {
-        yield* events.publish(SessionEvent.AgentSwitched, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
-          agent: info.agent,
-        })
-      }
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (
-        current?.model?.providerID !== info.model.providerID ||
-        current.model.id !== info.model.modelID ||
-        (current.model.variant === "default" ? undefined : current.model.variant) !== info.model.variant
+        current.agent !== info.agent ||
+        current.model?.providerID !== info.model.providerID ||
+        current.model?.id !== info.model.modelID ||
+        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
       ) {
-        yield* events.publish(SessionEvent.ModelSwitched, {
+        yield* sessions.setAgentModel({
           sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
+          agent: info.agent,
           model: {
-            id: ModelV2.ID.make(info.model.modelID),
-            providerID: ProviderV2.ID.make(info.model.providerID),
-            variant: ModelV2.VariantID.make(info.model.variant ?? "default"),
+            id: info.model.modelID,
+            providerID: info.model.providerID,
+            variant: info.model.variant ?? "default",
           },
+          time: info.time.created,
         })
       }
 
@@ -1087,76 +1054,6 @@ export const layer = Layer.effect(
 
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
-      const nextPrompt = parts.reduce(
-        (result, part) => {
-          if (part.type === "text") {
-            if (part.synthetic) result.synthetic.push(part.text)
-            else result.text.push(part.text)
-          }
-          if (part.type === "file") {
-            result.files.push(
-              new FileAttachment({
-                uri: part.url,
-                mime: part.mime,
-                name: part.filename,
-                source: part.source
-                  ? new Source({
-                      start: part.source.text.start,
-                      end: part.source.text.end,
-                      text: part.source.text.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          if (part.type === "agent") {
-            result.agents.push(
-              new AgentAttachment({
-                name: part.name,
-                source: part.source
-                  ? new Source({
-                      start: part.source.start,
-                      end: part.source.end,
-                      text: part.source.value,
-                    })
-                  : undefined,
-              }),
-            )
-          }
-          return result
-        },
-        {
-          text: [] as string[],
-          files: [] as FileAttachment[],
-          agents: [] as AgentAttachment[],
-          synthetic: [] as string[],
-        },
-      )
-      // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-      if (flags.experimentalEventSystem) {
-        yield* events.publish(SessionEvent.Prompted, {
-          sessionID: input.sessionID,
-          messageID: SessionMessage.ID.create(),
-          timestamp: DateTime.makeUnsafe(info.time.created),
-          delivery: "steer",
-          prompt: new Prompt({
-            text: nextPrompt.text.join("\n"),
-            files: nextPrompt.files,
-            agents: nextPrompt.agents,
-          }),
-        })
-      }
-      for (const text of nextPrompt.synthetic) {
-        // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-        if (flags.experimentalEventSystem) {
-          yield* events.publish(SessionEvent.Synthetic, {
-            sessionID: input.sessionID,
-            messageID: SessionMessage.ID.create(),
-            timestamp: DateTime.makeUnsafe(info.time.created),
-            text,
-          })
-        }
-      }
 
       return { info, parts }
     }, Effect.scoped)
@@ -1349,6 +1246,7 @@ export const layer = Layer.effect(
               Effect.provideService(ToolRegistry.Service, registry),
               Effect.provideService(MCP.Service, mcp),
               Effect.provideService(Truncate.Service, truncate),
+              Effect.provideService(RuntimeFlags.Service, flags),
             )
 
             if (lastUser.format?.type === "json_schema") {
@@ -1365,13 +1263,19 @@ export const layer = Layer.effect(
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-            const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
+              sys.mcp(agent, session.permission),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
-            const system = [...env, ...instructions, ...(skills ? [skills] : [])]
+            const system = [
+              ...env,
+              ...instructions,
+              ...(mcpInstructions ? [mcpInstructions] : []),
+              ...(skills ? [skills] : []),
+            ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const postToolContinuation = isPostToolContinuation(lastAssistantMsg, lastAssistant?.finish)
@@ -1600,40 +1504,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = Layer.suspend(() =>
-  layer.pipe(
-    Layer.provide(SessionRunState.defaultLayer),
-    Layer.provide(SessionStatus.defaultLayer),
-    Layer.provide(SessionCompaction.defaultLayer),
-    Layer.provide(SessionProcessor.defaultLayer),
-    Layer.provide(Command.defaultLayer),
-    Layer.provide(Permission.defaultLayer),
-    Layer.provide(MCP.defaultLayer),
-    Layer.provide(LSP.defaultLayer),
-    Layer.provide(ToolRegistry.defaultLayer),
-    Layer.provide(Truncate.defaultLayer),
-    Layer.provide(Provider.defaultLayer),
-    Layer.provide(Config.defaultLayer),
-    Layer.provide(Instruction.defaultLayer),
-    Layer.provide(FSUtil.defaultLayer),
-    Layer.provide(Plugin.defaultLayer),
-    Layer.provide(Session.defaultLayer),
-    Layer.provide(SessionRevert.defaultLayer),
-    Layer.provide(SessionSummary.defaultLayer),
-    Layer.provide(Image.defaultLayer),
-    Layer.provide(
-      Layer.mergeAll(
-        Agent.defaultLayer,
-        Database.defaultLayer,
-        SystemPrompt.defaultLayer,
-        LLM.defaultLayer,
-        CrossSpawnSpawner.defaultLayer,
-        RuntimeFlags.defaultLayer,
-        EventV2Bridge.defaultLayer,
-      ),
-    ),
-  ),
-)
 const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
@@ -1738,33 +1608,37 @@ const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
-export const node = LayerNode.make(layer, [
-  SessionStatus.node,
-  Session.node,
-  Agent.node,
-  Provider.node,
-  SessionProcessor.node,
-  SessionCompaction.node,
-  Plugin.node,
-  Command.node,
-  Config.node,
-  Permission.node,
-  FSUtil.node,
-  MCP.node,
-  LSP.node,
-  ToolRegistry.node,
-  Truncate.node,
-  Image.node,
-  CrossSpawnSpawner.node,
-  Instruction.node,
-  SessionRunState.node,
-  SessionRevert.node,
-  SessionSummary.node,
-  SystemPrompt.node,
-  LLM.node,
-  EventV2Bridge.node,
-  RuntimeFlags.node,
-  Database.node,
-])
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [
+    SessionStatus.node,
+    Session.node,
+    Agent.node,
+    Provider.node,
+    SessionProcessor.node,
+    SessionCompaction.node,
+    Plugin.node,
+    Command.node,
+    Config.node,
+    Permission.node,
+    FSUtil.node,
+    MCP.node,
+    LSP.node,
+    ToolRegistry.node,
+    Truncate.node,
+    Image.node,
+    CrossSpawnSpawner.node,
+    Instruction.node,
+    SessionRunState.node,
+    SessionRevert.node,
+    SessionSummary.node,
+    SystemPrompt.node,
+    LLM.node,
+    EventV2Bridge.node,
+    RuntimeFlags.node,
+    Database.node,
+  ],
+})
 
 export * as SessionPrompt from "./prompt"

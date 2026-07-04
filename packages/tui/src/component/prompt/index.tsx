@@ -10,6 +10,7 @@ import {
 } from "@opentui/core"
 import type { CommandContext } from "@opentui/keymap"
 import { createEffect, createMemo, onMount, createSignal, onCleanup, on, Show, Switch, Match } from "solid-js"
+import { registerOpencodeSpinner } from "../register-spinner"
 import path from "path"
 import { fileURLToPath } from "url"
 import { useLocal } from "../../context/local"
@@ -54,6 +55,8 @@ import { useTuiConfig } from "../../config"
 import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
+
+registerOpencodeSpinner()
 
 export type PromptProps = {
   sessionID?: string
@@ -611,6 +614,7 @@ export function Prompt(props: PromptProps) {
       "prompt.stash",
       "prompt.stash.pop",
       "prompt.stash.list",
+      "prompt.skills",
       "session.interrupt",
       "workspace.set",
       "session.move",
@@ -1469,6 +1473,9 @@ export function Prompt(props: PromptProps) {
                       <text fg={fadeColor(highlight(), agentMetaAlpha())}>
                         {store.mode === "shell" ? "Shell" : Locale.titlecase(agent().name)}
                       </text>
+                      <Show when={store.mode === "normal" && local.permission.mode === "auto"}>
+                        <text fg={fadeColor(theme.textMuted, agentMetaAlpha())}>auto</text>
+                      </Show>
                       <Show when={store.mode === "normal"}>
                         <box flexDirection="row" gap={1}>
                           <text fg={fadeColor(theme.textMuted, modelMetaAlpha())}>·</text>

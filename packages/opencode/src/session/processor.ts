@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -28,7 +28,6 @@ import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import * as DateTime from "effect/DateTime"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ToolOutput, Usage, type LLMEvent } from "@opencode-ai/llm"
 
@@ -102,7 +101,7 @@ type StreamActivity = {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionProcessor") {}
 
-export const layer = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const session = yield* Session.Service
@@ -280,6 +279,8 @@ export const layer = Layer.effect(
             status: "error",
             input: match.part.state.input,
             error: errorMessage(error),
+            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+            metadata: match.part.state.metadata,
             time: { start: match.part.state.time.start, end: Date.now() },
           },
         })
@@ -292,7 +293,6 @@ export const layer = Layer.effect(
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
         if (!(reasoningID in ctx.reasoningMap)) return
-        // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
         if (mirrorAssistant) {
           yield* events.publish(SessionEvent.Reasoning.Ended, {
             sessionID: ctx.sessionID,
@@ -357,7 +357,6 @@ export const layer = Layer.effect(
           }
           return { call: ctx.toolcalls[input.id], part }
         }
-        // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
         const assistantMessageID = mirrorAssistant ? yield* ensureV2AssistantMessage() : undefined
         if (assistantMessageID) {
           yield* events.publish(SessionEvent.Tool.Input.Started, {
@@ -413,8 +412,6 @@ export const layer = Layer.effect(
         }
       }
 
-      const toolInput = (value: unknown): Record<string, any> => (isRecord(value) ? value : { value })
-
       const markVisiblePart = (increment = true) => {
         const now = Date.now()
         activity.firstVisiblePartAt ??= now
@@ -431,7 +428,6 @@ export const layer = Layer.effect(
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
             markVisiblePart()
-            // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (mirrorAssistant) {
               yield* events.publish(SessionEvent.Reasoning.Started, {
                 sessionID: ctx.sessionID,
@@ -511,7 +507,6 @@ export const layer = Layer.effect(
 
           case "tool-input-end": {
             const toolCall = yield* ensureToolCall(value)
-            // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
               yield* events.publish(SessionEvent.Tool.Input.Ended, {
@@ -533,20 +528,16 @@ export const layer = Layer.effect(
             markVisiblePart(false)
             const toolCall = yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
-            if (!toolCall.call.inputEnded) {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-              if (mirrorAssistant) {
-                const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
-                yield* events.publish(SessionEvent.Tool.Input.Ended, {
-                  sessionID: ctx.sessionID,
-                  assistantMessageID,
-                  callID: value.id,
-                  text: toolCall.call.raw,
-                  timestamp: DateTime.makeUnsafe(Date.now()),
-                })
-              }
+            if (!toolCall.call.inputEnded && mirrorAssistant) {
+              const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
+              yield* events.publish(SessionEvent.Tool.Input.Ended, {
+                sessionID: ctx.sessionID,
+                assistantMessageID,
+                callID: value.id,
+                text: toolCall.call.raw,
+                timestamp: DateTime.makeUnsafe(Date.now()),
+              })
             }
-            // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
               yield* events.publish(SessionEvent.Tool.Called, {
@@ -613,7 +604,6 @@ export const layer = Layer.effect(
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (mirrorAssistant) {
                 const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
                 yield* events.publish(SessionEvent.Tool.Failed, {
@@ -654,7 +644,6 @@ export const layer = Layer.effect(
                   : `${rawOutput.output}\n\n[${omitted} image${omitted === 1 ? "" : "s"} omitted: could not be resized below the image size limit.]`,
               attachments: attachments.length ? attachments : undefined,
             }
-            // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
               const content = [
@@ -713,7 +702,6 @@ export const layer = Layer.effect(
           case "tool-error": {
             markVisiblePart(false)
             const toolCall = yield* readToolCall(value.id)
-            // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
               yield* events.publish(SessionEvent.Tool.Failed, {
@@ -741,11 +729,8 @@ export const layer = Layer.effect(
           case "step-start":
             activity.partCount++
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
-            if (!ctx.assistantMessage.summary) {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-              if (mirrorAssistant) {
-                yield* ensureV2AssistantMessage()
-              }
+            if (!ctx.assistantMessage.summary && mirrorAssistant) {
+              yield* ensureV2AssistantMessage()
             }
             yield* session.updatePart({
               id: PartID.ascending(),
@@ -764,20 +749,17 @@ export const layer = Layer.effect(
               usage: value.usage ?? new Usage({}),
               metadata: value.providerMetadata,
             })
-            if (!ctx.assistantMessage.summary) {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-              if (mirrorAssistant) {
-                yield* events.publish(SessionEvent.Step.Ended, {
-                  sessionID: ctx.sessionID,
-                  assistantMessageID: yield* currentV2AssistantMessage(),
-                  finish: value.reason,
-                  cost: usage.cost,
-                  tokens: usage.tokens,
-                  snapshot: completedSnapshot,
-                  timestamp: DateTime.makeUnsafe(Date.now()),
-                })
-                ctx.v2AssistantMessageID = undefined
-              }
+            if (!ctx.assistantMessage.summary && mirrorAssistant) {
+              yield* events.publish(SessionEvent.Step.Ended, {
+                sessionID: ctx.sessionID,
+                assistantMessageID: yield* currentV2AssistantMessage(),
+                finish: value.reason,
+                cost: usage.cost,
+                tokens: usage.tokens,
+                snapshot: completedSnapshot,
+                timestamp: DateTime.makeUnsafe(Date.now()),
+              })
+              ctx.v2AssistantMessageID = undefined
             }
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
@@ -827,7 +809,6 @@ export const layer = Layer.effect(
           case "text-start":
             markVisiblePart()
             if (!ctx.assistantMessage.summary) {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
               if (mirrorAssistant) {
                 yield* events.publish(SessionEvent.Text.Started, {
                   sessionID: ctx.sessionID,
@@ -887,17 +868,14 @@ export const layer = Layer.effect(
               },
               { text: ctx.currentText.text },
             )).text
-            if (!ctx.assistantMessage.summary) {
-              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-              if (mirrorAssistant) {
-                yield* events.publish(SessionEvent.Text.Ended, {
-                  sessionID: ctx.sessionID,
-                  assistantMessageID: yield* currentV2AssistantMessage(),
-                  text: ctx.currentText.text,
-                  timestamp: DateTime.makeUnsafe(Date.now()),
-                  textID: value.id,
-                })
-              }
+            if (!ctx.assistantMessage.summary && mirrorAssistant) {
+              yield* events.publish(SessionEvent.Text.Ended, {
+                sessionID: ctx.sessionID,
+                assistantMessageID: yield* currentV2AssistantMessage(),
+                text: ctx.currentText.text,
+                timestamp: DateTime.makeUnsafe(Date.now()),
+                textID: value.id,
+              })
             }
             {
               const end = Date.now()
@@ -1019,19 +997,16 @@ export const layer = Layer.effect(
           yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
           return
         }
-        if (!ctx.assistantMessage.summary) {
-          // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-          if (mirrorAssistant) {
-            yield* events.publish(SessionEvent.Step.Failed, {
-              sessionID: ctx.sessionID,
-              assistantMessageID: yield* ensureV2AssistantMessage(),
-              error: {
-                type: "unknown",
-                message: errorMessage(e),
-              },
-              timestamp: DateTime.makeUnsafe(Date.now()),
-            })
-          }
+        if (!ctx.assistantMessage.summary && mirrorAssistant) {
+          yield* events.publish(SessionEvent.Step.Failed, {
+            sessionID: ctx.sessionID,
+            assistantMessageID: yield* ensureV2AssistantMessage(),
+            error: {
+              type: "unknown",
+              message: errorMessage(e),
+            },
+            timestamp: DateTime.makeUnsafe(Date.now()),
+          })
         }
         ctx.assistantMessage.error = error
         yield* events.publish(Session.Event.Error, {
@@ -1168,7 +1143,6 @@ export const layer = Layer.effect(
                 set: (info) => {
                   retryAttempt = info.attempt
                   activity.retryAttempt = info.attempt
-                  // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                   const event = mirrorAssistant
                     ? events.publish(SessionEvent.Retried, {
                         sessionID: ctx.sessionID,
@@ -1229,24 +1203,6 @@ export const layer = Layer.effect(
   }),
 )
 
-export const defaultLayer = Layer.suspend(() =>
-  layer.pipe(
-    Layer.provide(Session.defaultLayer),
-    Layer.provide(Snapshot.defaultLayer),
-    Layer.provide(Agent.defaultLayer),
-    Layer.provide(LLM.defaultLayer),
-    Layer.provide(Permission.defaultLayer),
-    Layer.provide(Plugin.defaultLayer),
-    Layer.provide(SessionSummary.defaultLayer),
-    Layer.provide(SessionStatus.defaultLayer),
-    Layer.provide(Image.defaultLayer),
-    Layer.provide(Config.defaultLayer),
-    Layer.provide(RuntimeFlags.defaultLayer),
-    Layer.provide(Database.defaultLayer),
-    Layer.provide(EventV2Bridge.defaultLayer),
-  ),
-)
-
 function isEmptyAssistantOutput(parts: MessageV2.Part[]) {
   if (parts.length === 0) return true
   if (parts.every((part) => part.type === "step-start")) return true
@@ -1261,20 +1217,24 @@ function isStructuralAssistantPart(part: MessageV2.Part) {
   return part.type === "step-start" || part.type === "step-finish"
 }
 
-export const node = LayerNode.make(layer, [
-  Session.node,
-  Config.node,
-  Snapshot.node,
-  Agent.node,
-  LLM.node,
-  Permission.node,
-  Plugin.node,
-  SessionSummary.node,
-  SessionStatus.node,
-  Image.node,
-  EventV2Bridge.node,
-  RuntimeFlags.node,
-  Database.node,
-])
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [
+    Session.node,
+    Config.node,
+    Snapshot.node,
+    Agent.node,
+    LLM.node,
+    Permission.node,
+    Plugin.node,
+    SessionSummary.node,
+    SessionStatus.node,
+    Image.node,
+    EventV2Bridge.node,
+    RuntimeFlags.node,
+    Database.node,
+  ],
+})
 
 export * as SessionProcessor from "./processor"

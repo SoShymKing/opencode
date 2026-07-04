@@ -4,6 +4,9 @@ import { useKV } from "../context/kv"
 import { useRenderer, type JSX } from "@opentui/solid"
 import type { ColorInput, RGBA } from "@opentui/core"
 import type { ColorGenerator } from "opentui-spinner"
+import { registerOpencodeSpinner } from "./register-spinner"
+
+registerOpencodeSpinner()
 
 export const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
