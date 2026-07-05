@@ -40,7 +40,70 @@ export const AuthError = namedError("ProviderAuthError", {
   message: Schema.String,
 })
 
-export const AbortedError = namedError("MessageAbortedError", { message: Schema.String })
+export const AbortSource = Schema.Literals([
+  "user_cancel",
+  "session_cancel",
+  "provider_abort",
+  "network_abort",
+  "first_byte_timeout",
+  "stream_idle_timeout",
+  "post_tool_first_event_timeout",
+  "no_visible_part_timeout",
+  "server_restart",
+  "client_disconnect",
+  "unknown",
+])
+export type AbortSource = Schema.Schema.Type<typeof AbortSource>
+
+export const RequestPhase = Schema.Literals([
+  "model_stream",
+  "post_tool_continuation",
+  "message_finalization",
+  "unknown",
+])
+export type RequestPhase = Schema.Schema.Type<typeof RequestPhase>
+
+export const NoResponseDiagnostics = Schema.Struct({
+  providerID: Schema.optional(Provider.ID),
+  modelID: Schema.optional(Model.ID),
+  sessionID: Schema.optional(SessionID),
+  messageID: Schema.optional(MessageID),
+  elapsedMs: Schema.optional(NonNegativeInt),
+  isPostToolContinuation: Schema.optional(Schema.Boolean),
+  retryAttempt: Schema.optional(NonNegativeInt),
+  firstStreamEventAt: Schema.optional(NonNegativeInt),
+  lastStreamEventAt: Schema.optional(NonNegativeInt),
+  firstVisiblePartAt: Schema.optional(NonNegativeInt),
+  lastVisiblePartAt: Schema.optional(NonNegativeInt),
+  partCount: Schema.optional(NonNegativeInt),
+  tokenCount: Schema.optional(NonNegativeInt),
+})
+export type NoResponseDiagnostics = Schema.Schema.Type<typeof NoResponseDiagnostics>
+
+const NoResponseErrorData = {
+  message: Schema.String,
+  abortSource: AbortSource,
+  phase: RequestPhase,
+  retryable: Schema.Boolean,
+  diagnostics: Schema.optional(NoResponseDiagnostics),
+}
+
+export const AbortedError = namedError("MessageAbortedError", {
+  message: Schema.String,
+  abortSource: Schema.optional(AbortSource),
+})
+export const UnexpectedProviderAbortError = namedError("UnexpectedProviderAbortError", {
+  ...NoResponseErrorData,
+})
+export const PostToolContinuationTimeoutError = namedError("PostToolContinuationTimeoutError", {
+  ...NoResponseErrorData,
+})
+export const EmptyAssistantResponseError = namedError("EmptyAssistantResponseError", {
+  ...NoResponseErrorData,
+})
+export const NoResponseError = namedError("NoResponseError", {
+  ...NoResponseErrorData,
+})
 export const StructuredOutputError = namedError("StructuredOutputError", {
   message: Schema.String,
   retries: NonNegativeInt,
@@ -387,6 +450,10 @@ const AssistantErrorSchema = Schema.Union([
   namedError("UnknownError", { message: Schema.String, ref: Schema.optional(Schema.String) }).EffectSchema,
   OutputLengthError.EffectSchema,
   AbortedError.EffectSchema,
+  UnexpectedProviderAbortError.EffectSchema,
+  PostToolContinuationTimeoutError.EffectSchema,
+  EmptyAssistantResponseError.EffectSchema,
+  NoResponseError.EffectSchema,
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   ContentFilterError.EffectSchema,

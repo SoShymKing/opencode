@@ -207,7 +207,7 @@ const providerErrorLLM = Layer.succeed(
       ),
   }),
 )
-const providerErrorEnv = LayerNode.compile(root, [...replacements, [LLM.node, providerErrorLLM]])
+const providerErrorEnv = LayerNode.compile(root, [...replacements, [RuntimeFlags.node, RuntimeFlags.layer()], [LLM.node, providerErrorLLM]])
 const itProviderError = testEffect(providerErrorEnv)
 
 const fragmentFailureLLM = Layer.succeed(
@@ -224,7 +224,11 @@ const fragmentFailureLLM = Layer.succeed(
       ),
   }),
 )
-const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
+const fragmentFailureEnv = LayerNode.compile(root, [
+  ...replacements,
+  [RuntimeFlags.node, RuntimeFlags.layer()],
+  [LLM.node, fragmentFailureLLM],
+])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
@@ -296,9 +300,7 @@ function llmMock(...streams: Stream.Stream<LLMEvent, unknown>[]) {
 }
 
 function processorEnv(llmLayer: Layer.Layer<LLM.Service>) {
-  return LayerNode.buildLayer(root, {
-    replacements: [...replacements, LayerNode.replace(LLM.node, llmLayer)],
-  })
+  return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer]])
 }
 // ---------------------------------------------------------------------------
 // Tests
