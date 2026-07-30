@@ -33,8 +33,7 @@ export type Retryable = {
 
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
-export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
-export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const RETRY_MAX_DELAY = 30_000 // 30 seconds
 export const RETRY_UNEXPECTED_ABORT_LIMIT = 1
 export const RETRY_NO_RESPONSE_LIMIT = 1
 export const RETRY_MAIN_SESSION_NO_RESPONSE_LIMIT = 10
@@ -68,12 +67,10 @@ export function delay(attempt: number, error?: SessionV1.APIError) {
           return cap(Math.ceil(parsed))
         }
       }
-
-      return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
     }
   }
 
-  return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
+  return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
 }
 
 export function retryable(error: Err, provider: string, context?: RetryContext) {
