@@ -55,7 +55,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream, Tracer } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -71,6 +71,7 @@ let toolExecutionsStarted: Deferred.Deferred<void> | undefined
 let toolExecutionsReady = 5
 let activeToolExecutions = 0
 let maxActiveToolExecutions = 0
+let spanObserver: ((name: string) => void) | undefined
 const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
@@ -240,8 +241,19 @@ const execution = Layer.effect(
   SessionExecution.Service,
   Effect.gen(function* () {
     const sessionRunner = yield* SessionRunner.Service
+    const tracer = yield* Effect.tracer
     const coordinator = yield* SessionRunCoordinator.make<SessionV2.ID, SessionRunner.RunError>({
-      drain: (sessionID, force) => sessionRunner.run({ sessionID, force }),
+      drain: (sessionID, force) =>
+        sessionRunner.run({ sessionID, force }).pipe(
+          Effect.withTracer(
+            Tracer.make({
+              span(options) {
+                spanObserver?.(options.name)
+                return tracer.span(options)
+              },
+            }),
+          ),
+        ),
     })
     return SessionExecution.Service.of({
       active: coordinator.active,
@@ -2235,8 +2247,14 @@ describe("SessionRunnerLLM", () => {
       })
       requests.length = 0
       response = []
+      let historyLoads = 0
+      spanObserver = (name) => {
+        if (name === "SessionHistory.load") historyLoads++
+      }
       yield* session.resume(sessionID)
+      spanObserver = undefined
 
+      expect(historyLoads).toBe(0)
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
       expect(yield* session.context(sessionID)).toMatchObject([

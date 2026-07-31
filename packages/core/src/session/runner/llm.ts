@@ -113,28 +113,23 @@ const layer = Layer.effect(
       return session
     })
 
-    const getContext = Effect.fn("SessionRunner.getContext")(function* (sessionID: SessionSchema.ID) {
-      return yield* store.context(sessionID)
-    })
     const failInterruptedTools = Effect.fn("SessionRunner.failInterruptedTools")(function* (
       sessionID: SessionSchema.ID,
     ) {
-      for (const message of yield* getContext(sessionID)) {
-        if (message.type !== "assistant") continue
-        for (const tool of message.content) {
-          if (tool.type !== "tool" || (tool.state.status !== "pending" && tool.state.status !== "running")) continue
-          yield* events.publish(SessionEvent.Tool.Failed, {
-            sessionID,
-            timestamp: yield* DateTime.now,
-            assistantMessageID: message.id,
-            callID: tool.id,
-            error: { type: "unknown", message: "Tool execution interrupted" },
-            provider: {
-              executed: tool.provider?.executed === true,
-              ...(tool.provider?.metadata === undefined ? {} : { metadata: tool.provider.metadata }),
-            },
-          })
-        }
+      for (const interrupted of yield* SessionHistory.interruptedTools(db, sessionID)) {
+        yield* events.publish(SessionEvent.Tool.Failed, {
+          sessionID,
+          timestamp: yield* DateTime.now,
+          assistantMessageID: interrupted.assistantMessageID,
+          callID: interrupted.tool.id,
+          error: { type: "unknown", message: "Tool execution interrupted" },
+          provider: {
+            executed: interrupted.tool.provider?.executed === true,
+            ...(interrupted.tool.provider?.metadata === undefined
+              ? {}
+              : { metadata: interrupted.tool.provider.metadata }),
+          },
+        })
       }
     })
 
