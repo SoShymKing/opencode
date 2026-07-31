@@ -25,7 +25,7 @@ function createWorkerFetch(client: RpcClient): typeof fetch {
   const fn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const request = new Request(input, init)
     const body = request.body ? await request.text() : undefined
-    const result = await client.call("fetch", {
+    const result = await client.callObject("fetch", {
       url: request.url,
       method: request.method,
       headers: Object.fromEntries(request.headers.entries()),
