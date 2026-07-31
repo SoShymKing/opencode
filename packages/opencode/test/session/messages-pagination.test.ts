@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { Effect, Option } from "effect"
+import { Effect, Option, Tracer } from "effect"
 import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
@@ -640,6 +640,90 @@ describe("MessageV2.filterCompacted", () => {
         // Includes compaction boundary: u1, a1, u2, a2
         expect(result[0].info.id).toBe(u1)
         expect(result.length).toBe(4)
+      }),
+    ),
+  )
+
+  it.instance("stops paging after a completed compaction boundary", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        // Given
+        yield* fill(sessionID, 60, (i: number) => i)
+        const compaction = yield* addUser(sessionID)
+        yield* addCompactionPart(sessionID, compaction)
+        const summary = yield* addAssistant(sessionID, compaction, { summary: true, finish: "end_turn" })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: summary,
+          type: "text",
+          text: "summary",
+        })
+        const continuation = yield* fill(sessionID, 55)
+        const tracer = yield* Effect.tracer
+        let pageSpans = 0
+
+        // When
+        const result = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          Effect.withTracer(
+            Tracer.make({
+              span(options) {
+                if (options.name === "MessageV2.page") pageSpans += 1
+                return tracer.span(options)
+              },
+            }),
+          ),
+        )
+
+        // Then
+        expect(result.map((item) => item.info.id)).toEqual([compaction, summary, ...continuation])
+        expect(pageSpans).toBe(2)
+      }),
+    ),
+  )
+
+  it.instance("stops paging after reaching the compaction tail_start_id", () =>
+    withSession(({ session, sessionID }) =>
+      Effect.gen(function* () {
+        // Given
+        yield* fill(sessionID, 80, (i: number) => i)
+        const [tailStart] = yield* fill(sessionID, 1, () => 100)
+        const between = yield* fill(sessionID, 55, (i: number) => 200 + i)
+        const compaction = yield* addUser(sessionID)
+        yield* addCompactionPart(sessionID, compaction, tailStart)
+        const summary = yield* addAssistant(sessionID, compaction, { summary: true, finish: "end_turn" })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          sessionID,
+          messageID: summary,
+          type: "text",
+          text: "summary",
+        })
+        const continuation = yield* fill(sessionID, 5)
+        const tracer = yield* Effect.tracer
+        let pageSpans = 0
+
+        // When
+        const result = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          Effect.withTracer(
+            Tracer.make({
+              span(options) {
+                if (options.name === "MessageV2.page") pageSpans += 1
+                return tracer.span(options)
+              },
+            }),
+          ),
+        )
+
+        // Then
+        expect(result.map((item) => item.info.id)).toEqual([
+          compaction,
+          summary,
+          tailStart,
+          ...between,
+          ...continuation,
+        ])
+        expect(pageSpans).toBe(2)
       }),
     ),
   )
