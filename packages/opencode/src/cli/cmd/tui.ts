@@ -23,7 +23,7 @@ type WorkerFetchInput = Parameters<typeof rpc.fetch>[0]
 type WorkerFetchOutput = Awaited<ReturnType<typeof rpc.fetch>>
 type WorkerFetchCallOutput = WorkerFetchOutput | Promise<WorkerFetchOutput>
 type WorkerFetchClient = {
-  call(method: "fetch", input: WorkerFetchInput): Promise<WorkerFetchCallOutput>
+  callObject(method: "fetch", input: WorkerFetchInput): Promise<WorkerFetchCallOutput>
 }
 type WorkerFetchClientInput = WorkerFetchClient | (() => WorkerFetchClient)
 type AbortTimeoutInput = { sessionID: string }
@@ -70,7 +70,7 @@ export function createWorkerFetch(client: WorkerFetchClientInput, options: Worke
       headers: Object.fromEntries(request.headers.entries()),
       body,
     }
-    const call = () => workerFetchClient(client).call("fetch", workerInput)
+    const call = () => workerFetchClient(client).callObject("fetch", workerInput)
     try {
       const response = call()
       const result = await (sessionID ? withTimeout(response, abortTimeout, timeoutMessage) : response)

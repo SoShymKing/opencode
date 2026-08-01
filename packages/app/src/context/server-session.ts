@@ -20,6 +20,7 @@ import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
 import { normalizeSessionMessages } from "@/utils/session-message"
 import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
+import { normalizeTouchedSessionMessages } from "./server-session-v2-projection"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
 
@@ -886,26 +887,12 @@ export function createServerSession(
     setData("session_message", reduction.sessionID, reconcile(reduction.messages))
     if (reduction.touched.length === 0) return
 
-    const touched = new Set(reduction.touched)
-    let parentID: string | undefined
-    for (const message of reduction.messages) {
-      if (message.type === "user" || (message.type === "synthetic" && message.description?.trim()))
-        parentID = message.id
-      if (message.type === "shell") {
-        if (touched.has(message.id)) touched.add(`${message.id}:assistant`)
-        parentID = undefined
-      }
-      if (message.type === "assistant" && touched.has(message.id) && parentID) touched.add(parentID)
-      if (message.type === "compaction" && touched.has(message.id) && parentID) touched.add(parentID)
-    }
-
-    const normalized = normalizeSessionMessages(reduction.sessionID, reduction.messages)
+    const normalized = normalizeTouchedSessionMessages(reduction.sessionID, reduction.messages, reduction.touched)
     batch(() => {
       for (const message of normalized.messages) {
-        if (!touched.has(message.id)) continue
         apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
       }
-      for (const messageID of touched) {
+      for (const messageID of normalized.touched) {
         const next = normalized.parts.get(messageID) ?? []
         const nextIDs = new Set(next.map((part) => part.id))
         for (const part of next) {

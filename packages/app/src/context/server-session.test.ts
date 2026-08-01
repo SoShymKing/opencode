@@ -162,7 +162,7 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
-  test("projects V2 session events into current and legacy message state", () => {
+  test("projects a V2 event through touched-message normalization into current source and legacy parts", () => {
     const ctx = setup({ child: session("child") })
     ctx.store.remember(session("child"))
     ctx.store.set("session_message", "child", [
@@ -210,6 +210,10 @@ describe("server session", () => {
       content: [{ type: "text", text: "world" }],
     })
     expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual(["msg_1_user", "msg_2_assistant"])
+    expect(ctx.store.data.message.child?.[0]).toMatchObject({
+      agent: "build",
+      model: { modelID: "model", providerID: "provider" },
+    })
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
   })
 

@@ -79,6 +79,35 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
   return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
 })
 
+export const interruptedTools = Effect.fn("SessionHistory.interruptedTools")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const compaction = yield* latestCompaction(db, sessionID)
+  const rows = yield* db
+    .select()
+    .from(SessionMessageTable)
+    .where(
+      and(
+        eq(SessionMessageTable.session_id, sessionID),
+        eq(SessionMessageTable.type, "assistant"),
+        compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
+      ),
+    )
+    .orderBy(asc(SessionMessageTable.seq))
+    .all()
+    .pipe(Effect.orDie)
+  return (yield* Effect.forEach(rows, decodeMessageRow)).flatMap((message) =>
+    message.type === "assistant"
+      ? message.content.flatMap((tool) =>
+          tool.type === "tool" && (tool.state.status === "pending" || tool.state.status === "running")
+            ? [{ assistantMessageID: message.id, tool }]
+            : [],
+        )
+      : [],
+  )
+})
+
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,

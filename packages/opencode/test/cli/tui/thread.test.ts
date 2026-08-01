@@ -46,7 +46,7 @@ describe("tui thread", () => {
   test("times out session abort fetch when worker RPC does not respond", async () => {
     const fetch = createWorkerFetch(
       {
-        call: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
+        callObject: () => new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {}),
       },
       { abortTimeout: 10 },
     )
@@ -61,7 +61,7 @@ describe("tui thread", () => {
     let callCount = 0
     const fetch = createWorkerFetch(
       {
-        call: () => {
+        callObject: () => {
           callCount += 1
           return new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {})
         },
@@ -85,7 +85,7 @@ describe("tui thread", () => {
     let timeoutCount = 0
     const fetch = createWorkerFetch(
       {
-        call: async () => {
+        callObject: async () => {
           await Bun.sleep(20)
           return { status: 200, headers: {}, body: "ok" }
         },
@@ -105,14 +105,14 @@ describe("tui thread", () => {
   test("automatically retries abort with the replacement client after timeout recovery", async () => {
     let firstAbortCalls = 0
     const firstClient = {
-      call: () => {
+      callObject: () => {
         firstAbortCalls += 1
         return new Promise<{ status: number; headers: Record<string, string>; body: string }>(() => {})
       },
     }
     let secondAbortCalls = 0
     const secondClient = {
-      call: async () => {
+      callObject: async () => {
         secondAbortCalls += 1
         return { status: 200, headers: {}, body: "true" }
       },
@@ -136,7 +136,7 @@ describe("tui thread", () => {
   test("returns successful session abort worker fetch responses", async () => {
     const fetch = createWorkerFetch(
       {
-        call: async (method: "fetch", input: { url: string; method: string }) => {
+        callObject: async (method: "fetch", input: { url: string; method: string }) => {
           expect(method).toBe("fetch")
           expect(input.url).toBe("http://opencode.internal/session/ses_test/abort")
           expect(input.method).toBe("POST")
