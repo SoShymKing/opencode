@@ -1,4 +1,5 @@
 import { describe, expect } from "bun:test"
+import { sql } from "drizzle-orm"
 import { Effect, Layer, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -9,7 +10,9 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { MessageDecodeError } from "@opencode-ai/core/session/error"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
+import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionTable } from "@opencode-ai/core/session/sql"
@@ -160,6 +163,25 @@ describe("SessionV2.history", () => {
       const error = yield* session.history({ sessionID: SessionV2.ID.make("ses_missing"), limit: 10 }).pipe(Effect.flip)
 
       expect(error._tag).toBe("Session.NotFoundError")
+    }),
+  )
+
+  it.effect("reports public message ownership when stored data cannot be decoded", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const session = yield* SessionV2.Service
+      const created = yield* session.create({ location })
+      const messageID = SessionMessage.ID.make("msg_malformed")
+      yield* db
+        .run(
+          sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+          VALUES (${messageID}, ${created.id}, 'assistant', 0, 0, 0, ${"{}"})`,
+        )
+        .pipe(Effect.orDie)
+
+      const error = yield* session.messages({ sessionID: created.id }).pipe(Effect.flip)
+
+      expect(error).toEqual(new MessageDecodeError({ sessionID: created.id, messageID }))
     }),
   )
 })

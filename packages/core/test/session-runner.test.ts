@@ -1174,15 +1174,13 @@ describe("SessionRunnerLLM", () => {
       expect(requests).toHaveLength(3)
       expect(userTexts(requests[1])[0]).toContain("## Objective")
       expect(userTexts(requests[2])[0]).toContain("<summary>\n## Objective\n- Recover overflow\n</summary>")
-      expect(yield* session.context(sessionID)).toMatchObject([
+      const projected = yield* session.context(sessionID)
+      expect(projected).toMatchObject([
         { type: "compaction", summary: "## Objective\n- Recover overflow" },
         { type: "assistant", finish: "stop" },
       ])
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.context(sessionID)).toMatchObject([
-        { type: "compaction" },
-        { type: "assistant", finish: "stop" },
-      ])
+      expect(yield* session.context(sessionID)).toEqual(projected)
     }),
   )
 
@@ -1721,7 +1719,8 @@ describe("SessionRunnerLLM", () => {
 
       expect(executions).toEqual(["first", "second"])
       expect(requests).toHaveLength(3)
-      expect(yield* session.context(sessionID)).toMatchObject([
+      const projected = yield* session.context(sessionID)
+      expect(projected).toMatchObject([
         { type: "user", text: "Echo twice" },
         {
           type: "assistant",
@@ -1751,33 +1750,7 @@ describe("SessionRunnerLLM", () => {
 
       yield* replaySessionProjection(sessionID)
 
-      expect(yield* session.context(sessionID)).toMatchObject([
-        { type: "user", text: "Echo twice" },
-        {
-          type: "assistant",
-          content: [
-            {
-              type: "tool",
-              id: "tool_0",
-              state: { status: "completed", structured: { text: "first" }, content: [{ type: "text", text: "first" }] },
-            },
-          ],
-        },
-        {
-          type: "assistant",
-          content: [
-            {
-              type: "tool",
-              id: "tool_0",
-              state: {
-                status: "completed",
-                structured: { text: "second" },
-                content: [{ type: "text", text: "second" }],
-              },
-            },
-          ],
-        },
-      ])
+      expect(yield* session.context(sessionID)).toEqual(projected)
     }),
   )
 
