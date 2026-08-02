@@ -44,7 +44,7 @@ function countedDatabaseLayer(filename: string, counter: QueryCounter) {
     Effect.gen(function* () {
       const db = yield* EffectDrizzleSqlite.make()
       yield* Effect.forEach(["PRAGMA journal_mode = WAL", "PRAGMA synchronous = NORMAL", "PRAGMA busy_timeout = 5000", "PRAGMA cache_size = -64000", "PRAGMA foreign_keys = ON"], (query) => db.run(query), { discard: true })
-      yield* DatabaseMigration.apply(db)
+      yield* DatabaseMigration.apply(db, filename)
       return Database.Service.of({ db })
     }),
   ).pipe(Layer.provide(sqliteLayer({ filename })), Layer.provide(EffectCache.Default), Layer.provide(logger))

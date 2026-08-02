@@ -13,7 +13,7 @@ import { BenchmarkContractError, measuredSamples, processCount, pragmas, warmupS
 export { BenchmarkContractError, pragmas }
 export const migrationRows = [0, 100, 1_000, 10_000] as const
 export const partDensities = [0, 3, 12, 32] as const
-export const predecessorMigrationID = "20260622202450_simplify_session_input"
+export const predecessorMigrationID = "v01_baseline"
 export type MigrationRows = (typeof migrationRows)[number]
 export type MigrationDatabase = EffectDrizzleSqlite.EffectSQLiteDatabase
 
@@ -204,12 +204,10 @@ export function validateMigration(db: MigrationDatabase, rows: MigrationRows) {
     if (journal.length !== benchmarkMigrations().length || parents.length !== rows) return yield* Effect.die(new BenchmarkContractError(`Migration validation failed for ${rows} assistants`))
     const childTable = yield* db.get<{ readonly name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_message_part'`)
     const children = childTable ? Schema.decodeUnknownSync(Schema.Array(ChildRow))(yield* db.all(sql`SELECT message_id, position, id, type, data FROM session_message_part ORDER BY message_id, position`)) : []
-    if (childTable && children.length !== growthInputs(rows).totalParts) return yield* Effect.die(new BenchmarkContractError(`Expected ${growthInputs(rows).totalParts} children, received ${children.length}`))
-    const grouped = Map.groupBy(children, (child) => child.message_id)
+    if (childTable && children.length !== 0) return yield* Effect.die(new BenchmarkContractError(`Expected no migrated children, received ${children.length}`))
     for (const parent of parents) {
       const envelope = decodeData(decodeJson(parent.data))
-      const reconstructed = childTable ? reconstructAssistant(envelope, grouped.get(parent.id) ?? []) : envelope
-      if (!isDeepStrictEqual(reconstructed, expectedDensities[parent.seq % partDensities.length])) return yield* Effect.die(new BenchmarkContractError(`Assistant ${parent.id} reconstruction mismatch`))
+      if (!isDeepStrictEqual(envelope, expectedDensities[parent.seq % partDensities.length])) return yield* Effect.die(new BenchmarkContractError(`Assistant ${parent.id} changed`))
     }
     return {
       journal: journal.map((item) => item.id),

@@ -19,7 +19,12 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionInputTable,
+  SessionMessagePartTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { SessionRevert } from "@opencode-ai/core/session/revert"
@@ -29,7 +34,7 @@ const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.no
 const sessionID = SessionV2.ID.make("ses_projector_test")
 const created = DateTime.makeUnsafe(0)
 const model = { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") }
-const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+const encodeAssistant = Schema.encodeSync(SessionMessage.Assistant)
 
 const assistantRow = (
   id: SessionMessage.ID,
@@ -39,8 +44,11 @@ const assistantRow = (
   const {
     id: _,
     type,
+    content: __,
     ...data
-  } = encodeMessage(SessionMessage.Assistant.make({ id, type: "assistant", agent: "build", model, content: [], time }))
+  } = encodeAssistant(
+    SessionMessage.Assistant.make({ id, type: "assistant", agent: "build", model, content: [], time }),
+  )
   return { id, session_id: sessionID, type, seq, time_created: DateTime.toEpochMillis(time.created), data }
 }
 
@@ -64,9 +72,9 @@ describe("SessionProjector", () => {
         })
         .run()
       const boundary = SessionMessage.ID.make("msg_boundary")
-      const events = yield* EventV2.Service
       const firstSnapshot = SessionMessage.ID.make("msg_snapshot_first")
       const secondSnapshot = SessionMessage.ID.make("msg_snapshot_second")
+      const events = yield* EventV2.Service
       const step = { sessionID, timestamp: created, agent: "build", model }
       const settlement = {
         sessionID,
@@ -86,6 +94,12 @@ describe("SessionProjector", () => {
         assistantMessageID: firstSnapshot,
         snapshot: Snapshot.ID.make("tree-first"),
       })
+      yield* events.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: firstSnapshot,
+        timestamp: created,
+        textID: "text-first",
+      })
       yield* events.publish(SessionEvent.Step.Ended, {
         ...settlement,
         assistantMessageID: firstSnapshot,
@@ -95,6 +109,12 @@ describe("SessionProjector", () => {
         ...step,
         assistantMessageID: secondSnapshot,
         snapshot: Snapshot.ID.make("tree-second"),
+      })
+      yield* events.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: secondSnapshot,
+        timestamp: created,
+        textID: "text-second",
       })
       yield* events.publish(SessionEvent.Step.Ended, {
         ...settlement,
@@ -147,6 +167,7 @@ describe("SessionProjector", () => {
       expect(
         (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
       ).toEqual([boundary])
+      expect(yield* db.select().from(SessionMessagePartTable).all().pipe(Effect.orDie)).toEqual([])
     }).pipe(Effect.provide(sessionsLayer)),
   )
 
@@ -598,25 +619,8 @@ describe("SessionProjector", () => {
         textID: "text-stale",
       })
 
-      const rows = yield* db
-        .select()
-        .from(SessionMessageTable)
-        .where(eq(SessionMessageTable.session_id, sessionID))
-        .orderBy(asc(SessionMessageTable.id))
-        .all()
-        .pipe(Effect.orDie)
-      const messages = rows.map((row) =>
-        Schema.decodeUnknownSync(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }),
-      )
+      const messages = yield* (yield* SessionV2.Service).messages({ sessionID, order: "asc" })
       expect(messages).toEqual([
-        SessionMessage.Assistant.make({
-          id: SessionMessage.ID.make("msg_assistant_completed"),
-          type: "assistant",
-          agent: "build",
-          model,
-          content: [SessionMessage.AssistantText.make({ type: "text", id: "text-stale", text: "" })],
-          time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(2) },
-        }),
         SessionMessage.Assistant.make({
           id: SessionMessage.ID.make("msg_assistant_stale"),
           type: "assistant",
@@ -625,7 +629,15 @@ describe("SessionProjector", () => {
           content: [],
           time: { created },
         }),
+        SessionMessage.Assistant.make({
+          id: SessionMessage.ID.make("msg_assistant_completed"),
+          type: "assistant",
+          agent: "build",
+          model,
+          content: [SessionMessage.AssistantText.make({ type: "text", id: "text-stale", text: "" })],
+          time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(2) },
+        }),
       ])
-    }),
+    }).pipe(Effect.provide(sessionsLayer)),
   )
 })

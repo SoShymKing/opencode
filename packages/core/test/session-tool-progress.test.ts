@@ -12,6 +12,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
+import { hydrateSelection } from "@opencode-ai/core/session/message-storage"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
@@ -56,14 +57,13 @@ describe("Tool.Progress", () => {
         model,
       })
       const readAssistant = Effect.gen(function* () {
-        const row = yield* db
-          .select()
-          .from(SessionMessageTable)
-          .where(eq(SessionMessageTable.id, assistantMessageID))
-          .get()
-          .pipe(Effect.orDie)
-        if (!row) return yield* Effect.die("Missing projected assistant")
-        return Schema.decodeUnknownSync(SessionMessage.Assistant)({ ...row.data, id: row.id, type: row.type })
+        const message = (yield* hydrateSelection({
+          db,
+          where: eq(SessionMessageTable.id, assistantMessageID),
+          limit: 1,
+        }))[0]?.message
+        if (message?.type !== "assistant") return yield* Effect.die("Missing projected assistant")
+        return message
       })
       const start = (callID: string) =>
         Effect.gen(function* () {

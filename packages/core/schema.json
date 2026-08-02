@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "f14a9b18-8207-487e-a3d3-227e629ba9ad",
-  "prevIds": ["169a0f0f-d58f-479f-b024-fa1c7b9a09db"],
+  "id": "90c0bda2-0d5f-4e19-940e-34e0320f91f2",
+  "prevIds": ["f14a9b18-8207-487e-a3d3-227e629ba9ad"],
   "ddl": [
     {
       "name": "workspace",
@@ -62,6 +62,10 @@
     },
     {
       "name": "session_input",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_message_part",
       "entityType": "tables"
     },
     {
@@ -992,6 +996,56 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_message_part"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "position",
+      "entityType": "columns",
+      "table": "session_message_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "session_message_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "type",
+      "entityType": "columns",
+      "table": "session_message_part"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "data",
+      "entityType": "columns",
+      "table": "session_message_part"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -1580,6 +1634,17 @@
       "table": "session_input"
     },
     {
+      "columns": ["message_id"],
+      "tableTo": "session_message",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_message_part_message_id_session_message_id_fk",
+      "entityType": "fks",
+      "table": "session_message_part"
+    },
+    {
       "columns": ["session_id"],
       "tableTo": "session",
       "columnsTo": ["id"],
@@ -1636,6 +1701,13 @@
       "name": "project_directory_pk",
       "entityType": "pks",
       "table": "project_directory"
+    },
+    {
+      "columns": ["message_id", "position"],
+      "nameExplicit": false,
+      "name": "session_message_part_pk",
+      "entityType": "pks",
+      "table": "session_message_part"
     },
     {
       "columns": ["session_id", "position"],
@@ -1937,6 +2009,32 @@
     {
       "columns": [
         {
+          "value": "message_id",
+          "isExpression": false
+        },
+        {
+          "value": "type",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        },
+        {
+          "value": "\"position\" desc",
+          "isExpression": true
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_message_part_lookup_idx",
+      "entityType": "indexes",
+      "table": "session_message_part"
+    },
+    {
+      "columns": [
+        {
           "value": "session_id",
           "isExpression": false
         },
@@ -2065,6 +2163,12 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "value": "json_valid(\"data\") AND json_type(\"data\") = 'object'",
+      "name": "session_message_part_data_json_object",
+      "entityType": "checks",
+      "table": "session_message_part"
     }
   ],
   "renames": []

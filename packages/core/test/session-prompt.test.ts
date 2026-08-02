@@ -16,7 +16,12 @@ import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionInputTable,
+  SessionMessagePartTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { testEffect } from "./lib/effect"
 
@@ -413,6 +418,7 @@ describe("SessionV2.prompt", () => {
         prompt: Prompt.make({ text: "Replay pending" }),
         resume: false,
       })
+      const expected = yield* session.messages({ sessionID })
       const recorded = yield* db
         .select()
         .from(EventTable)
@@ -427,6 +433,7 @@ describe("SessionV2.prompt", () => {
         .where(eq(SessionMessageTable.session_id, sessionID))
         .run()
         .pipe(Effect.orDie)
+      expect(yield* db.select().from(SessionMessagePartTable).all().pipe(Effect.orDie)).toEqual([])
       yield* events.replayAll(
         recorded.map((event) => ({
           id: event.id,
@@ -438,7 +445,7 @@ describe("SessionV2.prompt", () => {
       )
 
       expect(yield* admitted(messageID)).toMatchObject({ id: messageID, prompt: { text: "Replay pending" } })
-      expect(yield* session.messages({ sessionID })).toEqual([])
+      expect(yield* session.messages({ sessionID })).toEqual(expected)
       expect(wakeCalls).toEqual([])
     }),
   )

@@ -1,5 +1,19 @@
 # V2 Schema Changelog
 
+## 2026-08-02: Normalize Projected Assistant Message Parts
+
+Affected schema:
+
+- Add `session_message_part` as the universal ordered child table for projected message parts, with a composite primary key, parent-delete cascade, JSON-object check, and lookup index.
+
+Change:
+
+- Store newly projected assistant parts in the child table instead of embedding them in the projected message envelope.
+
+Compatibility:
+
+- No public API, OpenAPI, or generated SDK contract changes are required.
+
 ## 2026-06-26: Add Finite Session History
 
 - Add `GET /api/session/:sessionID/history` and generated Promise, Effect, and legacy JavaScript client methods.

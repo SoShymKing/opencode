@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { sql } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { Effect, Layer, Schema } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -13,9 +13,12 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { MessageDecodeError } from "@opencode-ai/core/session/error"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionStore } from "@opencode-ai/core/session/store"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionMessagePartTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffect } from "./lib/effect"
 
 const projects = Layer.succeed(
@@ -182,6 +185,117 @@ describe("SessionV2.history", () => {
       const error = yield* session.messages({ sessionID: created.id }).pipe(Effect.flip)
 
       expect(error).toEqual(new MessageDecodeError({ sessionID: created.id, messageID }))
+    }),
+  )
+
+  it.effect("recovers interrupted tools after compaction in parent and child order", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const session = yield* SessionV2.Service
+      const created = yield* session.create({ location })
+      const model = { id: ModelV2.ID.make("history"), providerID: ProviderV2.ID.make("history") }
+      const olderID = SessionMessage.ID.make("msg_interrupted_older")
+      const compactionID = SessionMessage.ID.make("msg_interrupted_compaction")
+      const firstID = SessionMessage.ID.make("msg_interrupted_first")
+      const secondID = SessionMessage.ID.make("msg_interrupted_second")
+      yield* Effect.forEach(
+        [
+          {
+            id: olderID,
+            type: "assistant",
+            seq: 10,
+            data: { agent: "build", model, time: { created: 10 } },
+          },
+          {
+            id: compactionID,
+            type: "compaction",
+            seq: 11,
+            data: { reason: "manual", summary: "summary", recent: "recent", time: { created: 11 } },
+          },
+          {
+            id: firstID,
+            type: "assistant",
+            seq: 12,
+            data: { agent: "build", model, time: { created: 12 } },
+          },
+          {
+            id: secondID,
+            type: "assistant",
+            seq: 13,
+            data: { agent: "build", model, time: { created: 13 } },
+          },
+        ] as const,
+        (row) =>
+          db.run(sql`
+            INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+            VALUES (${row.id}, ${created.id}, ${row.type}, ${row.seq}, ${row.seq}, ${row.seq}, ${JSON.stringify(row.data)})
+          `),
+        { discard: true },
+      )
+      yield* db
+        .insert(SessionMessagePartTable)
+        .values([
+          {
+            message_id: olderID,
+            position: 0,
+            id: "tool-before-compaction",
+            type: "tool",
+            data: { name: "bash", state: { status: "pending", input: "" }, time: { created: 10 } },
+          },
+          {
+            message_id: firstID,
+            position: 1,
+            id: "tool-running",
+            type: "tool",
+            data: {
+              name: "bash",
+              state: { status: "running", input: {}, structured: {}, content: [] },
+              time: { created: 12 },
+            },
+          },
+          {
+            message_id: firstID,
+            position: 3,
+            id: "tool-pending",
+            type: "tool",
+            data: { name: "bash", state: { status: "pending", input: "" }, time: { created: 12 } },
+          },
+          {
+            message_id: secondID,
+            position: 0,
+            id: "tool-second-parent",
+            type: "tool",
+            data: { name: "bash", state: { status: "pending", input: "" }, time: { created: 13 } },
+          },
+        ])
+        .run()
+        .pipe(Effect.orDie)
+      yield* db.run(sql`
+        INSERT INTO session_message_part (message_id, position, id, type, data)
+        VALUES (${firstID}, 2, 'corrupt-unrelated-text', 'text', '{}')
+      `)
+
+      const interrupted = yield* SessionHistory.interruptedTools(db, created.id)
+
+      expect(
+        interrupted.map((item) => ({
+          assistantMessageID: item.assistantMessageID,
+          id: item.tool.id,
+          status: item.tool.state.status,
+        })),
+      ).toEqual([
+        { assistantMessageID: firstID, id: "tool-running", status: "running" },
+        { assistantMessageID: firstID, id: "tool-pending", status: "pending" },
+        { assistantMessageID: secondID, id: "tool-second-parent", status: "pending" },
+      ])
+      expect(
+        yield* db
+          .select({ id: SessionMessagePartTable.id })
+          .from(SessionMessagePartTable)
+          .where(eq(SessionMessagePartTable.message_id, olderID))
+          .all()
+          .pipe(Effect.orDie),
+      ).toEqual([{ id: "tool-before-compaction" }])
     }),
   )
 })

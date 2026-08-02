@@ -1,6 +1,6 @@
 export * as SessionRevert from "./revert"
 
-import { and, asc, eq, gt } from "drizzle-orm"
+import { and, asc, eq, gt, sql } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
@@ -10,6 +10,7 @@ import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable } from "./sql"
+import { decodeEnvelope } from "./message-storage"
 
 export class MessageNotFoundError extends Schema.TaggedErrorClass<MessageNotFoundError>()(
   "Session.MessageNotFoundError",
@@ -34,7 +35,12 @@ const plan = Effect.fn("SessionRevert.plan")(function* (input: BoundaryInput) {
     .pipe(Effect.orDie)
   if (!boundary) return yield* new MessageNotFoundError(input)
   const rows = yield* db
-    .select()
+    .select({
+      sessionID: SessionMessageTable.session_id,
+      messageID: SessionMessageTable.id,
+      type: SessionMessageTable.type,
+      dataText: sql<string>`${SessionMessageTable.data}`,
+    })
     .from(SessionMessageTable)
     .where(
       and(
@@ -46,10 +52,9 @@ const plan = Effect.fn("SessionRevert.plan")(function* (input: BoundaryInput) {
     .orderBy(asc(SessionMessageTable.seq))
     .all()
     .pipe(Effect.orDie)
-  const decode = Schema.decodeUnknownEffect(SessionMessage.Message)
   const files = new Map<RelativePath, Snapshot.ID>()
   for (const row of rows) {
-    const message = yield* decode({ ...row.data, id: row.id, type: row.type }).pipe(Effect.orDie)
+    const message = yield* decodeEnvelope(row).pipe(Effect.orDie)
     if (message.type !== "assistant" || !message.snapshot?.start) continue
     for (const file of message.snapshot.files ?? [])
       if (!files.has(file)) files.set(file, Snapshot.ID.make(message.snapshot.start))

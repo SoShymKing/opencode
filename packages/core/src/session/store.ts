@@ -1,12 +1,13 @@
 export * as SessionStore from "./store"
 
 import { eq } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionHistory } from "./history"
 import { MessageDecodeError } from "./error"
 import { SessionMessage } from "./message"
+import { hydrateSelection } from "./message-storage"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable, SessionTable } from "./sql"
 import { fromRow } from "./info"
@@ -29,8 +30,6 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
-
     return Service.of({
       get: Effect.fn("SessionStore.get")(function* (sessionID) {
         const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
@@ -43,16 +42,13 @@ const layer = Layer.effect(
         return yield* SessionHistory.loadForRunner(db, sessionID, baselineSeq)
       }),
       message: Effect.fn("SessionStore.message")(function* (messageID) {
-        const row = yield* db
-          .select()
-          .from(SessionMessageTable)
-          .where(eq(SessionMessageTable.id, messageID))
-          .get()
-          .pipe(Effect.orDie)
+        const row = (yield* hydrateSelection({ db, where: eq(SessionMessageTable.id, messageID), limit: 1 }).pipe(
+          Effect.orDie,
+        ))[0]
         return row
           ? {
-              sessionID: SessionSchema.ID.make(row.session_id),
-              message: yield* decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(Effect.orDie),
+              sessionID: row.sessionID,
+              message: row.message,
             }
           : undefined
       }),
