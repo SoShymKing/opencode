@@ -15,6 +15,7 @@ import { WorkspaceV2 } from "../workspace"
 import { SessionContextEpoch } from "./context-epoch"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
+import { projectToolEvent, type ToolEvent } from "./projector-tool"
 
 type DatabaseService = Database.Interface["db"]
 
@@ -188,6 +189,10 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
     }
     yield* SessionMessageUpdater.update(adapter, event)
   })
+}
+
+function runTool(db: DatabaseService, event: ToolEvent) {
+  return projectToolEvent(db, event).pipe(Effect.flatMap((projected) => (projected ? Effect.void : run(db, event))))
 }
 
 function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: SessionMessage.Message) {
@@ -383,12 +388,12 @@ const layer = Layer.effectDiscard(
     yield* events.project(SessionEvent.Step.Failed, (event) => run(db, event))
     yield* events.project(SessionEvent.Text.Started, (event) => run(db, event))
     yield* events.project(SessionEvent.Text.Ended, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Input.Started, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Input.Ended, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Called, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Progress, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Success, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Failed, (event) => run(db, event))
+    yield* events.project(SessionEvent.Tool.Input.Started, (event) => runTool(db, event))
+    yield* events.project(SessionEvent.Tool.Input.Ended, (event) => runTool(db, event))
+    yield* events.project(SessionEvent.Tool.Called, (event) => runTool(db, event))
+    yield* events.project(SessionEvent.Tool.Progress, (event) => runTool(db, event))
+    yield* events.project(SessionEvent.Tool.Success, (event) => runTool(db, event))
+    yield* events.project(SessionEvent.Tool.Failed, (event) => runTool(db, event))
     yield* events.project(SessionEvent.Reasoning.Started, (event) => run(db, event))
     yield* events.project(SessionEvent.Reasoning.Ended, (event) => run(db, event))
     // yield* events.project(SessionEvent.Retried, (event) => run(db, event))
