@@ -28,6 +28,7 @@ import { ContextSnapshotDecodeError } from "@opencode-ai/core/session/error"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionInput } from "@opencode-ai/core/session/input"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { hydrateSelection } from "@opencode-ai/core/session/message-storage"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -44,6 +45,7 @@ import { Tool } from "@opencode-ai/core/tool/tool"
 import {
   SessionContextEpochTable,
   SessionInputTable,
+  SessionMessagePartTable,
   SessionMessageTable,
   SessionTable,
 } from "@opencode-ai/core/session/sql"
@@ -383,6 +385,11 @@ const replaySessionProjection = (id: SessionV2.ID) =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const events = yield* EventV2.Service
+    const expected = yield* hydrateSelection({
+      db,
+      where: eq(SessionMessageTable.session_id, id),
+      order: "asc",
+    })
     const recorded = yield* db
       .select()
       .from(EventTable)
@@ -394,6 +401,7 @@ const replaySessionProjection = (id: SessionV2.ID) =>
     yield* events.remove(id)
     yield* db.delete(SessionInputTable).where(eq(SessionInputTable.session_id, id)).run().pipe(Effect.orDie)
     yield* db.delete(SessionMessageTable).where(eq(SessionMessageTable.session_id, id)).run().pipe(Effect.orDie)
+    expect(yield* db.select().from(SessionMessagePartTable).all().pipe(Effect.orDie)).toEqual([])
     yield* events.replayAll(
       recorded.map((event) => ({
         id: event.id,
@@ -402,6 +410,9 @@ const replaySessionProjection = (id: SessionV2.ID) =>
         type: event.type,
         data: event.data,
       })),
+    )
+    expect(yield* hydrateSelection({ db, where: eq(SessionMessageTable.session_id, id), order: "asc" })).toEqual(
+      expected,
     )
   })
 
@@ -1174,15 +1185,13 @@ describe("SessionRunnerLLM", () => {
       expect(requests).toHaveLength(3)
       expect(userTexts(requests[1])[0]).toContain("## Objective")
       expect(userTexts(requests[2])[0]).toContain("<summary>\n## Objective\n- Recover overflow\n</summary>")
-      expect(yield* session.context(sessionID)).toMatchObject([
+      const projected = yield* session.context(sessionID)
+      expect(projected).toMatchObject([
         { type: "compaction", summary: "## Objective\n- Recover overflow" },
         { type: "assistant", finish: "stop" },
       ])
       yield* replaySessionProjection(sessionID)
-      expect(yield* session.context(sessionID)).toMatchObject([
-        { type: "compaction" },
-        { type: "assistant", finish: "stop" },
-      ])
+      expect(yield* session.context(sessionID)).toEqual(projected)
     }),
   )
 
@@ -1721,7 +1730,8 @@ describe("SessionRunnerLLM", () => {
 
       expect(executions).toEqual(["first", "second"])
       expect(requests).toHaveLength(3)
-      expect(yield* session.context(sessionID)).toMatchObject([
+      const projected = yield* session.context(sessionID)
+      expect(projected).toMatchObject([
         { type: "user", text: "Echo twice" },
         {
           type: "assistant",
@@ -1751,33 +1761,7 @@ describe("SessionRunnerLLM", () => {
 
       yield* replaySessionProjection(sessionID)
 
-      expect(yield* session.context(sessionID)).toMatchObject([
-        { type: "user", text: "Echo twice" },
-        {
-          type: "assistant",
-          content: [
-            {
-              type: "tool",
-              id: "tool_0",
-              state: { status: "completed", structured: { text: "first" }, content: [{ type: "text", text: "first" }] },
-            },
-          ],
-        },
-        {
-          type: "assistant",
-          content: [
-            {
-              type: "tool",
-              id: "tool_0",
-              state: {
-                status: "completed",
-                structured: { text: "second" },
-                content: [{ type: "text", text: "second" }],
-              },
-            },
-          ],
-        },
-      ])
+      expect(yield* session.context(sessionID)).toEqual(projected)
     }),
   )
 

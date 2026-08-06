@@ -15,11 +15,11 @@ import { WorkspaceV2 } from "../workspace"
 import { SessionContextEpoch } from "./context-epoch"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
-import { projectToolEvent, type ToolEvent } from "./projector-tool"
+import { decodeEnvelope } from "./message-storage"
+import { projectContentEvent } from "./projector-content"
 
 type DatabaseService = Database.Interface["db"]
 
-const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Message)
 const encodeMessage = Schema.encodeSync(SessionMessage.Message)
 
 export class SessionAlreadyProjected extends Error {}
@@ -112,12 +112,15 @@ function applyUsage(
 
 function run(db: DatabaseService, event: SessionEvent.Event) {
   return Effect.gen(function* () {
-    const decodeRow = (row: typeof SessionMessageTable.$inferSelect) =>
-      decodeMessage({ ...row.data, id: row.id, type: row.type })
+    const decodeRow = (row: {
+      readonly sessionID: typeof SessionMessageTable.$inferSelect.session_id
+      readonly messageID: typeof SessionMessageTable.$inferSelect.id
+      readonly type: typeof SessionMessageTable.$inferSelect.type
+      readonly dataText: string
+    }) => decodeEnvelope(row).pipe(Effect.orDie)
     const updateMessage = (message: SessionMessage.Message) => {
       if (event.durable === undefined) return Effect.die("Durable Session event is missing aggregate sequence")
-      const encoded = encodeMessage(message)
-      const { id, type, ...data } = encoded
+      const { id, type, data } = encodeStoredMessage(message)
       return db
         .update(SessionMessageTable)
         .set({ type, time_created: DateTime.toEpochMillis(message.time.created), data })
@@ -136,7 +139,12 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
         return Effect.gen(function* () {
           // A newer turn supersedes stale incomplete rows; never resume an older assistant projection.
           const row = yield* db
-            .select()
+            .select({
+              sessionID: SessionMessageTable.session_id,
+              messageID: SessionMessageTable.id,
+              type: SessionMessageTable.type,
+              dataText: sql<string>`${SessionMessageTable.data}`,
+            })
             .from(SessionMessageTable)
             .where(
               and(eq(SessionMessageTable.session_id, event.data.sessionID), eq(SessionMessageTable.type, "assistant")),
@@ -146,14 +154,19 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
             .get()
             .pipe(Effect.orDie)
           if (!row) return
-          const message = decodeRow(row)
+          const message = yield* decodeRow(row)
           return message.type === "assistant" && !message.time.completed ? message : undefined
         })
       },
       getAssistant(messageID) {
         return Effect.gen(function* () {
           const row = yield* db
-            .select()
+            .select({
+              sessionID: SessionMessageTable.session_id,
+              messageID: SessionMessageTable.id,
+              type: SessionMessageTable.type,
+              dataText: sql<string>`${SessionMessageTable.data}`,
+            })
             .from(SessionMessageTable)
             .where(
               and(
@@ -165,22 +178,27 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
             .get()
             .pipe(Effect.orDie)
           if (!row) return
-          const message = decodeRow(row)
+          const message = yield* decodeRow(row)
           return message.type === "assistant" ? message : undefined
         })
       },
       getCurrentShell(callID) {
         return Effect.gen(function* () {
           const rows = yield* db
-            .select()
+            .select({
+              sessionID: SessionMessageTable.session_id,
+              messageID: SessionMessageTable.id,
+              type: SessionMessageTable.type,
+              dataText: sql<string>`${SessionMessageTable.data}`,
+            })
             .from(SessionMessageTable)
             .where(and(eq(SessionMessageTable.session_id, event.data.sessionID), eq(SessionMessageTable.type, "shell")))
             .orderBy(desc(SessionMessageTable.seq))
             .all()
             .pipe(Effect.orDie)
-          return rows
-            .map(decodeRow)
-            .find((message): message is SessionMessage.Shell => message.type === "shell" && message.callID === callID)
+          return (yield* Effect.forEach(rows, decodeRow)).find(
+            (message): message is SessionMessage.Shell => message.type === "shell" && message.callID === callID,
+          )
         })
       },
       updateAssistant: updateMessage,
@@ -191,14 +209,9 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
   })
 }
 
-function runTool(db: DatabaseService, event: ToolEvent) {
-  return projectToolEvent(db, event).pipe(Effect.flatMap((projected) => (projected ? Effect.void : run(db, event))))
-}
-
 function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: SessionMessage.Message) {
   if (event.durable === undefined) return Effect.die("Durable Session event is missing aggregate sequence")
-  const encoded = encodeMessage(message)
-  const { id, type, ...data } = encoded
+  const { id, type, data } = encodeStoredMessage(message)
   return db
     .insert(SessionMessageTable)
     .values({
@@ -211,6 +224,16 @@ function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: 
     })
     .run()
     .pipe(Effect.orDie)
+}
+
+function encodeStoredMessage(message: SessionMessage.Message) {
+  const encoded = encodeMessage(message)
+  if (encoded.type === "assistant") {
+    const { id, type, content: _, ...data } = encoded
+    return { id: SessionMessage.ID.make(id), type, data }
+  }
+  const { id, type, ...data } = encoded
+  return { id: SessionMessage.ID.make(id), type, data }
 }
 
 const layer = Layer.effectDiscard(
@@ -386,16 +409,16 @@ const layer = Layer.effectDiscard(
     yield* events.project(SessionEvent.Step.Started, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Failed, (event) => run(db, event))
-    yield* events.project(SessionEvent.Text.Started, (event) => run(db, event))
-    yield* events.project(SessionEvent.Text.Ended, (event) => run(db, event))
-    yield* events.project(SessionEvent.Tool.Input.Started, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Tool.Input.Ended, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Tool.Called, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Tool.Progress, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Tool.Success, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Tool.Failed, (event) => runTool(db, event))
-    yield* events.project(SessionEvent.Reasoning.Started, (event) => run(db, event))
-    yield* events.project(SessionEvent.Reasoning.Ended, (event) => run(db, event))
+    yield* events.project(SessionEvent.Text.Started, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Text.Ended, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Input.Started, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Input.Ended, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Called, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Progress, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Success, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Tool.Failed, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Reasoning.Started, (event) => projectContentEvent(db, event))
+    yield* events.project(SessionEvent.Reasoning.Ended, (event) => projectContentEvent(db, event))
     // yield* events.project(SessionEvent.Retried, (event) => run(db, event))
     yield* events.project(SessionEvent.Compaction.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.RevertEvent.Staged, (event) =>

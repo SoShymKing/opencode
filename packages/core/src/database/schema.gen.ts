@@ -167,6 +167,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_message_part\` (
+          \`message_id\` text NOT NULL,
+          \`position\` integer NOT NULL,
+          \`id\` text NOT NULL,
+          \`type\` text NOT NULL,
+          \`data\` text NOT NULL,
+          CONSTRAINT \`session_message_part_pk\` PRIMARY KEY(\`message_id\`, \`position\`),
+          CONSTRAINT \`fk_session_message_part_message_id_session_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`session_message\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT "session_message_part_data_json_object" CHECK(json_valid("data") AND json_type("data") = 'object')
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -254,6 +266,9 @@ export default {
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_input_session_promoted_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_message_part_lookup_idx\` ON \`session_message_part\` (\`message_id\`,\`type\`,\`id\`,"position" desc);`,
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,

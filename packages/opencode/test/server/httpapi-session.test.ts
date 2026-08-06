@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Layer, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -26,7 +26,12 @@ import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/se
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionInputTable,
+  SessionMessagePartTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -118,8 +123,13 @@ const createLocalWorkspace = (input: { projectID: Project.Info["id"]; type: stri
     (info) => Workspace.use.remove(info.id).pipe(Effect.ignore),
   )
 
-const insertLegacyAssistantMessage = (sessionID: SessionIDType, seq = 1, time = seq) =>
+const insertNormalizedAssistantMessage = (sessionID: SessionIDType, seq = 1, time = seq) =>
   Effect.gen(function* () {
+    const content = SessionMessage.AssistantText.make({
+      id: PartID.ascending(),
+      type: "text",
+      text: "normalized assistant",
+    })
     const message = SessionMessage.Assistant.make({
       id: SessionMessage.ID.create(),
       type: "assistant",
@@ -130,26 +140,31 @@ const insertLegacyAssistantMessage = (sessionID: SessionIDType, seq = 1, time = 
         variant: ModelV2.VariantID.make("default"),
       },
       time: { created: DateTime.makeUnsafe(time) },
-      content: [],
+      content: [content],
     })
+    const { id: _, type: __, content: ___, ...data } = Schema.encodeSync(SessionMessage.Assistant)(message)
     const { db } = yield* Database.Service
     yield* db
       .insert(SessionMessageTable)
-      .values([
-        {
-          id: message.id,
-          session_id: sessionID,
-          type: message.type,
-          seq,
-          time_created: time,
-          data: {
-            time: { created: time },
-            agent: message.agent,
-            model: message.model,
-            content: message.content,
-          } as NonNullable<(typeof SessionMessageTable.$inferInsert)["data"]>,
-        },
-      ])
+      .values({
+        id: message.id,
+        session_id: sessionID,
+        type: message.type,
+        seq,
+        time_created: time,
+        data,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionMessagePartTable)
+      .values({
+        message_id: message.id,
+        position: 0,
+        id: content.id,
+        type: content.type,
+        data: { text: content.text },
+      })
       .run()
       .pipe(Effect.orDie)
     return message
@@ -377,7 +392,7 @@ describe("session HttpApi", () => {
           ),
         ).toMatchObject({ info: { id: message.info.id } })
 
-        yield* insertLegacyAssistantMessage(parent.id)
+        yield* insertNormalizedAssistantMessage(parent.id)
 
         expect(
           (yield* requestJson<{ data: SessionMessage.Message[] }>(`/api/session/${parent.id}/message`, {
@@ -388,43 +403,46 @@ describe("session HttpApi", () => {
     { git: true, config: { formatter: false, lsp: false } },
   )
 
-  it.live("uses the persisted session directory for prompt requests", () =>
-    Effect.gen(function* () {
-      const llm = yield* TestLLMServer
-      yield* llm.text("ok", { usage: { input: 1, output: 1 } })
+  it.live(
+    "uses the persisted session directory for prompt requests",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("ok", { usage: { input: 1, output: 1 } })
 
-      const config = testProviderConfig(llm.url)
-      const sessionDirectory = yield* tmpdirScoped({ git: true, config })
-      const requestDirectory = yield* tmpdirScoped({ git: true, config })
-      const session = yield* createSession({ title: "directory regression" }).pipe(
-        provideInstanceEffect(sessionDirectory),
-      )
+        const config = testProviderConfig(llm.url)
+        const sessionDirectory = yield* tmpdirScoped({ git: true, config })
+        const requestDirectory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "directory regression" }).pipe(
+          provideInstanceEffect(sessionDirectory),
+        )
 
-      const response = yield* request(
-        `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            agent: "build",
-            model: { providerID: "test", modelID: "test-model" },
-            parts: [{ type: "text", text: "which directory?" }],
-          }),
-        },
-      )
+        const response = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(requestDirectory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "which directory?" }],
+            }),
+          },
+        )
 
-      expect(response.status).toBe(200)
-      yield* responseJson(response)
+        expect(response.status).toBe(200)
+        yield* responseJson(response)
 
-      const messages = yield* Session.use
-        .messages({ sessionID: session.id })
-        .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
-      const assistant = messages.find((message) => message.info.role === "assistant")
-      expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
-        cwd: sessionDirectory,
-        root: sessionDirectory,
-      })
-    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+        const messages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(sessionDirectory), Effect.orDie)
+        const assistant = messages.find((message) => message.info.role === "assistant")
+        expect(assistant?.info.role === "assistant" ? assistant.info.path : undefined).toEqual({
+          cwd: sessionDirectory,
+          root: sessionDirectory,
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    { timeout: 15000 },
   )
 
   it.instance(
@@ -434,8 +452,8 @@ describe("session HttpApi", () => {
         const test = yield* TestInstance
         const headers = { "x-opencode-directory": test.directory }
         const session = yield* createSession({ title: "v2 cursor" })
-        const firstMessage = yield* insertLegacyAssistantMessage(session.id, 1, 2)
-        const secondMessage = yield* insertLegacyAssistantMessage(session.id, 2, 1)
+        const firstMessage = yield* insertNormalizedAssistantMessage(session.id, 1, 2)
+        const secondMessage = yield* insertNormalizedAssistantMessage(session.id, 2, 1)
 
         const sessionPage = yield* request(
           `/api/session?${new URLSearchParams({

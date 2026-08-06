@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { DateTime, Effect, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -10,7 +10,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { AbsolutePath } from "@opencode-ai/core/schema"
+import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
@@ -19,16 +19,22 @@ import { SessionMessageUpdater } from "@opencode-ai/core/session/message-updater
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { SessionInput } from "@opencode-ai/core/session/input"
-import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionInputTable,
+  SessionMessagePartTable,
+  SessionMessageTable,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
+import { SessionRevert } from "@opencode-ai/core/session/revert"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
 const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.node, SessionExecution.noopLayer]])
 const sessionID = SessionV2.ID.make("ses_projector_test")
 const created = DateTime.makeUnsafe(0)
 const model = { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") }
-const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+const encodeAssistant = Schema.encodeSync(SessionMessage.Assistant)
 
 const assistantRow = (
   id: SessionMessage.ID,
@@ -38,8 +44,11 @@ const assistantRow = (
   const {
     id: _,
     type,
+    content: __,
     ...data
-  } = encodeMessage(SessionMessage.Assistant.make({ id, type: "assistant", agent: "build", model, content: [], time }))
+  } = encodeAssistant(
+    SessionMessage.Assistant.make({ id, type: "assistant", agent: "build", model, content: [], time }),
+  )
   return { id, session_id: sessionID, type, seq, time_created: DateTime.toEpochMillis(time.created), data }
 }
 
@@ -63,11 +72,76 @@ describe("SessionProjector", () => {
         })
         .run()
       const boundary = SessionMessage.ID.make("msg_boundary")
-      yield* db
-        .insert(SessionMessageTable)
-        .values([assistantRow(boundary, 1), assistantRow(SessionMessage.ID.make("msg_later"), 2)])
-        .run()
+      const firstSnapshot = SessionMessage.ID.make("msg_snapshot_first")
+      const secondSnapshot = SessionMessage.ID.make("msg_snapshot_second")
       const events = yield* EventV2.Service
+      const step = { sessionID, timestamp: created, agent: "build", model }
+      const settlement = {
+        sessionID,
+        timestamp: created,
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      }
+      yield* events.publish(SessionEvent.Synthetic, {
+        sessionID,
+        messageID: boundary,
+        timestamp: created,
+        text: "boundary",
+      })
+      yield* events.publish(SessionEvent.Step.Started, {
+        ...step,
+        assistantMessageID: firstSnapshot,
+        snapshot: Snapshot.ID.make("tree-first"),
+      })
+      yield* events.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: firstSnapshot,
+        timestamp: created,
+        textID: "text-first",
+      })
+      yield* events.publish(SessionEvent.Step.Ended, {
+        ...settlement,
+        assistantMessageID: firstSnapshot,
+        files: [RelativePath.make("shared.ts"), RelativePath.make("first.ts")],
+      })
+      yield* events.publish(SessionEvent.Step.Started, {
+        ...step,
+        assistantMessageID: secondSnapshot,
+        snapshot: Snapshot.ID.make("tree-second"),
+      })
+      yield* events.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: secondSnapshot,
+        timestamp: created,
+        textID: "text-second",
+      })
+      yield* events.publish(SessionEvent.Step.Ended, {
+        ...settlement,
+        assistantMessageID: secondSnapshot,
+        files: [RelativePath.make("shared.ts"), RelativePath.make("second.ts")],
+      })
+      const restores: Snapshot.RestoreInput[] = []
+      const snapshots = Layer.succeed(
+        Snapshot.Service,
+        Snapshot.Service.of({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+          diff: () => Effect.succeed([]),
+          preview: () => Effect.succeed([]),
+          restore: (input) => Effect.sync(() => restores.push(input)),
+          checkout: () => Effect.void,
+        }),
+      )
+      const sessions = yield* SessionV2.Service
+      yield* SessionRevert.stage({ session: yield* sessions.get(sessionID), messageID: boundary }).pipe(
+        Effect.provide(snapshots),
+      )
+      expect(Array.from(restores[0]?.files ?? [])).toEqual([
+        [RelativePath.make("shared.ts"), Snapshot.ID.make("tree-first")],
+        [RelativePath.make("first.ts"), Snapshot.ID.make("tree-first")],
+        [RelativePath.make("second.ts"), Snapshot.ID.make("tree-second")],
+      ])
       yield* events.publish(SessionEvent.RevertEvent.Staged, {
         sessionID,
         timestamp: DateTime.makeUnsafe(1),
@@ -93,7 +167,8 @@ describe("SessionProjector", () => {
       expect(
         (yield* db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all()).map((row) => row.id),
       ).toEqual([boundary])
-    }),
+      expect(yield* db.select().from(SessionMessagePartTable).all().pipe(Effect.orDie)).toEqual([])
+    }).pipe(Effect.provide(sessionsLayer)),
   )
 
   it.effect("orders projected messages and context by durable aggregate sequence", () =>
@@ -118,11 +193,13 @@ describe("SessionProjector", () => {
         .pipe(Effect.orDie)
       const events = yield* EventV2.Service
 
+      const firstID = SessionMessage.ID.make("msg_first")
+      const secondID = SessionMessage.ID.make("msg_second")
       yield* events.publish(
         SessionEvent.Prompted,
         {
           sessionID,
-          messageID: SessionMessage.ID.make("msg_first"),
+          messageID: firstID,
           timestamp: created,
           prompt: Prompt.make({ text: "first" }),
           delivery: "steer",
@@ -133,7 +210,7 @@ describe("SessionProjector", () => {
         SessionEvent.Prompted,
         {
           sessionID,
-          messageID: SessionMessage.ID.make("msg_second"),
+          messageID: secondID,
           timestamp: created,
           prompt: Prompt.make({ text: "second" }),
           delivery: "steer",
@@ -142,6 +219,15 @@ describe("SessionProjector", () => {
       )
 
       const sessions = yield* SessionV2.Service
+      expect(yield* sessions.messages({ sessionID, order: "asc" })).toEqual([
+        SessionMessage.User.make({ id: firstID, type: "user", text: "first", time: { created } }),
+        SessionMessage.User.make({ id: secondID, type: "user", text: "second", time: { created } }),
+      ])
+      expect(
+        (yield* sessions.messages({ sessionID, order: "desc" })).map((message) =>
+          message.type === "user" ? message.text : message.type,
+        ),
+      ).toEqual(["second", "first"])
       const firstPage = yield* sessions.messages({ sessionID, limit: 1, order: "asc" })
       expect(firstPage.map((message) => (message.type === "user" ? message.text : message.type))).toEqual(["first"])
       const secondPage = yield* sessions.messages({
@@ -162,6 +248,21 @@ describe("SessionProjector", () => {
       expect(
         (yield* sessions.context(sessionID)).map((message) => (message.type === "user" ? message.text : message.type)),
       ).toEqual(["first", "second"])
+      expect(
+        yield* sessions.messages({
+          sessionID,
+          order: "desc",
+          cursor: { id: secondID, direction: "next" },
+        }),
+      ).toEqual([SessionMessage.User.make({ id: firstID, type: "user", text: "first", time: { created } })])
+      expect(
+        yield* sessions.messages({
+          sessionID,
+          cursor: { id: SessionMessage.ID.make("msg_missing_cursor"), direction: "next" },
+        }),
+      ).toEqual([])
+      yield* db.delete(SessionMessageTable).where(eq(SessionMessageTable.id, firstID)).run().pipe(Effect.orDie)
+      expect(yield* sessions.messages({ sessionID, cursor: { id: firstID, direction: "next" } })).toEqual([])
     }).pipe(Effect.provide(sessionsLayer)),
   )
 
@@ -402,7 +503,7 @@ describe("SessionProjector", () => {
     }),
   )
 
-  it.effect("updates only the newest incomplete assistant projection", () =>
+  it.effect("updates only the latest duplicate content ID", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service
       yield* db
@@ -422,42 +523,60 @@ describe("SessionProjector", () => {
         })
         .run()
         .pipe(Effect.orDie)
-      yield* db
-        .insert(SessionMessageTable)
-        .values([
-          assistantRow(SessionMessage.ID.make("msg_assistant_1"), 0),
-          assistantRow(SessionMessage.ID.make("msg_assistant_2"), 1),
-        ])
-        .run()
-        .pipe(Effect.orDie)
-
       const service = yield* EventV2.Service
+      const assistantID = SessionMessage.ID.make("msg_assistant_2")
+      yield* service.publish(SessionEvent.Step.Started, {
+        sessionID,
+        assistantMessageID: assistantID,
+        timestamp: created,
+        agent: "build",
+        model,
+      })
+      yield* service.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: assistantID,
+        timestamp: created,
+        textID: "text-duplicate",
+      })
+      yield* service.publish(SessionEvent.Text.Started, {
+        sessionID,
+        assistantMessageID: assistantID,
+        timestamp: created,
+        textID: "text-duplicate",
+      })
+      yield* service.publish(SessionEvent.Text.Ended, {
+        sessionID,
+        assistantMessageID: assistantID,
+        timestamp: created,
+        textID: "text-duplicate",
+        text: "latest",
+      })
       yield* service.publish(SessionEvent.Step.Ended, {
         sessionID,
         timestamp: DateTime.makeUnsafe(1),
-        assistantMessageID: SessionMessage.ID.make("msg_assistant_2"),
+        assistantMessageID: assistantID,
         finish: "stop",
         cost: 0,
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
       })
 
-      const rows = yield* db
-        .select()
-        .from(SessionMessageTable)
-        .where(eq(SessionMessageTable.session_id, sessionID))
-        .orderBy(asc(SessionMessageTable.id))
-        .all()
-        .pipe(Effect.orDie)
-      const messages = rows.map((row) =>
-        Schema.decodeUnknownSync(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }),
-      )
-      expect(messages[0]).not.toHaveProperty("time.completed")
-      expect(messages[1]).toMatchObject({
-        type: "assistant",
-        finish: "stop",
-        time: { completed: DateTime.makeUnsafe(1) },
-      })
-    }),
+      expect(yield* (yield* SessionV2.Service).messages({ sessionID, order: "asc" })).toEqual([
+        SessionMessage.Assistant.make({
+          id: assistantID,
+          type: "assistant",
+          agent: "build",
+          model,
+          finish: "stop",
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          content: [
+            SessionMessage.AssistantText.make({ type: "text", id: "text-duplicate", text: "" }),
+            SessionMessage.AssistantText.make({ type: "text", id: "text-duplicate", text: "latest" }),
+          ],
+          time: { created, completed: DateTime.makeUnsafe(1) },
+        }),
+      ])
+    }).pipe(Effect.provide(sessionsLayer)),
   )
 
   it.effect("does not revive a stale incomplete assistant projection", () =>
@@ -500,25 +619,8 @@ describe("SessionProjector", () => {
         textID: "text-stale",
       })
 
-      const rows = yield* db
-        .select()
-        .from(SessionMessageTable)
-        .where(eq(SessionMessageTable.session_id, sessionID))
-        .orderBy(asc(SessionMessageTable.id))
-        .all()
-        .pipe(Effect.orDie)
-      const messages = rows.map((row) =>
-        Schema.decodeUnknownSync(SessionMessage.Message)({ ...row.data, id: row.id, type: row.type }),
-      )
+      const messages = yield* (yield* SessionV2.Service).messages({ sessionID, order: "asc" })
       expect(messages).toEqual([
-        SessionMessage.Assistant.make({
-          id: SessionMessage.ID.make("msg_assistant_completed"),
-          type: "assistant",
-          agent: "build",
-          model,
-          content: [SessionMessage.AssistantText.make({ type: "text", id: "text-stale", text: "" })],
-          time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(2) },
-        }),
         SessionMessage.Assistant.make({
           id: SessionMessage.ID.make("msg_assistant_stale"),
           type: "assistant",
@@ -527,7 +629,15 @@ describe("SessionProjector", () => {
           content: [],
           time: { created },
         }),
+        SessionMessage.Assistant.make({
+          id: SessionMessage.ID.make("msg_assistant_completed"),
+          type: "assistant",
+          agent: "build",
+          model,
+          content: [SessionMessage.AssistantText.make({ type: "text", id: "text-stale", text: "" })],
+          time: { created: DateTime.makeUnsafe(1), completed: DateTime.makeUnsafe(2) },
+        }),
       ])
-    }),
+    }).pipe(Effect.provide(sessionsLayer)),
   )
 })

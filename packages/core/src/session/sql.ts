@@ -1,4 +1,5 @@
-import { sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { desc, sql } from "drizzle-orm"
+import { check, sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
 import * as DatabasePath from "../database/path"
 import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
@@ -15,7 +16,9 @@ import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
 
-type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
+type SessionMessageEnvelopeData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
+type SessionMessagePart = (typeof SessionMessage.AssistantContent)["Encoded"]
+type SessionMessagePartData = Omit<SessionMessagePart, "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
 type V1PartData = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
 
@@ -127,13 +130,35 @@ export const SessionMessageTable = sqliteTable(
     type: text().$type<SessionMessage.Type>().notNull(),
     seq: integer().notNull(),
     ...Timestamps,
-    data: text({ mode: "json" }).notNull().$type<SessionMessageData>(),
+    data: text({ mode: "json" }).notNull().$type<SessionMessageEnvelopeData>(),
   },
   (table) => [
     uniqueIndex("session_message_session_seq_idx").on(table.session_id, table.seq),
     index("session_message_session_type_seq_idx").on(table.session_id, table.type, table.seq),
     index("session_message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
     index("session_message_time_created_idx").on(table.time_created),
+  ],
+)
+
+export const SessionMessagePartTable = sqliteTable(
+  "session_message_part",
+  {
+    message_id: text()
+      .$type<SessionMessage.ID>()
+      .notNull()
+      .references(() => SessionMessageTable.id, { onDelete: "cascade" }),
+    position: integer().notNull(),
+    id: text().notNull(),
+    type: text().$type<SessionMessagePart["type"]>().notNull(),
+    data: text({ mode: "json" }).$type<SessionMessagePartData>().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.message_id, table.position] }),
+    index("session_message_part_lookup_idx").on(table.message_id, table.type, table.id, desc(table.position)),
+    check(
+      "session_message_part_data_json_object",
+      sql`json_valid(${table.data}) AND json_type(${table.data}) = 'object'`,
+    ),
   ],
 )
 
