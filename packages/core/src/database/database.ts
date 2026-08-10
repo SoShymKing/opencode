@@ -9,6 +9,8 @@ import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
+import { DatabaseReplacement } from "./replacement"
+import { DatabaseLease } from "./lease"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 type DatabaseShape = Effect.Success<typeof makeDatabase>
@@ -38,7 +40,16 @@ const layer = (filename: string) =>
   )
 
 export function layerFromPath(filename: string) {
-  return layer(filename).pipe(Layer.provide(sqliteLayer({ filename })))
+  const database = layer(filename).pipe(Layer.provide(sqliteLayer({ filename })))
+  if (filename === ":memory:") return database
+  return Layer.unwrap(
+    Effect.gen(function* () {
+      yield* DatabaseReplacement.activate(filename)
+      yield* DatabaseLease.shared(filename)
+      if (yield* DatabaseReplacement.pending(filename)) return yield* Effect.die("Pending database replacement")
+      return database
+    }).pipe(Effect.orDie),
+  )
 }
 
 export function path() {

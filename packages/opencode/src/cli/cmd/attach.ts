@@ -134,7 +134,7 @@ export const AttachCommand = cmd({
       run({
         url: args.url,
         config,
-        pluginHost: createLegacyTuiPluginHost(),
+        pluginHost: createLegacyTuiPluginHost({ localDatabase: false }),
         args: {
           continue: args.continue,
           sessionID: args.session,

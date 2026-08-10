@@ -991,6 +991,7 @@ export async function init(input: {
   runtime?: PluginRuntime
   dispose?: () => void
   disposeTimeoutMs?: number
+  localDatabase?: boolean
 }) {
   const cwd = process.cwd()
   if (loaded) {
@@ -1001,7 +1002,11 @@ export async function init(input: {
   }
 
   dir = cwd
-  loaded = load({ ...input, runtime: input.runtime ?? createPluginRuntime() })
+  loaded = load({
+    ...input,
+    runtime: input.runtime ?? createPluginRuntime(),
+    localDatabase: input.localDatabase ?? false,
+  })
   return loaded
 }
 
@@ -1054,6 +1059,7 @@ async function load(input: {
   runtime: PluginRuntime
   dispose?: () => void
   disposeTimeoutMs?: number
+  localDatabase: boolean
 }) {
   const { api, config } = input
   const cwd = process.cwd()
@@ -1090,7 +1096,7 @@ async function load(input: {
     if (Flag.OPENCODE_PURE && pluginOrigins.length) {
     }
 
-    for (const item of internalTuiPlugins(flags)) {
+    for (const item of internalTuiPlugins(flags, { localDatabase: input.localDatabase })) {
       const entry = loadInternalPlugin(item)
       const meta = createMeta(entry.source, entry.spec, entry.target, undefined, entry.id)
       addPluginEntry(next, {
@@ -1121,9 +1127,11 @@ async function load(input: {
   }
 }
 
-export function createLegacyTuiPluginHost(): TuiPluginHost {
+export function createLegacyTuiPluginHost(
+  options: { readonly localDatabase: boolean } = { localDatabase: false },
+): TuiPluginHost {
   return {
-    start: init,
+    start: (input: Parameters<typeof init>[0]) => init({ ...input, localDatabase: options.localDatabase }),
     dispose,
   }
 }

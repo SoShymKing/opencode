@@ -33,10 +33,14 @@ interface Config {
   readonly readonly?: boolean
   readonly create?: boolean
   readonly readwrite?: boolean
-  readonly disableWAL?: boolean
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
+}
+
+type LeaseConfig = {
+  readonly filename: string
+  readonly mode: "shared" | "exclusive"
 }
 
 interface SqliteConnection extends Connection {
@@ -55,12 +59,16 @@ const make = (options: Config) =>
 
     const run = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<Record<string, unknown>>, SqlError>((fiber) => {
-        const statement = native.query(query)
-        // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
-        statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+        using statement = native.query(query)
+        Reflect.apply(Reflect.get(statement, "safeIntegers"), statement, [
+          Context.get(fiber.context, Client.SafeIntegers),
+        ])
         try {
-          return Effect.succeed((statement.all(...(params as any)) ?? []) as Array<Record<string, unknown>>)
+          return Effect.succeed(
+            (Reflect.apply(statement.all, statement, params) ?? []) as Array<Record<string, unknown>>,
+          )
         } catch (cause) {
+          if (!(cause instanceof globalThis.Error)) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
@@ -71,12 +79,14 @@ const make = (options: Config) =>
 
     const runValues = (query: string, params: ReadonlyArray<unknown> = []) =>
       Effect.withFiber<Array<unknown[]>, SqlError>((fiber) => {
-        const statement = native.query(query)
-        // @ts-ignore bun-types missing safeIntegers method, fixed in https://github.com/oven-sh/bun/pull/26627
-        statement.safeIntegers(Context.get(fiber.context, Client.SafeIntegers))
+        using statement = native.query(query)
+        Reflect.apply(Reflect.get(statement, "safeIntegers"), statement, [
+          Context.get(fiber.context, Client.SafeIntegers),
+        ])
         try {
-          return Effect.succeed((statement.values(...(params as any)) ?? []) as Array<unknown[]>)
+          return Effect.succeed((Reflect.apply(statement.values, statement, params) ?? []) as Array<unknown[]>)
         } catch (cause) {
+          if (!(cause instanceof globalThis.Error)) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
@@ -121,7 +131,8 @@ const make = (options: Config) =>
     const semaphore = yield* Semaphore.make(1)
     const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!
+      const fiber = Fiber.getCurrent()
+      if (!fiber) return Effect.die("SQLite transaction requires an active fiber")
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
         Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
@@ -161,7 +172,7 @@ const nativeLayer = (config: Config) =>
         create: config.create ?? true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
+      native.run("PRAGMA busy_timeout = 5000;")
       return native
     }),
   )
@@ -181,3 +192,32 @@ export const layer = (config: Config) => {
     Layer.provide(Reactivity.layer),
   )
 }
+
+export const lease = (config: LeaseConfig) =>
+  Effect.acquireRelease(
+    Effect.try({
+      try: () => {
+        const native = new Database(config.filename, { create: true })
+        try {
+          native.run("PRAGMA busy_timeout = 0")
+          const journal = native.query<{ readonly journal_mode: string }, []>("PRAGMA journal_mode = DELETE").get()
+          if (journal?.journal_mode !== "delete") throw new globalThis.Error("Lease database is not in DELETE mode")
+          native.run(config.mode === "shared" ? "BEGIN DEFERRED" : "BEGIN EXCLUSIVE")
+          if (config.mode === "shared") native.query("SELECT count(*) FROM sqlite_schema").get()
+          return native
+        } catch (cause) {
+          native.close()
+          throw cause
+        }
+      },
+      catch: (cause) => cause,
+    }),
+    (native) =>
+      Effect.sync(() => {
+        try {
+          native.run("ROLLBACK")
+        } finally {
+          native.close()
+        }
+      }),
+  ).pipe(Effect.asVoid)
