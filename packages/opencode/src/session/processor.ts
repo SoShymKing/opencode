@@ -58,9 +58,7 @@ export interface Interface {
 }
 
 type ToolCall = {
-  partID: SessionV1.ToolPart["id"]
-  messageID: SessionV1.ToolPart["messageID"]
-  sessionID: SessionV1.ToolPart["sessionID"]
+  part: SessionV1.ToolPart
   done: Deferred.Deferred<void>
 }
 
@@ -120,39 +118,29 @@ const layer = Layer.effect(
           aborted,
         })
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
-        delete ctx.toolcalls[toolCallID]
-        if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
+        toolCallID: string,
+        call: ToolCall,
+      ) {
+        yield* Deferred.succeed(call.done, undefined).pipe(Effect.ignore)
+        if (ctx.toolcalls[toolCallID]?.done === call.done) delete ctx.toolcalls[toolCallID]
       })
 
-      const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
+      const readToolCall = (toolCallID: string) => {
         const call = ctx.toolcalls[toolCallID]
         if (!call) return undefined
-        const part = yield* session.getPart({
-          partID: call.partID,
-          messageID: call.messageID,
-          sessionID: call.sessionID,
-        })
-        if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
-          return undefined
-        }
-        return { call, part }
-      })
+        return { call, part: call.part }
+      }
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
       ) {
-        const match = yield* readToolCall(toolCallID)
+        const match = readToolCall(toolCallID)
         if (!match) return undefined
         const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
         }
         return part
       })
@@ -166,9 +154,9 @@ const layer = Layer.effect(
           attachments?: SessionV1.FilePart[]
         },
       ) {
-        const match = yield* readToolCall(toolCallID)
+        const match = readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "completed",
@@ -180,13 +168,16 @@ const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
-        yield* settleToolCall(toolCallID)
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
+        }
+        yield* settleToolCall(toolCallID, match.call)
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
+        const match = readToolCall(toolCallID)
         if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "error",
@@ -197,10 +188,13 @@ const layer = Layer.effect(
             time: { start: match.part.state.time.start, end: Date.now() },
           },
         })
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
+        }
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
-        yield* settleToolCall(toolCallID)
+        yield* settleToolCall(toolCallID, match.call)
         return true
       })
 
@@ -218,18 +212,17 @@ const layer = Layer.effect(
         name: string
         providerExecuted?: boolean
       }) {
-        const existing = yield* readToolCall(input.id)
+        const existing = readToolCall(input.id)
         if (existing) {
           if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
           const part = yield* session.updatePart({
             ...existing.part,
             metadata: { ...existing.part.metadata, providerExecuted: true },
           })
+          if (ctx.toolcalls[input.id]?.done !== existing.call.done) return readToolCall(input.id)
           ctx.toolcalls[input.id] = {
             ...existing.call,
-            partID: part.id,
-            messageID: part.messageID,
-            sessionID: part.sessionID,
+            part,
           }
           return { call: ctx.toolcalls[input.id], part }
         }
@@ -245,9 +238,7 @@ const layer = Layer.effect(
         } satisfies SessionV1.ToolPart)
         ctx.toolcalls[input.id] = {
           done: yield* Deferred.make<void>(),
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
+          part,
         }
         return { call: ctx.toolcalls[input.id], part }
       })
@@ -381,7 +372,7 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
-            const toolCall = yield* readToolCall(value.id)
+            const toolCall = readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
               yield* failToolCall(value.id, value.result.value)
@@ -568,19 +559,19 @@ const layer = Layer.effect(
         }
         ctx.reasoningMap = {}
 
+        const pendingToolCalls = Object.entries(ctx.toolcalls)
         yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+          pendingToolCalls,
+          ([, call]) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
           { concurrency: "unbounded" },
         )
 
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
-          const part = match.part
+        for (const [toolCallID, call] of pendingToolCalls) {
+          if (ctx.toolcalls[toolCallID]?.done !== call.done) continue
+          const part = call.part
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
+          const updated = yield* session.updatePart({
             ...part,
             state: {
               ...part.state,
@@ -590,8 +581,11 @@ const layer = Layer.effect(
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })
+          if (ctx.toolcalls[toolCallID]?.done === call.done) {
+            ctx.toolcalls[toolCallID] = { ...call, part: updated }
+          }
+          yield* settleToolCall(toolCallID, call)
         }
-        ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })
