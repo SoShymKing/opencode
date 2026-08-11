@@ -11,6 +11,8 @@ export interface Shape {
   readonly bind: <Args extends readonly unknown[], Result>(fn: (...args: Args) => Result) => (...args: Args) => Result
 }
 
+export type Interface = Shape
+
 function restoreWorkspace<R>(workspace: WorkspaceV2.ID | undefined, fn: () => R): R {
   if (workspace !== undefined) return WorkspaceContext.restore(workspace, fn)
   return fn()
