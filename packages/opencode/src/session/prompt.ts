@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import path from "path"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -56,6 +57,8 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { PromptHistory } from "./prompt-history"
+import { PromptHistoryConversion } from "./prompt-history-conversion"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1084,14 +1087,17 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        const conversion = PromptHistoryConversion.make()
+        const history = yield* PromptHistory.make(sessionID, { invalidate: conversion.invalidate }).pipe(
+          Effect.provideService(EventV2.Service, events),
+          Effect.provideService(Database.Service, database),
+        )
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          let msgs = yield* history.refresh()
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
@@ -1252,6 +1258,10 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            msgs = structuredClone(msgs)
+            const transformed = (yield* plugin.list()).some(
+              (hook) => hook["experimental.chat.messages.transform"] !== undefined,
+            )
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
@@ -1259,7 +1269,7 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              conversion.convert({ messages: msgs, model, transformed }),
             ])
             const system = [
               ...env,
