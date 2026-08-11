@@ -1,14 +1,13 @@
 export * as DatabaseMigration from "./migration"
 
 import { randomUUID } from "node:crypto"
-import { link, open, rm } from "node:fs/promises"
-import { dirname } from "node:path"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Semaphore } from "effect"
+import { Effect, Semaphore } from "effect"
 import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { migrations } from "./migration.gen"
 import sessionMessagePartMigration from "./migration/v02_session_message_part"
 import schema from "./schema.gen"
+import { DatabaseArtifact } from "./artifact"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -58,6 +57,12 @@ export const legacyBaselineMigrationIDs = [
 ] as const
 export const legacySessionMetadataAlias = "20260530232709_lovely_romulus"
 export const legacyPartMigrationID = "20260802133449_session_message_part"
+export const currentMigrationIDs = new Set([
+  ...migrations.map((migration) => migration.id),
+  ...legacyBaselineMigrationIDs,
+  legacySessionMetadataAlias,
+  legacyPartMigrationID,
+])
 
 export type Migration = {
   readonly id: string
@@ -186,44 +191,28 @@ function migrationState(history: ReadonlySet<string>) {
 }
 
 function backup(db: Database, filename: string) {
-  const partial = `${filename}.backup-${Date.now()}-${process.pid}-${randomUUID()}.db.partial`
-  const completed = partial.slice(0, -".partial".length)
-  return db.run(sql`VACUUM INTO ${partial}`).pipe(
-    Effect.andThen(syncFile(partial)),
-    Effect.andThen(operation("publish", () => link(partial, completed))),
-    Effect.andThen(syncDirectory(completed)),
-    Effect.andThen(operation("cleanup", () => rm(partial))),
-    Effect.andThen(syncDirectory(completed)),
-    Effect.onExit((exit) =>
-      Exit.isFailure(exit)
-        ? operation("cleanup", () => rm(partial, { force: true })).pipe(Effect.catch(() => Effect.void))
-        : Effect.void,
-    ),
+  return DatabaseArtifact.snapshot(db, `${filename}.backup-${Date.now()}-${process.pid}-${randomUUID()}.db`).pipe(
+    Effect.mapError((cause) => new MigrationBackupError(backupOperation(cause), { cause })),
   )
 }
 
-function syncFile(filename: string) {
-  return Effect.acquireUseRelease(
-    operation("open", () => open(filename, "r+")),
-    (handle) => operation("sync", () => handle.sync()),
-    (handle) => operation("close", () => handle.close()),
-  )
-}
-
-function syncDirectory(filename: string) {
-  if (process.platform === "win32") return Effect.void
-  return Effect.acquireUseRelease(
-    operation("open", () => open(dirname(filename), "r")),
-    (handle) => operation("sync-directory", () => handle.sync()),
-    (handle) => operation("close", () => handle.close()),
-  )
-}
-
-function operation<A>(name: MigrationBackupError["operation"], run: () => Promise<A>) {
-  return Effect.tryPromise({
-    try: run,
-    catch: (cause) => new MigrationBackupError(name, { cause }),
-  })
+function backupOperation(error: DatabaseArtifact.Error): MigrationBackupError["operation"] {
+  switch (error.operation) {
+    case "open":
+    case "sync":
+    case "close":
+    case "publish":
+    case "sync-directory":
+      return error.operation
+    case "remove":
+      return "cleanup"
+    case "hash":
+    case "replace":
+    case "snapshot":
+    case "stat":
+    case "write":
+      return "publish"
+  }
 }
 
 function journal(tx: Transaction, id: string) {

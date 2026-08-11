@@ -38,7 +38,7 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/webp",
 ])
 
-export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
+type ResolveInput = {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
@@ -46,9 +46,17 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
-}) {
+}
+
+export const resolve = Effect.fn("SessionTools.resolve")(function* (input: ResolveInput) {
+  return yield* resolveWithBridge(input, yield* EffectBridge.make())
+})
+
+export const resolveWithBridge = Effect.fn("SessionTools.resolveWithBridge")(function* (
+  input: ResolveInput,
+  run: EffectBridge.Interface,
+) {
   const tools: Record<string, AITool> = {}
-  const run = yield* EffectBridge.make()
   const plugin = yield* Plugin.Service
   const permission = yield* Permission.Service
   const registry = yield* ToolRegistry.Service
@@ -58,7 +66,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
-    abort: options.abortSignal!,
+    abort: options.abortSignal ?? AbortSignal.any([]),
     messageID: input.processor.message.id,
     callID: options.toolCallId,
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },

@@ -4,8 +4,9 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import * as Stream from "effect/Stream"
+import { TestClock } from "effect/testing"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -27,6 +28,17 @@ import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import {
+  clearControlledProcesses,
+  controlledToolLLM,
+  eventPublishGate,
+  eventV2BridgeWithPublishGate,
+  forkControlledProcess,
+  partUpdateGate,
+  sessionWithPartUpdateGate,
+  startControlledProcess,
+} from "./processor-race.fixture"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -231,6 +243,77 @@ const fragmentFailureEnv = LayerNode.compile(root, [
 ])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const activeToolLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: { query: "weather" } }),
+      ).pipe(Stream.concat(Stream.never)),
+  }),
+)
+const activeToolEnv = LayerNode.compile(root, [...replacements, [LLM.node, activeToolLLM]])
+const itActiveTool = testEffect(activeToolEnv)
+
+const cleanupWaiterEnv = LayerNode.compile(root, [...replacements, [LLM.node, controlledToolLLM]])
+const itCleanupWaiter = testEffect(cleanupWaiterEnv)
+const ownerRaceEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, controlledToolLLM],
+  [Session.node, sessionWithPartUpdateGate],
+  [EventV2Bridge.node, eventV2BridgeWithPublishGate],
+])
+const itOwnerRace = testEffect(ownerRaceEnv)
+
+const toolFailureGate = defer<void>()
+const toolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-1", name: "lookup", input: { query: "weather" } }),
+      ).pipe(
+        Stream.concat(
+          Stream.fromEffect(
+            Effect.promise(() => toolFailureGate.promise).pipe(
+              Effect.as(LLMEvent.toolError({ id: "call-1", name: "lookup", message: "tool boom" })),
+            ),
+          ),
+        ),
+      ),
+  }),
+)
+const toolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, toolFailureLLM]])
+const itToolFailure = testEffect(toolFailureEnv)
+
+const partLookupProbe = { active: false, count: 0 }
+const sessionWithPartLookupProbe = Layer.effect(
+  Session.Service,
+  Effect.gen(function* () {
+    const session = yield* Session.Service
+    return Session.Service.of({
+      ...session,
+      getPart: (input) =>
+        Effect.gen(function* () {
+          if (partLookupProbe.active) partLookupProbe.count += 1
+          return yield* session.getPart(input)
+        }),
+    })
+  }),
+).pipe(Layer.provide(LayerNode.compile(Session.node)))
+const probedActiveToolEnv = LayerNode.compile(root, [
+  ...replacements,
+  [LLM.node, activeToolLLM],
+  [Session.node, sessionWithPartLookupProbe],
+])
+const itProbedActiveTool = testEffect(probedActiveToolEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -302,6 +385,65 @@ function llmMock(...streams: Stream.Stream<LLMEvent, unknown>[]) {
 function processorEnv(llmLayer: Layer.Layer<LLM.Service>) {
   return LayerNode.compile(root, [...replacements, [LLM.node, llmLayer]])
 }
+
+function processorInput(input: {
+  parent: SessionV1.User
+  sessionID: SessionID
+  model: Provider.Model
+  text: string
+}) {
+  return {
+    user: {
+      id: input.parent.id,
+      sessionID: input.sessionID,
+      role: "user",
+      time: input.parent.time,
+      agent: input.parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionV1.User,
+    sessionID: input.sessionID,
+    model: input.model,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: input.text }],
+    tools: {},
+  } satisfies LLM.StreamInput
+}
+
+const processorHarness = Effect.fn("test.processorHarness")(function* (directory: string, text: string) {
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, text)
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(directory))
+  const model = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+  return { handle, input: processorInput({ parent, sessionID: chat.id, model, text }) }
+})
+
+const startToolCall = Effect.fn("test.startToolCall")(function* (directory: string, text: string) {
+  const database = yield* Database.Service
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, text)
+  const msg = yield* assistant(chat.id, parent.id, path.resolve(directory))
+  const model = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+  const run = yield* handle
+    .process(processorInput({ parent, sessionID: chat.id, model, text }))
+    .pipe(Effect.forkChild)
+
+  yield* waitFor(
+    MessageV2.parts(msg.id).pipe(
+      Effect.map((parts) =>
+        parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status === "running"),
+      ),
+      Effect.provideService(Database.Service, database),
+    ),
+    "timed out waiting for running tool part",
+  )
+  return { handle, messageID: msg.id, projectID: chat.projectID, run, sessionID: chat.id }
+})
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1239,6 +1381,601 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
   ),
 )
 
+itActiveTool.live("session.processor effect tests preserve complete tool shape after metadata updates", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const active = yield* startToolCall(dir, "tool metadata")
+        const running = yield* active.handle.updateToolCall("call-1", (part) => ({
+          ...part,
+          state: { ...part.state, metadata: { step: 1 } },
+        }))
+        yield* active.handle.completeToolCall("call-1", {
+          title: "Weather lookup",
+          metadata: { step: 1 },
+          output: "result:weather",
+        })
+        yield* Fiber.interrupt(active.run)
+
+        const call = (yield* MessageV2.parts(active.messageID)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(running?.state.status).toBe("running")
+        if (!running || running.state.status !== "running") return
+        expect(call).toEqual({
+          ...running,
+          state: {
+            status: "completed",
+            input: running.state.input,
+            output: "result:weather",
+            metadata: { step: 1 },
+            title: "Weather lookup",
+            time: { start: running.state.time.start, end: expect.any(Number) },
+            attachments: undefined,
+          },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itProbedActiveTool.live("session.processor metadata updates avoid post-create part lookups", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        partLookupProbe.active = false
+        partLookupProbe.count = 0
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            partLookupProbe.active = false
+            partLookupProbe.count = 0
+          }),
+        )
+
+        const active = yield* startToolCall(dir, "tool metadata churn")
+        partLookupProbe.active = true
+        const seen: Array<number | undefined> = []
+        const updates = yield* Effect.forEach(Array.from({ length: 100 }, (_, step) => step), (step) =>
+          active.handle.updateToolCall("call-1", (part) => {
+            seen.push(
+              part.state.status === "running" && typeof part.state.metadata?.step === "number"
+                ? part.state.metadata.step
+                : undefined,
+            )
+            return { ...part, state: { ...part.state, metadata: { step } } }
+          }),
+        )
+        yield* active.handle.completeToolCall("call-1", {
+          title: "Weather lookup",
+          metadata: { step: 99 },
+          output: "result:weather",
+        })
+        partLookupProbe.active = false
+        const lookups = partLookupProbe.count
+        yield* Fiber.interrupt(active.run)
+
+        const call = (yield* MessageV2.parts(active.messageID)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(updates.every((part) => part?.state.status === "running")).toBe(true)
+        expect(seen).toEqual([undefined, ...Array.from({ length: 99 }, (_, step) => step)])
+        expect(lookups).toBe(0)
+        expect(call?.state).toEqual({
+          status: "completed",
+          input: { query: "weather" },
+          output: "result:weather",
+          metadata: { step: 99 },
+          title: "Weather lookup",
+          time: { start: expect.any(Number), end: expect.any(Number) },
+          attachments: undefined,
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itToolFailure.live("session.processor failures preserve latest tool metadata", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const active = yield* startToolCall(dir, "tool failure metadata")
+        yield* active.handle.updateToolCall("call-1", (part) => ({
+          ...part,
+          state: { ...part.state, metadata: { step: 1 } },
+        }))
+        toolFailureGate.resolve()
+        expect(yield* Fiber.join(active.run)).toBe("continue")
+
+        const call = (yield* MessageV2.parts(active.messageID)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(call?.state).toEqual({
+          status: "error",
+          input: { query: "weather" },
+          error: "tool boom",
+          metadata: { step: 1 },
+          time: { start: expect.any(Number), end: expect.any(Number) },
+        })
+      }),
+    { config: cfg },
+  ),
+)
+
+itCleanupWaiter.effect("session.processor cleanup settles retained tool waiters after interruption", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.sync(clearControlledProcesses))
+        const harness = yield* processorHarness(dir, "tool cleanup waiter")
+        const firstReady = yield* Deferred.make<void>()
+        const secondReady = yield* Deferred.make<void>()
+        const first = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: firstReady })
+        const second = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: secondReady })
+
+        const firstCleanup = yield* Fiber.interrupt(first).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* Deferred.await(firstReady)
+        yield* TestClock.adjust("249 millis")
+        const retainedSettled = yield* Deferred.make<void>()
+        const retainedCleanup = yield* Fiber.interrupt(second).pipe(
+          Effect.ensuring(Deferred.succeed(retainedSettled, undefined).pipe(Effect.asVoid)),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* Deferred.await(secondReady)
+        yield* TestClock.adjust("1 milli")
+        yield* Fiber.join(firstCleanup)
+        yield* Effect.yieldNow
+
+        expect(yield* Deferred.isDone(retainedSettled)).toBe(true)
+        yield* Fiber.join(retainedCleanup)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor late metadata persistence cannot replace newer tool ownership", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        partUpdateGate.current = {
+          entered,
+          release,
+          matches: (part) =>
+            part.type === "tool" &&
+            part.state.status === "running" &&
+            part.state.metadata?.race === "late-update",
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "late metadata ownership")
+        const originalReady = yield* Deferred.make<void>()
+        const original = yield* startControlledProcess(harness.handle, harness.input, {
+          cleanupReady: originalReady,
+        })
+        const delayed = yield* harness.handle
+          .updateToolCall("call-1", (part) => ({
+            ...part,
+            state: { ...part.state, metadata: { race: "late-update" } },
+          }))
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+
+        const originalCleanup = yield* Fiber.interrupt(original).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* Deferred.await(originalReady)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(originalCleanup)
+        const newerReady = yield* Deferred.make<void>()
+        const newer = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: newerReady })
+        const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!newerPart) return yield* Effect.die(new Error("newer metadata owner was not created"))
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(delayed)
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        const newerCleanup = yield* Fiber.interrupt(newer).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* Deferred.await(newerReady)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(newerCleanup)
+
+        expect(current?.id).toBe(newerPart.id)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor late completion persistence cannot delete newer tool ownership", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        partUpdateGate.current = {
+          entered,
+          release,
+          matches: (part) =>
+            part.type === "tool" && part.state.status === "completed" && part.state.title === "late completion",
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "late completion ownership")
+        const originalReady = yield* Deferred.make<void>()
+        const original = yield* startControlledProcess(harness.handle, harness.input, {
+          cleanupReady: originalReady,
+        })
+        const delayed = yield* harness.handle
+          .completeToolCall("call-1", {
+            title: "late completion",
+            metadata: { race: "late-completion" },
+            output: "late",
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+
+        const originalCleanup = yield* Fiber.interrupt(original).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* Deferred.await(originalReady)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(originalCleanup)
+        const newerReady = yield* Deferred.make<void>()
+        const newer = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: newerReady })
+        const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!newerPart) return yield* Effect.die(new Error("newer completion owner was not created"))
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(delayed)
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        const newerCleanup = yield* Fiber.interrupt(newer).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* Deferred.await(newerReady)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(newerCleanup)
+
+        expect(current?.id).toBe(newerPart.id)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor late provider ensure persistence cannot replace newer tool ownership", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        partUpdateGate.current = {
+          entered,
+          release,
+          matches: (part) => part.type === "tool" && part.metadata?.providerExecuted === true,
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "late provider ensure ownership")
+        const originalReady = yield* Deferred.make<void>()
+        const original = yield* startControlledProcess(harness.handle, harness.input, {
+          cleanupReady: originalReady,
+        })
+        const delayed = yield* forkControlledProcess(harness.handle, harness.input, {
+          providerExecuted: true,
+        })
+        yield* Deferred.await(entered)
+
+        const originalCleanup = yield* Fiber.interrupt(original).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* Deferred.await(originalReady)
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(originalCleanup)
+        const newer = yield* startControlledProcess(harness.handle, harness.input)
+        const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!newerPart) return yield* Effect.die(new Error("newer provider owner was not created"))
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(delayed.started)
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        yield* harness.handle.completeToolCall("call-1", {
+          title: "race cleanup",
+          metadata: {},
+          output: "done",
+        })
+        yield* Fiber.interrupt(delayed.process)
+        yield* Fiber.interrupt(newer)
+
+        expect(current?.id).toBe(newerPart.id)
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor tool-call continuation cannot update a replacement owner", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const gate = {
+          type: SessionEvent.Tool.Called.type,
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        eventPublishGate.current = gate
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            eventPublishGate.current = undefined
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "tool-call replacement ownership")
+        const original = yield* forkControlledProcess(harness.handle, harness.input, { query: "owner-a" })
+        yield* Deferred.await(gate.entered)
+        eventPublishGate.current = undefined
+
+        yield* harness.handle.updateToolCall("call-1", (part) => ({
+          ...part,
+          state: { status: "running", input: { query: "owner-a" }, time: { start: Date.now() } },
+        }))
+        yield* harness.handle.completeToolCall("call-1", {
+          title: "owner-a complete",
+          metadata: {},
+          output: "done",
+        })
+        const replacement = yield* startControlledProcess(harness.handle, harness.input, { query: "owner-b" })
+        const replacementPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!replacementPart) return yield* Effect.die(new Error("replacement tool-call owner was not created"))
+
+        yield* Deferred.succeed(gate.release, undefined)
+        yield* Deferred.await(original.started)
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        yield* harness.handle.completeToolCall("call-1", { title: "cleanup", metadata: {}, output: "done" })
+        yield* Fiber.interrupt(original.process)
+        yield* Fiber.interrupt(replacement)
+
+        expect(current?.id).toBe(replacementPart.id)
+        expect(current?.state.status).toBe("running")
+        if (current?.state.status === "running") expect(current.state.input).toEqual({ query: "owner-b" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor tool-result cannot complete a replacement owner", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const gate = {
+          type: SessionEvent.Tool.Success.type,
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            eventPublishGate.current = undefined
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "tool-result replacement ownership")
+        const next = {
+          event: yield* Deferred.make<LLMEvent>(),
+          handled: yield* Deferred.make<void>(),
+        }
+        const original = yield* startControlledProcess(harness.handle, harness.input, { next, query: "owner-a" })
+        eventPublishGate.current = gate
+        yield* Deferred.succeed(
+          next.event,
+          LLMEvent.toolResult({ id: "call-1", name: "lookup", result: { type: "text", value: "done" } }),
+        )
+        yield* Deferred.await(gate.entered)
+        eventPublishGate.current = undefined
+
+        yield* harness.handle.completeToolCall("call-1", {
+          title: "owner-a complete",
+          metadata: {},
+          output: "done",
+        })
+        const replacement = yield* startControlledProcess(harness.handle, harness.input, { query: "owner-b" })
+        const replacementPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!replacementPart) return yield* Effect.die(new Error("replacement tool-result owner was not created"))
+        yield* Deferred.succeed(gate.release, undefined)
+        yield* Deferred.await(next.handled)
+
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        yield* harness.handle.completeToolCall("call-1", { title: "cleanup", metadata: {}, output: "done" })
+        yield* Fiber.interrupt(original)
+        yield* Fiber.interrupt(replacement)
+
+        expect(current?.id).toBe(replacementPart.id)
+        expect(current?.state.status).toBe("running")
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor tool-error cannot fail a replacement owner", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const gate = {
+          type: SessionEvent.Tool.Failed.type,
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            eventPublishGate.current = undefined
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "tool-error replacement ownership")
+        const next = {
+          event: yield* Deferred.make<LLMEvent>(),
+          handled: yield* Deferred.make<void>(),
+        }
+        const original = yield* startControlledProcess(harness.handle, harness.input, { next, query: "owner-a" })
+        eventPublishGate.current = gate
+        yield* Deferred.succeed(
+          next.event,
+          LLMEvent.toolError({ id: "call-1", name: "lookup", message: "owner-a failed" }),
+        )
+        yield* Deferred.await(gate.entered)
+        eventPublishGate.current = undefined
+
+        yield* harness.handle.completeToolCall("call-1", {
+          title: "owner-a complete",
+          metadata: {},
+          output: "done",
+        })
+        const replacement = yield* startControlledProcess(harness.handle, harness.input, { query: "owner-b" })
+        const replacementPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!replacementPart) return yield* Effect.die(new Error("replacement tool-error owner was not created"))
+        yield* Deferred.succeed(gate.release, undefined)
+        yield* Deferred.await(next.handled)
+
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        yield* harness.handle.completeToolCall("call-1", { title: "cleanup", metadata: {}, output: "done" })
+        yield* Fiber.interrupt(original)
+        yield* Fiber.interrupt(replacement)
+
+        expect(current?.id).toBe(replacementPart.id)
+        expect(current?.state.status).toBe("running")
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor cleanup retains same-owner metadata written during the grace period", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            eventPublishGate.current = undefined
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "cleanup grace metadata")
+        const cleanupReady = yield* Deferred.make<void>()
+        const process = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady })
+        const cleanup = yield* Fiber.interrupt(process).pipe(Effect.forkScoped({ startImmediately: true }))
+        yield* Deferred.await(cleanupReady)
+
+        yield* harness.handle.updateToolCall("call-1", (part) => ({
+          ...part,
+          state: { ...part.state, metadata: { grace: true } },
+        }))
+        yield* TestClock.adjust("250 millis")
+        yield* Fiber.join(cleanup)
+
+        const call = (yield* MessageV2.parts(harness.handle.message.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status === "error") expect(call.state.metadata).toEqual({ grace: true, interrupted: true })
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnerRace.effect("session.processor concurrent initial tool creation retains the first owner", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const firstGate = {
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        const secondGate = {
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        const startGate = {
+          type: SessionEvent.Tool.Input.Started.type,
+          entered: yield* Deferred.make<void>(),
+          release: yield* Deferred.make<void>(),
+        }
+        partUpdateGate.current = {
+          sequence: [firstGate, secondGate],
+          matches: (part) => part.type === "tool" && part.state.status === "pending",
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            eventPublishGate.current = undefined
+            partUpdateGate.current = undefined
+            clearControlledProcesses()
+          }),
+        )
+        const harness = yield* processorHarness(dir, "concurrent initial tool ownership")
+        const order: string[] = []
+        const off = yield* (yield* EventV2Bridge.Service).listen((event) => {
+          if (
+            event.type === SessionEvent.Tool.Input.Started.type ||
+            event.type === SessionEvent.Tool.Input.Ended.type ||
+            event.type === SessionEvent.Tool.Called.type
+          ) {
+            order.push(event.type)
+          }
+          return Effect.void
+        })
+        const first = yield* forkControlledProcess(harness.handle, harness.input, { query: "owner-a" })
+        yield* Deferred.await(firstGate.entered)
+        const second = yield* forkControlledProcess(harness.handle, harness.input, { query: "owner-b" })
+        yield* Deferred.await(secondGate.entered)
+
+        eventPublishGate.current = startGate
+        yield* Deferred.succeed(firstGate.release, undefined)
+        yield* Deferred.await(startGate.entered)
+        eventPublishGate.current = undefined
+        const firstOwner = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        if (!firstOwner) return yield* Effect.die(new Error("first concurrent tool owner was not created"))
+        yield* Deferred.succeed(secondGate.release, undefined)
+        const beforeStart = yield* Deferred.await(second.started).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({ duration: "1 milli", orElse: () => Effect.succeed(false) }),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* Effect.yieldNow
+        yield* TestClock.adjust("1 milli")
+        const completedBeforeStart = yield* Fiber.join(beforeStart)
+        yield* Deferred.succeed(startGate.release, undefined)
+        yield* Deferred.await(first.started)
+        yield* Deferred.await(second.started)
+        const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
+        yield* off
+        const parts = (yield* MessageV2.parts(harness.handle.message.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        yield* harness.handle.completeToolCall("call-1", { title: "cleanup", metadata: {}, output: "done" })
+        yield* Fiber.interrupt(first.process)
+        yield* Fiber.interrupt(second.process)
+
+        expect(current?.id).toBe(firstOwner.id)
+        expect(completedBeforeStart).toBe(false)
+        expect(parts).toHaveLength(1)
+        expect(order.filter((type) => type === SessionEvent.Tool.Input.Started.type)).toHaveLength(1)
+        expect(order.indexOf(SessionEvent.Tool.Input.Started.type)).toBeLessThan(
+          order.indexOf(SessionEvent.Tool.Input.Ended.type),
+        )
+        expect(order.indexOf(SessionEvent.Tool.Input.Started.type)).toBeLessThan(
+          order.indexOf(SessionEvent.Tool.Called.type),
+        )
+      }),
+    { config: cfg },
+  ),
+)
+
 it.live("session.processor effect tests mark pending tools as aborted on cleanup", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
@@ -1285,6 +2022,10 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           ),
           "timed out waiting for tool part",
         )
+        yield* handle.updateToolCall("call_1", (part) => ({
+          ...part,
+          state: { ...part.state, metadata: { step: 1 } },
+        }))
         yield* Fiber.interrupt(run)
 
         const exit = yield* Fiber.await(run)
@@ -1299,7 +2040,7 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
         expect(call?.state.status).toBe("error")
         if (call?.state.status === "error") {
           expect(call.state.error).toBe("Tool execution aborted")
-          expect(call.state.metadata?.interrupted).toBe(true)
+          expect(call.state.metadata).toEqual({ step: 1, interrupted: true })
           expect(call.state.time.end).toBeDefined()
         }
       }),

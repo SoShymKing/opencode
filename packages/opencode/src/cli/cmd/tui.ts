@@ -373,7 +373,7 @@ export const TuiThreadCommand = cmd({
               return [tui, server]
             },
             config,
-            pluginHost: createLegacyTuiPluginHost(),
+            pluginHost: createLegacyTuiPluginHost({ localDatabase: true }),
             directory: cwd,
             fetch: transport.fetch,
             headers: transport.headers,

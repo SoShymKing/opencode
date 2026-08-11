@@ -1,4 +1,4 @@
-import { DatabaseSync, type SQLInputValue } from "node:sqlite"
+import { DatabaseSync } from "node:sqlite"
 import { drizzle } from "drizzle-orm/node-sqlite"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -32,12 +32,16 @@ interface Config {
   readonly readonly?: boolean
   readonly create?: boolean
   readonly readwrite?: boolean
-  readonly disableWAL?: boolean
   readonly timeout?: number
   readonly allowExtension?: boolean
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
+}
+
+type LeaseConfig = {
+  readonly filename: string
+  readonly mode: "shared" | "exclusive"
 }
 
 interface SqliteConnection extends Connection {
@@ -58,8 +62,9 @@ const make = (options: Config) =>
         const statement = native.prepare(query)
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         try {
-          return Effect.succeed(statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>)
+          return Effect.succeed(Reflect.apply(statement.all, statement, params) as Array<Record<string, unknown>>)
         } catch (cause) {
+          if (!(cause instanceof globalThis.Error)) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
@@ -74,10 +79,12 @@ const make = (options: Config) =>
         statement.setReadBigInts(Context.get(fiber.context, Client.SafeIntegers))
         statement.setReturnArrays(true)
         try {
-          return Effect.succeed(
-            statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
-          )
+          const rows: unknown = Reflect.apply(statement.all, statement, params)
+          if (!Array.isArray(rows) || !rows.every(Array.isArray))
+            throw new globalThis.Error("Invalid SQLite row result")
+          return Effect.succeed(rows)
         } catch (cause) {
+          if (!(cause instanceof globalThis.Error)) throw cause
           return Effect.fail(
             new SqlError({
               reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
@@ -115,7 +122,8 @@ const make = (options: Config) =>
     const semaphore = yield* Semaphore.make(1)
     const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
     const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
-      const fiber = Fiber.getCurrent()!
+      const fiber = Fiber.getCurrent()
+      if (!fiber) return Effect.die("SQLite transaction requires an active fiber")
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
         Effect.tap(restore(semaphore.take(1)), () => Scope.addFinalizer(scope, semaphore.release(1))),
@@ -150,13 +158,12 @@ const nativeLayer = (config: Config) =>
     Effect.gen(function* () {
       const native = new DatabaseSync(config.filename, {
         readOnly: config.readonly,
-        timeout: config.timeout,
+        timeout: config.timeout ?? 5000,
         allowExtension: config.allowExtension,
         enableForeignKeyConstraints: true,
         open: true,
       })
       yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
-      if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native
     }),
   )
@@ -166,7 +173,7 @@ const sqliteLayer = (config: Config) => Layer.effect(Client.SqlClient, make(conf
 const drizzleLayer = Layer.effect(
   Sqlite.Drizzle,
   Effect.gen(function* () {
-    return drizzle({ client: (yield* Sqlite.Native) as DatabaseSync }) as unknown as Sqlite.DrizzleClient
+    return Reflect.apply(drizzle, undefined, [{ client: yield* Sqlite.Native }])
   }),
 )
 
@@ -176,3 +183,32 @@ export const layer = (config: Config) => {
     Layer.provide(Reactivity.layer),
   )
 }
+
+export const lease = (config: LeaseConfig) =>
+  Effect.acquireRelease(
+    Effect.try({
+      try: () => {
+        const native = new DatabaseSync(config.filename, { open: true, timeout: 0 })
+        try {
+          native.exec("PRAGMA busy_timeout = 0")
+          const journal = native.prepare("PRAGMA journal_mode = DELETE").get()
+          if (journal?.journal_mode !== "delete") throw new globalThis.Error("Lease database is not in DELETE mode")
+          native.exec(config.mode === "shared" ? "BEGIN DEFERRED" : "BEGIN EXCLUSIVE")
+          if (config.mode === "shared") native.prepare("SELECT count(*) FROM sqlite_schema").get()
+          return native
+        } catch (cause) {
+          native.close()
+          throw cause
+        }
+      },
+      catch: (cause) => cause,
+    }),
+    (native) =>
+      Effect.sync(() => {
+        try {
+          native.exec("ROLLBACK")
+        } finally {
+          native.close()
+        }
+      }),
+  ).pipe(Effect.asVoid)

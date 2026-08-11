@@ -65,10 +65,9 @@ export interface Interface {
 
 type ToolCall = {
   assistantMessageID?: SessionMessage.ID
-  partID: SessionV1.ToolPart["id"]
-  messageID: SessionV1.ToolPart["messageID"]
-  sessionID: SessionV1.ToolPart["sessionID"]
+  part: SessionV1.ToolPart
   done: Deferred.Deferred<void>
+  inputStarted: Deferred.Deferred<void>
   inputEnded: boolean
   raw: string
 }
@@ -179,10 +178,12 @@ const layer = Layer.effect(
           diagnostics: diagnostics(),
         })
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
-        delete ctx.toolcalls[toolCallID]
-        if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
+        toolCallID: string,
+        call: ToolCall,
+      ) {
+        yield* Deferred.succeed(call.done, undefined).pipe(Effect.ignore)
+        if (ctx.toolcalls[toolCallID]?.done === call.done) delete ctx.toolcalls[toolCallID]
       })
 
       const ensureV2AssistantMessage = Effect.fn("SessionProcessor.ensureV2AssistantMessage")(function* () {
@@ -213,33 +214,22 @@ const layer = Layer.effect(
           ? Effect.die("V2 step settlement has no owning assistant message")
           : Effect.succeed(ctx.v2AssistantMessageID)
 
-      const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
+      const readToolCall = (toolCallID: string, expectedOwner?: ToolCall["done"]) => {
         const call = ctx.toolcalls[toolCallID]
-        if (!call) return undefined
-        const part = yield* session.getPart({
-          partID: call.partID,
-          messageID: call.messageID,
-          sessionID: call.sessionID,
-        })
-        if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
-          return undefined
-        }
-        return { call, part }
-      })
+        if (!call || (expectedOwner && call.done !== expectedOwner)) return undefined
+        return { call, part: call.part }
+      }
 
       const updateToolCall = Effect.fn("SessionProcessor.updateToolCall")(function* (
         toolCallID: string,
         update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
+        expectedOwner?: ToolCall["done"],
       ) {
-        const match = yield* readToolCall(toolCallID)
+        const match = readToolCall(toolCallID, expectedOwner)
         if (!match) return undefined
         const part = yield* session.updatePart(update(match.part))
-        ctx.toolcalls[toolCallID] = {
-          ...match.call,
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
         }
         return part
       })
@@ -252,10 +242,11 @@ const layer = Layer.effect(
           output: string
           attachments?: SessionV1.FilePart[]
         },
+        expectedOwner?: ToolCall["done"],
       ) {
-        const match = yield* readToolCall(toolCallID)
+        const match = readToolCall(toolCallID, expectedOwner)
         if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "completed",
@@ -267,13 +258,20 @@ const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
-        yield* settleToolCall(toolCallID)
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
+        }
+        yield* settleToolCall(toolCallID, match.call)
       })
 
-      const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
+      const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (
+        toolCallID: string,
+        error: unknown,
+        expectedOwner?: ToolCall["done"],
+      ) {
+        const match = readToolCall(toolCallID, expectedOwner)
         if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
+        const part = yield* session.updatePart({
           ...match.part,
           state: {
             status: "error",
@@ -284,10 +282,13 @@ const layer = Layer.effect(
             time: { start: match.part.state.time.start, end: Date.now() },
           },
         })
+        if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+          ctx.toolcalls[toolCallID] = { ...match.call, part }
+        }
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
-        yield* settleToolCall(toolCallID)
+        yield* settleToolCall(toolCallID, match.call)
         return true
       })
 
@@ -337,36 +338,31 @@ const layer = Layer.effect(
         )
       })
 
-      const ensureToolCall = Effect.fn("SessionProcessor.ensureToolCall")(function* (input: {
+      const ensureToolCall: (input: {
         id: string
         name: string
         providerExecuted?: boolean
-      }) {
-        const existing = yield* readToolCall(input.id)
+      }) => Effect.Effect<{ call: ToolCall; part: SessionV1.ToolPart } | undefined> = Effect.fn(
+        "SessionProcessor.ensureToolCall",
+      )(function* (input) {
+        const existing = readToolCall(input.id)
         if (existing) {
-          if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
+          yield* Deferred.await(existing.call.inputStarted)
+          const current = readToolCall(input.id, existing.call.done)
+          if (!current) return yield* ensureToolCall(input)
+          if (!input.providerExecuted || current.part.metadata?.providerExecuted) return current
           const part = yield* session.updatePart({
-            ...existing.part,
-            metadata: { ...existing.part.metadata, providerExecuted: true },
+            ...current.part,
+            metadata: { ...current.part.metadata, providerExecuted: true },
           })
+          if (ctx.toolcalls[input.id]?.done !== current.call.done) return yield* ensureToolCall(input)
           ctx.toolcalls[input.id] = {
-            ...existing.call,
-            partID: part.id,
-            messageID: part.messageID,
-            sessionID: part.sessionID,
+            ...current.call,
+            part,
           }
           return { call: ctx.toolcalls[input.id], part }
         }
         const assistantMessageID = mirrorAssistant ? yield* ensureV2AssistantMessage() : undefined
-        if (assistantMessageID) {
-          yield* events.publish(SessionEvent.Tool.Input.Started, {
-            sessionID: ctx.sessionID,
-            assistantMessageID,
-            callID: input.id,
-            name: input.name,
-            timestamp: DateTime.makeUnsafe(Date.now()),
-          })
-        }
         const part = yield* session.updatePart({
           id: PartID.ascending(),
           messageID: ctx.assistantMessage.id,
@@ -377,16 +373,36 @@ const layer = Layer.effect(
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
         } satisfies SessionV1.ToolPart)
+        const done = yield* Deferred.make<void>()
+        const inputStarted = yield* Deferred.make<void>()
+        if (readToolCall(input.id)) {
+          yield* session.removePart({ sessionID: part.sessionID, messageID: part.messageID, partID: part.id })
+          yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+          yield* Deferred.succeed(inputStarted, undefined).pipe(Effect.ignore)
+          return yield* ensureToolCall(input)
+        }
         ctx.toolcalls[input.id] = {
           assistantMessageID,
-          done: yield* Deferred.make<void>(),
-          partID: part.id,
-          messageID: part.messageID,
-          sessionID: part.sessionID,
+          part,
+          done,
+          inputStarted,
           inputEnded: false,
           raw: "",
         }
-        return { call: ctx.toolcalls[input.id], part }
+        if (assistantMessageID) {
+          yield* events
+            .publish(SessionEvent.Tool.Input.Started, {
+              sessionID: ctx.sessionID,
+              assistantMessageID,
+              callID: input.id,
+              name: input.name,
+              timestamp: DateTime.makeUnsafe(Date.now()),
+            })
+            .pipe(Effect.ensuring(Deferred.succeed(inputStarted, undefined).pipe(Effect.ignore)))
+        } else {
+          yield* Deferred.succeed(inputStarted, undefined).pipe(Effect.ignore)
+        }
+        return readToolCall(input.id, done) ?? (yield* ensureToolCall(input))
       })
 
       const isFilePart = (value: unknown): value is SessionV1.FilePart => Schema.is(SessionV1.FilePart)(value)
@@ -491,6 +507,7 @@ const layer = Layer.effect(
           case "tool-input-delta":
             {
               const toolCall = yield* ensureToolCall(value)
+              if (!toolCall) return
               const assistantMessageID = mirrorAssistant ? yield* requireV2AssistantMessage(toolCall.call) : undefined
               if (assistantMessageID) {
                 yield* events.publish(SessionEvent.Tool.Input.Delta, {
@@ -501,12 +518,15 @@ const layer = Layer.effect(
                   timestamp: DateTime.makeUnsafe(Date.now()),
                 })
               }
-              ctx.toolcalls[value.id] = { ...toolCall.call, raw: toolCall.call.raw + value.text }
+              if (ctx.toolcalls[value.id]?.done === toolCall.call.done) {
+                ctx.toolcalls[value.id] = { ...toolCall.call, raw: toolCall.call.raw + value.text }
+              }
             }
             return
 
           case "tool-input-end": {
             const toolCall = yield* ensureToolCall(value)
+            if (!toolCall) return
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
               yield* events.publish(SessionEvent.Tool.Input.Ended, {
@@ -517,7 +537,9 @@ const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            ctx.toolcalls[value.id] = { ...toolCall.call, inputEnded: true }
+            if (ctx.toolcalls[value.id]?.done === toolCall.call.done) {
+              ctx.toolcalls[value.id] = { ...toolCall.call, inputEnded: true }
+            }
             return
           }
 
@@ -527,6 +549,7 @@ const layer = Layer.effect(
             }
             markVisiblePart(false)
             const toolCall = yield* ensureToolCall(value)
+            if (!toolCall) return
             const input = isRecord(value.input) ? value.input : { value: value.input }
             if (!toolCall.call.inputEnded && mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall.call)
@@ -553,21 +576,25 @@ const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            yield* updateToolCall(value.id, (match) => ({
-              ...match,
-              tool: value.name,
-              state:
-                match.state.status === "running"
-                  ? { ...match.state, input }
-                  : {
-                      status: "running",
-                      input,
-                      time: { start: Date.now() },
-                    },
-              metadata: match.metadata?.providerExecuted
-                ? { ...value.providerMetadata, providerExecuted: true }
-                : value.providerMetadata,
-            }))
+            yield* updateToolCall(
+              value.id,
+              (match) => ({
+                ...match,
+                tool: value.name,
+                state:
+                  match.state.status === "running"
+                    ? { ...match.state, input }
+                    : {
+                        status: "running",
+                        input,
+                        time: { start: Date.now() },
+                      },
+                metadata: match.metadata?.providerExecuted
+                  ? { ...value.providerMetadata, providerExecuted: true }
+                  : value.providerMetadata,
+              }),
+              toolCall.call.done,
+            )
 
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
@@ -601,8 +628,8 @@ const layer = Layer.effect(
 
           case "tool-result": {
             markVisiblePart(false)
-            const toolCall = yield* readToolCall(value.id)
-            if (!toolCall && value.result.type === "error") return
+            const toolCall = readToolCall(value.id)
+            if (!toolCall) return
             if (value.result.type === "error") {
               if (mirrorAssistant) {
                 const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
@@ -619,7 +646,7 @@ const layer = Layer.effect(
                   timestamp: DateTime.makeUnsafe(Date.now()),
                 })
               }
-              yield* failToolCall(value.id, value.result.value)
+              yield* failToolCall(value.id, value.result.value, toolCall.call.done)
               return
             }
             const rawOutput = toolResultOutput(value)
@@ -678,7 +705,7 @@ const layer = Layer.effect(
                   },
                   timestamp: DateTime.makeUnsafe(Date.now()),
                 })
-                yield* failToolCall(value.id, error)
+                yield* failToolCall(value.id, error, toolCall.call.done)
                 return
               } else
                 yield* events.publish(SessionEvent.Tool.Success, {
@@ -695,13 +722,14 @@ const layer = Layer.effect(
                   timestamp: DateTime.makeUnsafe(Date.now()),
                 })
             }
-            yield* completeToolCall(value.id, output)
+            yield* completeToolCall(value.id, output, toolCall.call.done)
             return
           }
 
           case "tool-error": {
             markVisiblePart(false)
-            const toolCall = yield* readToolCall(value.id)
+            const toolCall = readToolCall(value.id)
+            if (!toolCall) return
             if (mirrorAssistant) {
               const assistantMessageID = yield* requireV2AssistantMessage(toolCall?.call)
               yield* events.publish(SessionEvent.Tool.Failed, {
@@ -719,7 +747,7 @@ const layer = Layer.effect(
                 timestamp: DateTime.makeUnsafe(Date.now()),
               })
             }
-            yield* failToolCall(value.id, value.error ?? new Error(value.message))
+            yield* failToolCall(value.id, value.error ?? new Error(value.message), toolCall.call.done)
             return
           }
 
@@ -925,15 +953,19 @@ const layer = Layer.effect(
         }
         ctx.reasoningMap = {}
 
+        const pendingToolCalls = Object.entries(ctx.toolcalls)
         yield* Effect.forEach(
-          Object.values(ctx.toolcalls),
-          (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
+          pendingToolCalls,
+          ([, call]) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
           { concurrency: "unbounded" },
         )
 
-        for (const toolCallID of Object.keys(ctx.toolcalls)) {
-          const match = yield* readToolCall(toolCallID)
-          if (!match) continue
+        for (const [toolCallID, call] of pendingToolCalls) {
+          const match = readToolCall(toolCallID, call.done)
+          if (!match) {
+            yield* settleToolCall(toolCallID, call)
+            continue
+          }
           const part = match.part
           if (mirrorAssistant && match.call.assistantMessageID) {
             yield* events.publish(SessionEvent.Tool.Failed, {
@@ -947,7 +979,7 @@ const layer = Layer.effect(
           }
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
-          yield* session.updatePart({
+          const updated = yield* session.updatePart({
             ...part,
             state: {
               ...part.state,
@@ -957,8 +989,11 @@ const layer = Layer.effect(
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })
+          if (ctx.toolcalls[toolCallID]?.done === match.call.done) {
+            ctx.toolcalls[toolCallID] = { ...match.call, part: updated }
+          }
+          yield* settleToolCall(toolCallID, match.call)
         }
-        ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })
