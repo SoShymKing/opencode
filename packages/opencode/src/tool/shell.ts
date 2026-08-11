@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -21,10 +21,12 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { ShellProgress } from "./shell-progress"
 
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+const SHELL_CHECKPOINT_INTERVAL_MS = 100
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -335,8 +337,7 @@ const parser = lazy(async () => {
   return { bash, ps }
 })
 
-export const ShellTool = Tool.define(
-  ShellID.ToolID,
+const shellTool = (checkpointIntervalMs: number) =>
   Effect.gen(function* () {
     const config = yield* Config.Service
     const spawner = yield* ChildProcessSpawner
@@ -447,59 +448,61 @@ export const ShellTool = Tool.define(
       let expired = false
       let aborted = false
 
-      const closeSink = Effect.fnUntraced(function* () {
-        const stream = sink
-        if (!stream) return
-        sink = undefined
-        if (stream.destroyed || stream.closed) return
-        yield* Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              let settled = false
-              const done = () => {
-                if (settled) return
-                settled = true
-                stream.off("close", done)
-                stream.off("error", done)
-                stream.off("finish", done)
-                resolve()
-              }
-              stream.once("close", done)
-              stream.once("error", done)
-              stream.once("finish", done)
-              stream.end(done)
-            }),
-        ).pipe(Effect.catch(() => Effect.void))
+      const progress = yield* ShellProgress.make({
+        checkpointIntervalMs,
+        publish: (snapshot) => ctx.metadata({ metadata: snapshot }),
       })
 
-      yield* ctx.metadata({
-        metadata: {
-          output: "",
-        },
-      })
+      const execute = Effect.gen(function* () {
+        const closeSink = Effect.fnUntraced(function* () {
+          const stream = sink
+          if (!stream) return
+          sink = undefined
+          if (stream.destroyed || stream.closed) return
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                let settled = false
+                const done = () => {
+                  if (settled) return
+                  settled = true
+                  stream.off("close", done)
+                  stream.off("error", done)
+                  stream.off("finish", done)
+                  resolve()
+                }
+                stream.once("close", done)
+                stream.once("error", done)
+                stream.once("finish", done)
+                stream.end(done)
+              }),
+          ).pipe(Effect.catch(() => Effect.void))
+        })
 
-      const code: number | null = yield* Effect.scoped(
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(closeSink)
-          const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+        const code: number | null = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(closeSink)
+            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
-              }
+            const output = yield* Effect.forkScoped(
+              Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+                const size = Buffer.byteLength(chunk, "utf-8")
+                list.push({ text: chunk, size })
+                used += size
+                while (used > keep && list.length > 1) {
+                  const item = list.shift()
+                  if (!item) break
+                  used -= item.size
+                  cut = true
+                }
 
-              last = preview(last + chunk)
+                last = preview(last + chunk)
 
-              if (file) {
-                sink?.write(chunk)
-              } else {
+                if (file) {
+                  sink?.write(chunk)
+                  return progress.update({ output: last, truncated: true, outputPath: file })
+                }
+
                 full += chunk
                 if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
                   return trunc.write(full).pipe(
@@ -511,88 +514,86 @@ export const ShellTool = Tool.define(
                         full = ""
                       }),
                     ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
+                    Effect.andThen(() => progress.update({ output: last, truncated: true, outputPath: file }, true)),
                   )
                 }
-              }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
-            }),
+                return progress.update({ output: last })
+              }),
+            )
+
+            const abort = Effect.callback<void>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.void)
+              const handler = () => resume(Effect.void)
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
+
+            const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+            const exit = yield* Effect.raceAll([
+              handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+              timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            ])
+
+            if (exit.kind === "abort") {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+            if (exit.kind === "timeout") {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+
+            yield* Fiber.join(output)
+            return exit.kind === "exit" ? exit.code : null
+          }),
+        ).pipe(Effect.orDie)
+
+        const meta: string[] = []
+        if (expired) {
+          meta.push(
+            `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
           )
+        }
+        if (aborted) meta.push("User aborted the command")
+        const raw = list.map((item) => item.text).join("")
+        const end = tail(raw, limits.maxLines, limits.maxBytes)
+        if (end.cut) cut = true
+        if (!file && end.cut) {
+          file = yield* trunc.write(raw)
+          yield* progress.update({ output: last, truncated: true, outputPath: file }, true)
+        }
 
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
+        let output = end.text
+        if (!output) output = "(no output)"
+        if (cut && file) output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+        if (meta.length > 0) output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
 
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+        return {
+          title: input.command,
+          metadata: {
+            output: last || preview(output),
+            exit: code,
+            truncated: cut,
+            ...(cut && file ? { outputPath: file } : {}),
+          },
+          output,
+        }
+      })
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
-
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const result = yield* restore(execute).pipe(Effect.exit)
+          const closed = yield* progress.close.pipe(Effect.exit)
+          if (Exit.isFailure(result) && Exit.isFailure(closed)) {
+            return yield* Exit.failCause(Cause.combine(result.cause, closed.cause))
           }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-
-          return exit.kind === "exit" ? exit.code : null
+          yield* closed
+          return yield* result
         }),
-      ).pipe(Effect.orDie)
-
-      const meta: string[] = []
-      if (expired) {
-        meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-        )
-      }
-      if (aborted) meta.push("User aborted the command")
-      const raw = list.map((item) => item.text).join("")
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut) {
-        file = yield* trunc.write(raw)
-      }
-
-      let output = end.text
-      if (!output) output = "(no output)"
-
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
-
-      if (meta.length > 0) {
-        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-      }
-      return {
-        title: input.command,
-        metadata: {
-          output: last || preview(output),
-          exit: code,
-          truncated: cut,
-          ...(cut && file ? { outputPath: file } : {}),
-        },
-        output,
-      }
-    })
+      )
+    }, Effect.scoped)
 
     return () =>
       Effect.gen(function* () {
@@ -641,5 +642,10 @@ export const ShellTool = Tool.define(
             }),
         }
       })
-  }),
-)
+  })
+
+const defineShellTool = (checkpointIntervalMs: number) => Tool.define(ShellID.ToolID, shellTool(checkpointIntervalMs))
+
+export const createShellToolForTest = (checkpointIntervalMs: number) => defineShellTool(checkpointIntervalMs)
+
+export const ShellTool = defineShellTool(SHELL_CHECKPOINT_INTERVAL_MS)
