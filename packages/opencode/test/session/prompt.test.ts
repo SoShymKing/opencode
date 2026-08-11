@@ -57,6 +57,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { measureHistoryOperations, recordConversions, seedLongHistory } from "./prompt-history-run-loop.fixtures"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -808,6 +809,120 @@ it.instance("loop continues when finish is tool-calls", () =>
       expect(result.info.finish).toBe("stop")
     }
   }),
+)
+
+it.instance("legacy loop incrementally refreshes long history across a tool continuation", () =>
+  Effect.gen(function* () {
+    // Given
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), plugin: [] }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const tail = yield* seedLongHistory(session.id)
+    const hooks = yield* (yield* Plugin.Service).list()
+    const transforms = hooks.flatMap((hook) => {
+      const transform = hook["experimental.chat.messages.transform"]
+      return transform ? [{ hook, transform }] : []
+    })
+    for (const item of transforms) delete item.hook["experimental.chat.messages.transform"]
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const item of transforms) item.hook["experimental.chat.messages.transform"] = item.transform
+      }),
+    )
+    const conversions = yield* recordConversions
+    yield* llm.tool("first", { value: "first" })
+    yield* llm.text("done")
+
+    // When
+    const result = yield* measureHistoryOperations(prompt.loop({ sessionID: session.id }))
+
+    // Then
+    expect(result.value.info.role).toBe("assistant")
+    expect(yield* llm.calls).toBe(2)
+    expect(result.counts).toEqual({ sequence: 4, pages: 4, hydrated: 2, ranges: 2 })
+    const optimizedMessages = yield* MessageV2.filterCompactedEffect(session.id)
+    const attempts = optimizedMessages.filter((message) => message.info.role === "assistant").slice(-2)
+    expect(conversions.calls.map((call) => call.length)).toEqual([100, 1, 2])
+    expect(conversions.calls[2]).toEqual([tail.id, attempts[0]?.info.id])
+    const optimized = (yield* llm.hits).map((hit) => structuredClone(hit.body.messages))
+
+    const coldHook = { "experimental.chat.messages.transform": async () => {} }
+    hooks.push(coldHook)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        const index = hooks.indexOf(coldHook)
+        if (index >= 0) hooks.splice(index, 1)
+      }),
+    )
+    yield* llm.reset
+    const cold = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* seedLongHistory(cold.id)
+    yield* llm.tool("first", { value: "first" })
+    yield* llm.text("done")
+    yield* prompt.loop({ sessionID: cold.id })
+
+    expect(conversions.calls.slice(3).map((call) => call.length)).toEqual([101, 102])
+    expect((yield* llm.hits).map((hit) => hit.body.messages)).toEqual(optimized)
+    expect(yield* llm.calls).toBe(2)
+  }),
+  60_000,
+)
+
+it.instance("legacy loop fully transforms hook-enabled history without retaining mutations", () =>
+  Effect.gen(function* () {
+    // Given
+    const conversions = yield* recordConversions
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      plugin: [],
+    }))
+    const hooks = yield* (yield* Plugin.Service).list()
+    const transform = {
+      "experimental.chat.messages.transform": async (_input, output) => {
+        const newest = output.messages.at(-1)?.info.id ?? "missing"
+        const oldest = output.messages[0]?.parts.find((part) => part.type === "text")
+        if (oldest) oldest.text = `hook:${newest}`
+      },
+    } satisfies (typeof hooks)[number]
+    hooks.push(transform)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        const index = hooks.indexOf(transform)
+        if (index >= 0) hooks.splice(index, 1)
+      }),
+    )
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* seed(session.id, { finish: "stop" })
+    const tail = yield* user(session.id, "continue")
+    yield* llm.tool("first", { value: "first" })
+    yield* llm.text("done")
+
+    // When
+    yield* prompt.loop({ sessionID: session.id })
+
+    // Then
+    const hits = yield* llm.hits
+    const messages = yield* MessageV2.filterCompactedEffect(session.id)
+    const attempts = messages.filter((item) => item.info.role === "assistant").slice(-2)
+    expect(JSON.stringify(hits[0]?.body.messages)).toContain(`hook:${tail.id}`)
+    expect(JSON.stringify(hits[1]?.body.messages)).toContain(`hook:${attempts[0]?.info.id}`)
+    expect(messages[0]?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "hello" }))
+    expect(conversions.calls.map((call) => call.length)).toEqual([3, 4])
+    expect(yield* llm.calls).toBe(2)
+  }),
+  60_000,
 )
 
 it.instance("glob tool keeps instance context during prompt runs", () =>
@@ -1739,7 +1854,7 @@ it.instance(
       }
       expect(yield* llm.calls).toBe(1)
     }),
-  { git: true },
+  {},
   10_000,
 )
 
