@@ -10,6 +10,8 @@ type Converter = (
   model: Provider.Model,
 ) => Effect.Effect<ModelMessage[]>
 
+type Clone = <T>(value: T) => T
+
 type Input = {
   readonly messages: SessionV1.WithParts[]
   readonly model: Provider.Model
@@ -25,7 +27,7 @@ type Cache = {
   readonly converted: ModelMessage[]
 }
 
-export function make(converter: Converter = MessageV2.toModelMessagesEffect) {
+export function make(converter: Converter = MessageV2.toModelMessagesEffect, clone: Clone = structuredClone) {
   let cache: Cache | undefined
 
   const invalidate = () => {
@@ -35,28 +37,27 @@ export function make(converter: Converter = MessageV2.toModelMessagesEffect) {
   const convert = Effect.fnUntraced(function* (input: Input) {
     if (input.transformed) {
       invalidate()
-      return yield* converter(structuredClone(input.messages), input.model).pipe(
-        Effect.map((messages) => structuredClone(messages)),
-      )
+      return yield* converter(clone(input.messages), input.model)
     }
 
     const end = stablePrefixLength(input.messages)
     const stable = input.messages.slice(0, end)
     const previous = cacheMatches(cache, stable, input.model) ? cache : undefined
     const extension = previous ? stable.slice(previous.source.length) : stable
-    const converted = extension.length === 0 ? [] : yield* converter(structuredClone(extension), input.model)
+    const owned = extension.length === 0 ? [] : clone(extension)
+    const converted = owned.length === 0 ? [] : yield* converter(owned, input.model)
     const next = {
       providerID: input.model.providerID,
       modelID: input.model.id,
       apiNpm: input.model.api.npm,
       apiID: input.model.api.id,
-      source: structuredClone(stable),
-      converted: structuredClone(previous ? [...previous.converted, ...converted] : converted),
+      source: previous ? [...previous.source, ...owned] : owned,
+      converted: previous ? [...previous.converted, ...converted] : converted,
     } satisfies Cache
     cache = next
     const tail = input.messages.slice(end)
-    const convertedTail = tail.length === 0 ? [] : yield* converter(structuredClone(tail), input.model)
-    return structuredClone([...next.converted, ...convertedTail])
+    const convertedTail = tail.length === 0 ? [] : yield* converter(clone(tail), input.model)
+    return [...clone(next.converted), ...convertedTail]
   })
 
   return Object.freeze({ convert, invalidate })

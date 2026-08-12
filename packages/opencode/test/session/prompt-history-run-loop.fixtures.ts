@@ -23,6 +23,26 @@ export const recordConversions = Effect.acquireRelease(
   (recorder) => Effect.sync(() => recorder.spy.mockRestore()),
 )
 
+export const recordFullHistoryClones = Effect.acquireRelease(
+  Effect.sync(() => {
+    const calls: Array<{ messages: number; generation: number }> = []
+    const generations = new WeakMap<object, number>()
+    const original = structuredClone
+    const spy = spyOn(globalThis, "structuredClone").mockImplementation(
+      <T>(value: T, options?: StructuredSerializeOptions) => {
+        const result = original(value, options)
+        if (isHistoryRoot(value)) {
+          calls.push({ messages: value.length, generation: generations.get(value) ?? 0 })
+          if (isHistoryRoot(result)) generations.set(result, (generations.get(value) ?? 0) + 1)
+        }
+        return result
+      },
+    )
+    return { calls, spy }
+  }),
+  (recorder) => Effect.sync(() => recorder.spy.mockRestore()),
+)
+
 export const seedLongHistory = Effect.fn("PromptHistoryRunLoopTest.seedLongHistory")(function* (
   sessionID: SessionID,
 ) {
@@ -90,3 +110,14 @@ const addUser = Effect.fn("PromptHistoryRunLoopTest.addUser")(function* (
   })
   return info
 })
+
+function isHistoryRoot(value: unknown): value is SessionV1.WithParts[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (item) =>
+        typeof item === "object" && item !== null && "info" in item && "parts" in item && Array.isArray(item.parts),
+    )
+  )
+}

@@ -57,7 +57,12 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
-import { measureHistoryOperations, recordConversions, seedLongHistory } from "./prompt-history-run-loop.fixtures"
+import {
+  measureHistoryOperations,
+  recordConversions,
+  recordFullHistoryClones,
+  seedLongHistory,
+} from "./prompt-history-run-loop.fixtures"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -874,6 +879,7 @@ it.instance("legacy loop incrementally refreshes long history across a tool cont
       }),
     )
     const conversions = yield* recordConversions
+    const clones = yield* recordFullHistoryClones
     yield* llm.tool("first", { value: "first" })
     yield* llm.text("done")
 
@@ -888,6 +894,8 @@ it.instance("legacy loop incrementally refreshes long history across a tool cont
     const attempts = optimizedMessages.filter((message) => message.info.role === "assistant").slice(-2)
     expect(conversions.calls.map((call) => call.length)).toEqual([100, 1, 2])
     expect(conversions.calls[2]).toEqual([tail.id, attempts[0]?.info.id])
+    expect(clones.calls.filter((call) => call.messages === 101)).toEqual([{ messages: 101, generation: 0 }])
+    expect(clones.calls.filter((call) => call.messages === 102)).toEqual([{ messages: 102, generation: 0 }])
     const optimized = (yield* llm.hits).map((hit) => structuredClone(hit.body.messages))
 
     const coldHook = { "experimental.chat.messages.transform": async () => {} }
@@ -919,6 +927,7 @@ it.instance("legacy loop fully transforms hook-enabled history without retaining
   Effect.gen(function* () {
     // Given
     const conversions = yield* recordConversions
+    const clones = yield* recordFullHistoryClones
     const { llm } = yield* useServerConfig((url) => ({
       ...providerCfg(url),
       plugin: [],
@@ -960,6 +969,16 @@ it.instance("legacy loop fully transforms hook-enabled history without retaining
     expect(JSON.stringify(hits[1]?.body.messages)).toContain(`hook:${attempts[0]?.info.id}`)
     expect(messages[0]?.parts).toContainEqual(expect.objectContaining({ type: "text", text: "hello" }))
     expect(conversions.calls.map((call) => call.length)).toEqual([3, 4])
+    expect(clones.calls.filter((call) => call.messages === 3)).toEqual([
+      { messages: 3, generation: 0 },
+      { messages: 3, generation: 1 },
+      { messages: 3, generation: 2 },
+    ])
+    expect(clones.calls.filter((call) => call.messages === 4)).toEqual([
+      { messages: 4, generation: 0 },
+      { messages: 4, generation: 1 },
+      { messages: 4, generation: 2 },
+    ])
     expect(yield* llm.calls).toBe(2)
   }),
   60_000,

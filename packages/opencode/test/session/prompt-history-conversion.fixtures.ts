@@ -2,7 +2,9 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { Provider } from "@/provider/provider"
+import { MessageV2 } from "@/session/message-v2"
 import { SessionID } from "@/session/schema"
+import { Effect } from "effect"
 
 export const sessionID = SessionID.make("session-conversion")
 
@@ -183,3 +185,65 @@ export function historicalParts(label: string): SessionV1.Part[] {
 }
 
 export const failure = new SessionV1.APIError({ message: "failed", isRetryable: false }).toObject()
+
+export type CloneRoot = {
+  readonly kind: "source" | "model"
+  readonly messages: number
+  readonly parts: number
+}
+
+export function cloneLedger() {
+  const records: CloneRoot[] = []
+  const clone = <T>(value: T): T => {
+    const record = cloneRoot(value)
+    if (record) records.push(record)
+    return structuredClone(value)
+  }
+  return { clone, take: () => records.splice(0) }
+}
+
+export function recorder(calls: Array<{ ids: string[]; model: string }>) {
+  return (messages: SessionV1.WithParts[], selected: Provider.Model) =>
+    MessageV2.toModelMessagesEffect(messages, selected).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => calls.push({ ids: messages.map((item) => item.info.id), model: `${selected.providerID}/${selected.id}` })),
+      ),
+    )
+}
+
+export function contaminate(value: unknown) {
+  if (value instanceof Uint8Array) {
+    value.fill(255)
+    return
+  }
+  if (typeof value !== "object" || value === null) return
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "value") Reflect.set(value, key, "poisoned")
+    contaminate(child)
+  }
+}
+
+function cloneRoot(value: unknown): CloneRoot | undefined {
+  if (!Array.isArray(value) || value.length === 0) return
+  if (value.every(isSourceRoot)) {
+    return {
+      kind: "source",
+      messages: value.length,
+      parts: value.reduce((total, message) => total + message.parts.length, 0),
+    }
+  }
+  if (!value.every(isModelRoot)) return
+  return {
+    kind: "model",
+    messages: value.length,
+    parts: value.reduce((total, message) => total + (Array.isArray(message.content) ? message.content.length : 1), 0),
+  }
+}
+
+function isSourceRoot(value: unknown): value is { readonly info: object; readonly parts: readonly unknown[] } {
+  return typeof value === "object" && value !== null && "info" in value && "parts" in value && Array.isArray(value.parts)
+}
+
+function isModelRoot(value: unknown): value is { readonly role: string; readonly content: unknown } {
+  return typeof value === "object" && value !== null && "role" in value && "content" in value
+}
