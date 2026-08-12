@@ -1258,11 +1258,13 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            msgs = structuredClone(msgs)
             const transformed = (yield* plugin.list()).some(
               (hook) => hook["experimental.chat.messages.transform"] !== undefined,
             )
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            if (transformed) {
+              msgs = structuredClone(msgs)
+              yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            }
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),

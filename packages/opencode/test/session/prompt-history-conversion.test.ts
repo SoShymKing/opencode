@@ -7,25 +7,19 @@ import type { Provider } from "@/provider/provider"
 import type { SessionV1 } from "@opencode-ai/core/v1/session"
 import {
   assistant,
+  cloneLedger,
+  contaminate,
   failure,
   historicalParts,
   mediaToolPart,
   messageID,
   model,
+  recorder,
   stepParts,
   toolPart,
   turn,
   user,
 } from "./prompt-history-conversion.fixtures"
-
-function recorder(calls: Array<{ ids: string[]; model: string }>) {
-  return (messages: SessionV1.WithParts[], selected: Provider.Model) =>
-    MessageV2.toModelMessagesEffect(messages, selected).pipe(
-      Effect.tap(() =>
-        Effect.sync(() => calls.push({ ids: messages.map((item) => item.info.id), model: `${selected.providerID}/${selected.id}` })),
-      ),
-    )
-}
 
 function cold(messages: SessionV1.WithParts[], selected: Provider.Model) {
   return Effect.runPromise(MessageV2.toModelMessagesEffect(structuredClone(messages), selected))
@@ -40,15 +34,69 @@ function convert(
   return Effect.runPromise(cache.convert({ messages, model: selected, transformed }))
 }
 
-function contaminate(value: unknown) {
-  if (typeof value !== "object" || value === null) return
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "value") Reflect.set(value, key, "poisoned")
-    contaminate(child)
-  }
-}
-
 describe("PromptHistoryConversion", () => {
+  test("clones only provider-facing converted data for an unchanged warm prefix", async () => {
+    // Given
+    const ledger = cloneLedger()
+    const history = turn("warm")
+    const cache = PromptHistoryConversion.make(undefined, ledger.clone)
+    await convert(cache, history, model())
+    ledger.take()
+
+    // When
+    expect(await convert(cache, history, model())).toEqual(await cold(history, model()))
+
+    // Then
+    expect(ledger.take()).toEqual([{ kind: "model", messages: 2, parts: 2 }])
+  })
+
+  test("clones and converts only a stable extension while preserving the old prefix", async () => {
+    // Given
+    const ledger = cloneLedger()
+    const calls: Array<{ ids: string[]; model: string }> = []
+    const cache = PromptHistoryConversion.make(recorder(calls), ledger.clone)
+    const first = turn("first")
+    await convert(cache, first, model())
+    ledger.take()
+
+    // When
+    const extended = [...first, ...turn("second")]
+    expect(await convert(cache, extended, model())).toEqual(await cold(extended, model()))
+
+    // Then
+    expect(calls.at(-1)?.ids).toEqual(turn("second").map((message) => message.info.id))
+    expect(ledger.take()).toEqual([{ kind: "source", messages: 2, parts: 2 }, { kind: "model", messages: 4, parts: 4 }])
+  })
+
+  test("returns transient tail output without cloning the tail or assembled output", async () => {
+    // Given
+    const ledger = cloneLedger()
+    const cache = PromptHistoryConversion.make(undefined, ledger.clone)
+    const stable = turn("stable")
+    await convert(cache, stable, model())
+    ledger.take()
+
+    // When
+    const history = [...stable, user("tail")]
+    expect(await convert(cache, history, model())).toEqual(await cold(history, model()))
+
+    // Then
+    expect(ledger.take()).toEqual([{ kind: "source", messages: 1, parts: 1 }, { kind: "model", messages: 2, parts: 2 }])
+  })
+
+  test("transformed mode converts one private input and returns its fresh output directly", async () => {
+    // Given
+    const ledger = cloneLedger()
+    const cache = PromptHistoryConversion.make(undefined, ledger.clone)
+    const history = [...turn("transformed"), user("tail")]
+
+    // When
+    expect(await convert(cache, history, model(), true)).toEqual(await cold(history, model()))
+
+    // Then
+    expect(ledger.take()).toEqual([{ kind: "source", messages: 3, parts: 3 }])
+  })
+
   test("reuses settled turns and promotes only whole completed extensions", async () => {
     // Given
     const calls: Array<{ ids: string[]; model: string }> = []
@@ -261,6 +309,8 @@ describe("PromptHistoryConversion", () => {
     const selected = model({ providerID: "anthropic" })
     const cache = PromptHistoryConversion.make()
     const history = [...turn("mutation", { selectedModel: selected, parts: [toolPart("mutation", "completed")] }), user("tail")]
+    const nested = history[1]?.parts[0]
+    if (nested?.type === "tool") nested.metadata = { ...nested.metadata, binary: new Uint8Array([1, 2, 3]) }
     const source = structuredClone(history)
 
     // When
