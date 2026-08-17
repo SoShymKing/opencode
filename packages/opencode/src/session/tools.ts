@@ -44,7 +44,7 @@ type ResolveInput = {
   session: Session.Info
   processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
-  messages: SessionV1.WithParts[]
+  messages: ReadonlyArray<SessionV1.WithParts>
   promptOps: TaskPromptOps
 }
 

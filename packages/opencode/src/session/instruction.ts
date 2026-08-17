@@ -14,7 +14,7 @@ import { Global } from "@opencode-ai/core/global"
 import type { MessageV2 } from "./message-v2"
 import type { MessageID } from "./schema"
 
-function extract(messages: SessionV1.WithParts[]) {
+function extract(messages: ReadonlyArray<SessionV1.WithParts>) {
   const paths = new Set<string>()
   for (const msg of messages) {
     for (const part of msg.parts) {
@@ -37,7 +37,7 @@ export interface Interface {
   readonly system: () => Effect.Effect<string[], FSUtil.Error>
   readonly find: (dir: string) => Effect.Effect<string | undefined, FSUtil.Error>
   readonly resolve: (
-    messages: SessionV1.WithParts[],
+    messages: ReadonlyArray<SessionV1.WithParts>,
     filepath: string,
     messageID: MessageID,
   ) => Effect.Effect<{ filepath: string; content: string }[], FSUtil.Error>
@@ -177,7 +177,7 @@ const layer: Layer.Layer<
     })
 
     const resolve = Effect.fn("Instruction.resolve")(function* (
-      messages: SessionV1.WithParts[],
+      messages: ReadonlyArray<SessionV1.WithParts>,
       filepath: string,
       messageID: MessageID,
     ) {
@@ -224,7 +224,7 @@ const layer: Layer.Layer<
   }),
 )
 
-export function loaded(messages: SessionV1.WithParts[]) {
+export function loaded(messages: ReadonlyArray<SessionV1.WithParts>) {
   return extract(messages)
 }
 
