@@ -68,7 +68,7 @@ export const make = Effect.fn("PromptHistory.make")(function* (sessionID: Sessio
 
   const disable = Effect.fnUntraced(function* (current: State) {
     dependencies?.invalidate?.()
-    const source = yield* load()
+    const source = freeze(yield* load())
     state = { source, sequence: current.sequence, disabled: true }
     return clone(source)
   })
@@ -85,8 +85,10 @@ export const make = Effect.fn("PromptHistory.make")(function* (sessionID: Sessio
     if (!touched) return yield* disable(current)
     const hydrated = yield* Effect.forEach(touched.messageIDs, get).pipe(Effect.exit)
     if (Exit.isFailure(hydrated)) return yield* disable(current)
-    const source = updateSource(current.source, hydrated.value, touched.partOwners)
-    if (!source) return yield* disable(current)
+    hydrated.value.forEach((message) => freeze(message))
+    const updated = updateSource(current.source, hydrated.value, touched.partOwners)
+    if (!updated) return yield* disable(current)
+    const source = Object.freeze(updated)
     state = { source, sequence: target, disabled: false }
     return clone(source)
   })
@@ -94,13 +96,13 @@ export const make = Effect.fn("PromptHistory.make")(function* (sessionID: Sessio
   const refresh = Effect.fnUntraced(function* () {
     if (state?.disabled) {
       dependencies?.invalidate?.()
-      const source = yield* load()
+      const source = freeze(yield* load())
       state = { ...state, source }
       return clone(source)
     }
     if (state) return yield* incremental(state, yield* latestSequence())
     const sequence = yield* latestSequence()
-    const source = yield* load()
+    const source = freeze(yield* load())
     const initial = { source, sequence, disabled: false } satisfies State
     const target = yield* latestSequence()
     if (target !== sequence) return yield* incremental(initial, target)
@@ -122,7 +124,44 @@ function validRange(events: readonly Payload[], sessionID: SessionID, range: Ran
 }
 
 function clone(source: readonly SessionV1.WithParts[]) {
-  return structuredClone([...source])
+  return [...source]
+}
+
+function freeze<T extends object>(root: T) {
+  const worklist: object[] = [root]
+  const seen = new WeakSet<object>()
+  while (worklist.length > 0) {
+    const current = worklist.pop()
+    if (!current || seen.has(current)) continue
+    seen.add(current)
+    if (isGraphArray(current)) {
+      for (const value of current) {
+        if (isGraphObject(value)) worklist.push(value)
+      }
+    } else {
+      if (!isPlainObject(current)) throw new TypeError("Prompt history contains unsupported object prototype")
+      for (const key in current) {
+        if (!Object.hasOwn(current, key)) continue
+        const value = current[key]
+        if (isGraphObject(value)) worklist.push(value)
+      }
+    }
+    Object.freeze(current)
+  }
+  return root
+}
+
+function isGraphObject(value: unknown): value is object {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+}
+
+function isGraphArray(value: object): value is unknown[] {
+  return Array.isArray(value)
+}
+
+function isPlainObject(value: object): value is Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
 }
 
 function indexSource(source: readonly SessionV1.WithParts[]): SourceIndex {

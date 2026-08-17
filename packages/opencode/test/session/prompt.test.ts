@@ -227,13 +227,22 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  experimentalEventSystem?: boolean
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
-    [RuntimeFlags.node, runtimeFlags],
+    [
+      RuntimeFlags.node,
+      input?.experimentalEventSystem === false
+        ? RuntimeFlags.layer({ experimentalEventSystem: false })
+        : runtimeFlags,
+    ],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -246,6 +255,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const legacyHistory = testEffect(makeHttp({ experimentalEventSystem: false }))
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -560,6 +570,30 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("legacy loop applies plan reminder without mutating frozen history", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const message = yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "plan",
+      noReply: true,
+      parts: [{ type: "text", text: "plan" }],
+    })
+    yield* llm.text("done")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: message.info.id })
+    expect(result.info.role).toBe("assistant")
+    expect(yield* llm.calls).toBe(1)
+    expect(stored.parts).toHaveLength(1)
+    expect(stored.parts[0]).toMatchObject({ type: "text", text: "plan" })
+  }),
+)
+
 withMcpInstructions.instance(
   "loop includes MCP instructions in model system context",
   () =>
@@ -856,7 +890,7 @@ it.instance("loop continues when finish is tool-calls", () =>
   }),
 )
 
-it.instance("legacy loop incrementally refreshes long history across a tool continuation", () =>
+legacyHistory.instance("legacy loop incrementally refreshes long history across a tool continuation", () =>
   Effect.gen(function* () {
     // Given
     const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), plugin: [] }))
@@ -894,8 +928,8 @@ it.instance("legacy loop incrementally refreshes long history across a tool cont
     const attempts = optimizedMessages.filter((message) => message.info.role === "assistant").slice(-2)
     expect(conversions.calls.map((call) => call.length)).toEqual([100, 1, 2])
     expect(conversions.calls[2]).toEqual([tail.id, attempts[0]?.info.id])
-    expect(clones.calls.filter((call) => call.messages === 101)).toEqual([{ messages: 101, generation: 0 }])
-    expect(clones.calls.filter((call) => call.messages === 102)).toEqual([{ messages: 102, generation: 0 }])
+    expect(clones.calls.filter((call) => call.messages === 101)).toEqual([])
+    expect(clones.calls.filter((call) => call.messages === 102)).toEqual([])
     const optimized = (yield* llm.hits).map((hit) => structuredClone(hit.body.messages))
 
     const coldHook = { "experimental.chat.messages.transform": async () => {} }
@@ -972,12 +1006,10 @@ it.instance("legacy loop fully transforms hook-enabled history without retaining
     expect(clones.calls.filter((call) => call.messages === 3)).toEqual([
       { messages: 3, generation: 0 },
       { messages: 3, generation: 1 },
-      { messages: 3, generation: 2 },
     ])
     expect(clones.calls.filter((call) => call.messages === 4)).toEqual([
       { messages: 4, generation: 0 },
       { messages: 4, generation: 1 },
-      { messages: 4, generation: 2 },
     ])
     expect(yield* llm.calls).toBe(2)
   }),

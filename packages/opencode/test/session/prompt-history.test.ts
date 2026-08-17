@@ -5,6 +5,7 @@ import { testEffect } from "../lib/effect"
 import { addAssistant, addText, addUser, layer, measure, withSession } from "./prompt-history.fixtures"
 import { registerFallbackTests } from "./prompt-history-fallback.fixtures"
 import { registerOrderingTests } from "./prompt-history-ordering.fixtures"
+import { recordFullHistoryClones } from "./prompt-history-run-loop.fixtures"
 
 const it = testEffect(layer)
 
@@ -142,15 +143,30 @@ describe("PromptHistory", () => {
       Effect.gen(function* () {
         yield* addUser(sessionID, "pristine")
         const history = yield* PromptHistory.make(sessionID)
+        const clones = yield* recordFullHistoryClones
         const first = yield* history.refresh()
-        const part = first[0]?.parts[0]
-        if (part?.type === "text") part.text = "poisoned"
+        const retained = first[0]
+        if (!retained) throw new Error("expected retained message")
+        const part = retained.parts[0]
+        if (part?.type !== "text") throw new Error("expected retained text part")
+
+        expect(Object.isFrozen(first)).toBe(false)
+        expect(Object.isFrozen(retained)).toBe(true)
+        expect(Object.isFrozen(retained.info)).toBe(true)
+        expect(Object.isFrozen(retained.parts)).toBe(true)
+        expect(Object.isFrozen(part)).toBe(true)
+        expect(() => {
+          part.text = "poisoned"
+        }).toThrow(TypeError)
         first.splice(0, 1)
 
         const second = yield* history.refresh()
 
         expect(second).toHaveLength(1)
+        expect(Object.isFrozen(second)).toBe(false)
+        expect(second[0]).toBe(retained)
         expect(second[0]?.parts[0]).toMatchObject({ type: "text", text: "pristine" })
+        expect(clones.calls.filter((call) => call.messages === 1)).toEqual([])
       }),
     ),
   )

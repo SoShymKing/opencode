@@ -20,12 +20,16 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
   const flags = yield* RuntimeFlags.Service
   const fsys = yield* FSUtil.Service
   const sessions = yield* Session.Service
-  const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
+  const userIndex = input.messages.findLastIndex((msg) => msg.info.role === "user")
+  const userMessage = input.messages[userIndex]
   if (!userMessage) return input.messages
+  const append = (part: SessionV1.Part) => {
+    input.messages[userIndex] = { ...userMessage, parts: [...userMessage.parts, part] }
+  }
 
   if (!flags.experimentalPlanMode) {
     if (input.agent.name === "plan") {
-      userMessage.parts.push({
+      append({
         id: PartID.ascending(),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
@@ -36,7 +40,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     }
     const wasPlan = input.messages.some((msg) => msg.info.role === "assistant" && msg.info.agent === "plan")
     if (wasPlan && input.agent.name === "build") {
-      userMessage.parts.push({
+      append({
         id: PartID.ascending(),
         messageID: userMessage.info.id,
         sessionID: userMessage.info.sessionID,
@@ -63,7 +67,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
         : BUILD_SWITCH,
       synthetic: true,
     })
-    userMessage.parts.push(part)
+    append(part)
     return input.messages
   }
 
@@ -85,7 +89,7 @@ export const apply = Effect.fn("SessionReminders.apply")(function* (input: {
     ),
     synthetic: true,
   })
-  userMessage.parts.push(part)
+  append(part)
   return input.messages
 })
 
