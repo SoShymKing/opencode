@@ -3,17 +3,15 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ModelMessage } from "ai"
 import { Effect } from "effect"
 import type { Provider } from "@/provider/provider"
-import { MessageV2, type ToModelMessagesOptions } from "./message-v2"
-
-const HISTORICAL_TOOL_OUTPUT_MAX_CHARS = 2_000
+import { MessageV2 } from "./message-v2"
 
 type Converter = (
   messages: SessionV1.WithParts[],
   model: Provider.Model,
-  options?: ToModelMessagesOptions,
 ) => Effect.Effect<ModelMessage[]>
 
 type Clone = <T>(value: T) => T
+type ProjectToolOutput = (output: string) => Effect.Effect<string>
 
 type Input = {
   readonly messages: SessionV1.WithParts[]
@@ -30,8 +28,28 @@ type Cache = {
   readonly converted: ModelMessage[]
 }
 
-export function make(converter: Converter = MessageV2.toModelMessagesEffect, clone: Clone = structuredClone) {
+export function make(
+  converter: Converter = MessageV2.toModelMessagesEffect,
+  clone: Clone = structuredClone,
+  projectToolOutput: ProjectToolOutput = (output) => Effect.succeed(output),
+) {
   let cache: Cache | undefined
+  const projections = new Map<string, { readonly source: string; readonly projected: string }>()
+
+  const project = Effect.fnUntraced(function* (messages: SessionV1.WithParts[], count = messages.length) {
+    for (const message of messages.slice(0, count)) {
+      for (const part of message.parts) {
+        if (part.type !== "tool" || part.state.status !== "completed") continue
+        if (part.state.time.compacted || part.state.metadata.truncated === true) continue
+        const source = part.state.output
+        const cached = projections.get(part.id)
+        const projected = cached?.source === source ? cached.projected : yield* projectToolOutput(source)
+        projections.set(part.id, { source, projected })
+        part.state.output = projected
+      }
+    }
+    return messages
+  })
 
   const invalidate = () => {
     cache = undefined
@@ -41,20 +59,16 @@ export function make(converter: Converter = MessageV2.toModelMessagesEffect, clo
     const end = stablePrefixLength(input.messages)
     if (input.transformed) {
       invalidate()
-      return yield* converter(clone(input.messages), input.model, {
-        toolOutputMaxChars: HISTORICAL_TOOL_OUTPUT_MAX_CHARS,
-        toolOutputMaxMessageCount: end,
-      })
+      const projected = yield* project(clone(input.messages), end)
+      return yield* converter(projected, input.model)
     }
 
     const stable = input.messages.slice(0, end)
     const previous = cacheMatches(cache, stable, input.model) ? cache : undefined
     const extension = previous ? stable.slice(previous.source.length) : stable
     const owned = extension.length === 0 ? [] : clone(extension)
-    const converted =
-      owned.length === 0
-        ? []
-        : yield* converter(owned, input.model, { toolOutputMaxChars: HISTORICAL_TOOL_OUTPUT_MAX_CHARS })
+    const projected = owned.length === 0 ? [] : yield* project(copyMutable(owned))
+    const converted = projected.length === 0 ? [] : yield* converter(projected, input.model)
     const next = {
       providerID: input.model.providerID,
       modelID: input.model.id,

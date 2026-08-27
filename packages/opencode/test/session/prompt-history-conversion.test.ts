@@ -36,39 +36,59 @@ function convert(
 }
 
 describe("PromptHistoryConversion", () => {
-  test("bounds only settled historical tool text without mutating source or attachments", async () => {
+  test("uses recoverable configured projection only for oversized settled tool text", async () => {
     // Given
     const selected = model({ apiNpm: "@ai-sdk/anthropic" })
-    const settledUser = user("historical", "U".repeat(2_500))
-    const settledTool = mediaToolPart("historical")
-    if (settledTool.state.status !== "completed") throw new Error("Expected completed settled tool")
-    settledTool.state.output = "S".repeat(2_500)
+    const belowOutput = "S".repeat(49 * 1024)
+    const oversizedOutput = "O".repeat(60 * 1024)
+    const tailOutput = "T".repeat(60 * 1024)
+    const belowUser = user("below", "U".repeat(2_500))
+    const belowTool = mediaToolPart("below")
+    if (belowTool.state.status !== "completed") throw new Error("Expected completed below-limit tool")
+    belowTool.state.output = belowOutput
+    const oversizedUser = user("oversized")
+    const oversizedTool = toolPart("oversized", "completed")
+    if (oversizedTool.state.status !== "completed") throw new Error("Expected completed oversized tool")
+    oversizedTool.state.output = oversizedOutput
     const tailUser = user("tail")
     const tailTool = toolPart("tail", "completed")
     if (tailTool.state.status !== "completed") throw new Error("Expected completed tail tool")
-    tailTool.state.output = "T".repeat(2_500)
+    tailTool.state.output = tailOutput
+    let projectionCalls = 0
+    const projectToolOutput = (output: string) =>
+      Effect.sync(() => {
+        projectionCalls++
+        if (output.length <= 50 * 1024) return output
+        return `${output.slice(0, 50 * 1024)}\nFull output saved to: history-output\nUse Grep or Read to inspect it.`
+      })
     const history = [
-      settledUser,
-      assistant("historical", settledUser.info.id, {
-        parts: [text(messageID("assistant_historical"), "prose", "A".repeat(2_500)), settledTool],
+      belowUser,
+      assistant("below", belowUser.info.id, {
+        parts: [text(messageID("assistant_below"), "prose", "A".repeat(2_500)), belowTool],
       }),
+      oversizedUser,
+      assistant("oversized", oversizedUser.info.id, { parts: [oversizedTool] }),
       tailUser,
       assistant("tail", tailUser.info.id, { parts: [tailTool], finish: false }),
     ]
     const source = structuredClone(history)
+    const cache = PromptHistoryConversion.make(undefined, structuredClone, projectToolOutput)
 
     // When
-    const output = JSON.stringify(await convert(PromptHistoryConversion.make(), history, selected))
+    const output = JSON.stringify(await convert(cache, history, selected))
+    await convert(cache, history, selected)
+    await convert(cache, history, selected, true)
 
     // Then
-    expect(output).not.toContain("S".repeat(2_500))
-    expect(output).toContain("S".repeat(2_000))
-    expect(output).toContain("[Tool output truncated for compaction: omitted 500 chars]")
-    expect(output).toContain("U".repeat(2_500))
-    expect(output).toContain("A".repeat(2_500))
-    expect(output).toContain("T".repeat(2_500))
+    expect(output.includes(belowOutput)).toBe(true)
+    expect(output.includes(oversizedOutput)).toBe(false)
+    expect(output.includes("Full output saved to:")).toBe(true)
+    expect(output.includes("U".repeat(2_500))).toBe(true)
+    expect(output.includes("A".repeat(2_500))).toBe(true)
+    expect(output.includes(tailOutput)).toBe(true)
     expect(output).toContain("document.pdf")
     expect(history).toEqual(source)
+    expect(projectionCalls).toBe(2)
   })
 
   test("does not deep-clone large cached tool output on repeated warm conversions", async () => {
