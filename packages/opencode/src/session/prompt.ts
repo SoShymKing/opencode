@@ -1096,7 +1096,9 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-        const conversion = PromptHistoryConversion.make()
+        const conversion = PromptHistoryConversion.make(undefined, structuredClone, (output) =>
+          truncate.output(output).pipe(Effect.map((result) => result.content)),
+        )
         const history = yield* PromptHistory.make(sessionID, { invalidate: conversion.invalidate }).pipe(
           Effect.provideService(EventV2.Service, events),
           Effect.provideService(Database.Service, database),

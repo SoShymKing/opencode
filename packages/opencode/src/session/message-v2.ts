@@ -84,12 +84,6 @@ function truncateToolOutput(text: string, maxChars?: number) {
   return `${text.slice(0, maxChars)}\n[Tool output truncated for compaction: omitted ${omitted} chars]`
 }
 
-export type ToModelMessagesOptions = {
-  readonly stripMedia?: boolean
-  readonly toolOutputMaxChars?: number
-  readonly toolOutputMaxMessageCount?: number
-}
-
 export const Event = {
   Updated: SessionV1.Event.MessageUpdated,
   Removed: SessionV1.Event.MessageRemoved,
@@ -169,7 +163,7 @@ function providerMeta(metadata: Record<string, any> | undefined) {
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
-  options?: ToModelMessagesOptions,
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
 ) {
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
@@ -230,7 +224,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     return { type: "json", value: output as never }
   }
 
-  for (const [messageIndex, msg] of input.entries()) {
+  for (const msg of input) {
     if (msg.parts.length === 0) continue
 
     if (msg.info.role === "user") {
@@ -330,12 +324,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted
               ? "[Old tool result content cleared]"
-              : truncateToolOutput(
-                  part.state.output,
-                  options?.toolOutputMaxMessageCount === undefined || messageIndex < options.toolOutputMaxMessageCount
-                    ? options?.toolOutputMaxChars
-                    : undefined,
-                )
+              : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
             // For providers that don't support media in tool results, extract media files
@@ -460,7 +449,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 export function toModelMessages(
   input: WithParts[],
   model: Provider.Model,
-  options?: ToModelMessagesOptions,
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options))
 }
