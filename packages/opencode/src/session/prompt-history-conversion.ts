@@ -3,11 +3,14 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { ModelMessage } from "ai"
 import { Effect } from "effect"
 import type { Provider } from "@/provider/provider"
-import { MessageV2 } from "./message-v2"
+import { MessageV2, type ToModelMessagesOptions } from "./message-v2"
+
+const HISTORICAL_TOOL_OUTPUT_MAX_CHARS = 2_000
 
 type Converter = (
   messages: SessionV1.WithParts[],
   model: Provider.Model,
+  options?: ToModelMessagesOptions,
 ) => Effect.Effect<ModelMessage[]>
 
 type Clone = <T>(value: T) => T
@@ -35,17 +38,23 @@ export function make(converter: Converter = MessageV2.toModelMessagesEffect, clo
   }
 
   const convert = Effect.fnUntraced(function* (input: Input) {
+    const end = stablePrefixLength(input.messages)
     if (input.transformed) {
       invalidate()
-      return yield* converter(clone(input.messages), input.model)
+      return yield* converter(clone(input.messages), input.model, {
+        toolOutputMaxChars: HISTORICAL_TOOL_OUTPUT_MAX_CHARS,
+        toolOutputMaxMessageCount: end,
+      })
     }
 
-    const end = stablePrefixLength(input.messages)
     const stable = input.messages.slice(0, end)
     const previous = cacheMatches(cache, stable, input.model) ? cache : undefined
     const extension = previous ? stable.slice(previous.source.length) : stable
     const owned = extension.length === 0 ? [] : clone(extension)
-    const converted = owned.length === 0 ? [] : yield* converter(owned, input.model)
+    const converted =
+      owned.length === 0
+        ? []
+        : yield* converter(owned, input.model, { toolOutputMaxChars: HISTORICAL_TOOL_OUTPUT_MAX_CHARS })
     const next = {
       providerID: input.model.providerID,
       modelID: input.model.id,
