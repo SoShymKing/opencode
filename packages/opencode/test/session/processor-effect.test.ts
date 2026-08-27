@@ -1583,6 +1583,7 @@ itOwnerRace.effect("session.processor late metadata persistence cannot replace n
   provideTmpdirInstance(
     (dir) =>
       Effect.gen(function* () {
+        const session = yield* Session.Service
         const entered = yield* Deferred.make<void>()
         const release = yield* Deferred.make<void>()
         partUpdateGate.current = {
@@ -1616,20 +1617,38 @@ itOwnerRace.effect("session.processor late metadata persistence cannot replace n
           Effect.forkScoped({ startImmediately: true }),
         )
         yield* Deferred.await(originalReady)
-        yield* TestClock.adjust("250 millis")
+        const delayedRelease = yield* Effect.sleep("251 millis").pipe(
+          Effect.andThen(Deferred.succeed(release, undefined)),
+          Effect.forkScoped({ startImmediately: true }),
+        )
+        yield* TestClock.adjust("251 millis")
+        yield* Fiber.join(delayedRelease)
+        const delayedPart = yield* Fiber.join(delayed)
         yield* Fiber.join(originalCleanup)
+        if (!delayedPart) return yield* Effect.die(new Error("delayed metadata owner was not created"))
+        const storedOldPart = yield* session.getPart({
+          sessionID: delayedPart.sessionID,
+          messageID: delayedPart.messageID,
+          partID: delayedPart.id,
+        })
         const newerReady = yield* Deferred.make<void>()
         const newer = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: newerReady })
         const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
         if (!newerPart) return yield* Effect.die(new Error("newer metadata owner was not created"))
-        yield* Deferred.succeed(release, undefined)
-        yield* Fiber.join(delayed)
         const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
         const newerCleanup = yield* Fiber.interrupt(newer).pipe(Effect.forkScoped({ startImmediately: true }))
         yield* Deferred.await(newerReady)
         yield* TestClock.adjust("250 millis")
         yield* Fiber.join(newerCleanup)
 
+        expect(storedOldPart?.type).toBe("tool")
+        if (storedOldPart?.type === "tool") {
+          expect(storedOldPart.state.status).toBe("error")
+          if (storedOldPart.state.status === "error") {
+            expect(storedOldPart.state.error).toBe("Tool execution aborted")
+            expect(storedOldPart.state.metadata).toEqual({ race: "late-update", interrupted: true })
+          }
+        }
         expect(current?.id).toBe(newerPart.id)
       }),
     { config: cfg },
@@ -1673,13 +1692,13 @@ itOwnerRace.effect("session.processor late completion persistence cannot delete 
         )
         yield* Deferred.await(originalReady)
         yield* TestClock.adjust("250 millis")
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(delayed)
         yield* Fiber.join(originalCleanup)
         const newerReady = yield* Deferred.make<void>()
         const newer = yield* startControlledProcess(harness.handle, harness.input, { cleanupReady: newerReady })
         const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
         if (!newerPart) return yield* Effect.die(new Error("newer completion owner was not created"))
-        yield* Deferred.succeed(release, undefined)
-        yield* Fiber.join(delayed)
         const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
         const newerCleanup = yield* Fiber.interrupt(newer).pipe(Effect.forkScoped({ startImmediately: true }))
         yield* Deferred.await(newerReady)
@@ -1724,12 +1743,12 @@ itOwnerRace.effect("session.processor late provider ensure persistence cannot re
         )
         yield* Deferred.await(originalReady)
         yield* TestClock.adjust("250 millis")
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(delayed.started)
         yield* Fiber.join(originalCleanup)
         const newer = yield* startControlledProcess(harness.handle, harness.input)
         const newerPart = yield* harness.handle.updateToolCall("call-1", (part) => part)
         if (!newerPart) return yield* Effect.die(new Error("newer provider owner was not created"))
-        yield* Deferred.succeed(release, undefined)
-        yield* Deferred.await(delayed.started)
         const current = yield* harness.handle.updateToolCall("call-1", (part) => part)
         yield* harness.handle.completeToolCall("call-1", {
           title: "race cleanup",
