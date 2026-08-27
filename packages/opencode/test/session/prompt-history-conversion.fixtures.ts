@@ -194,12 +194,21 @@ export type CloneRoot = {
 
 export function cloneLedger() {
   const records: CloneRoot[] = []
+  let characters = 0
   const clone = <T>(value: T): T => {
     const record = cloneRoot(value)
-    if (record) records.push(record)
+    if (record) {
+      records.push(record)
+      characters += stringCharacters(value)
+    }
     return structuredClone(value)
   }
-  return { clone, take: () => records.splice(0) }
+  const take = () => {
+    const result = records.splice(0)
+    characters = 0
+    return result
+  }
+  return { clone, take, characters: () => characters }
 }
 
 export function recorder(calls: Array<{ ids: string[]; model: string }>) {
@@ -246,4 +255,11 @@ function isSourceRoot(value: unknown): value is { readonly info: object; readonl
 
 function isModelRoot(value: unknown): value is { readonly role: string; readonly content: unknown } {
   return typeof value === "object" && value !== null && "role" in value && "content" in value
+}
+
+function stringCharacters(value: unknown): number {
+  if (typeof value === "string") return value.length
+  if (Array.isArray(value)) return value.reduce((total, item) => total + stringCharacters(item), 0)
+  if (typeof value !== "object" || value === null) return 0
+  return Object.values(value).reduce((total, item) => total + stringCharacters(item), 0)
 }

@@ -56,11 +56,48 @@ export function make(converter: Converter = MessageV2.toModelMessagesEffect, clo
     } satisfies Cache
     cache = next
     const tail = input.messages.slice(end)
-    const convertedTail = tail.length === 0 ? [] : yield* converter(clone(tail), input.model)
-    return [...clone(next.converted), ...convertedTail]
+    const convertedTail = tail.length === 0 ? [] : yield* converter(copyMutable(tail), input.model)
+    return [...copyMutable(next.converted), ...convertedTail]
   })
 
   return Object.freeze({ convert, invalidate })
+}
+
+function copyMutable<T>(value: T): T
+function copyMutable(value: unknown): unknown {
+  return copyValue(value, new Map())
+}
+
+function copyValue(value: unknown, seen: Map<object, unknown>): unknown {
+  if (typeof value !== "object" || value === null) return value
+  const previous = seen.get(value)
+  if (previous !== undefined) return previous
+  if (value instanceof ArrayBuffer) return value.slice(0)
+  if (ArrayBuffer.isView(value)) return structuredClone(value)
+  if (value instanceof Date) return new Date(value)
+  if (value instanceof URL) return new URL(value)
+  if (Array.isArray(value)) {
+    const result: unknown[] = []
+    seen.set(value, result)
+    result.push(...value.map((item) => copyValue(item, seen)))
+    return result
+  }
+  if (value instanceof Map) {
+    const result = new Map<unknown, unknown>()
+    seen.set(value, result)
+    for (const [key, item] of value) result.set(copyValue(key, seen), copyValue(item, seen))
+    return result
+  }
+  if (value instanceof Set) {
+    const result = new Set<unknown>()
+    seen.set(value, result)
+    for (const item of value) result.add(copyValue(item, seen))
+    return result
+  }
+  const result: Record<string, unknown> = {}
+  seen.set(value, result)
+  for (const [key, item] of Object.entries(value)) result[key] = copyValue(item, seen)
+  return result
 }
 
 function cacheMatches(cache: Cache | undefined, stable: SessionV1.WithParts[], model: Provider.Model): cache is Cache {

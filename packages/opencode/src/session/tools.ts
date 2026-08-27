@@ -131,6 +131,11 @@ export const resolveWithBridge = Effect.fn("SessionTools.resolveWithBridge")(fun
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
+            const bounded = yield* truncate.output(output.output, {}, input.agent)
+            if (bounded.truncated) {
+              output.output = bounded.content
+              Object.assign(output.metadata, { truncated: true, outputPath: bounded.outputPath })
+            }
             if (options.abortSignal?.aborted) {
               yield* input.processor.completeToolCall(options.toolCallId, output)
             }
@@ -486,7 +491,6 @@ export const resolveWithBridge = Effect.fn("SessionTools.resolveWithBridge")(fun
               sessionID: ctx.sessionID,
               messageID: input.processor.message.id,
             })),
-            content: result.content,
           }
           if (opts.abortSignal?.aborted) {
             yield* input.processor.completeToolCall(opts.toolCallId, output)
