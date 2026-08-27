@@ -35,19 +35,26 @@ function convert(
 }
 
 describe("PromptHistoryConversion", () => {
-  test("clones only provider-facing converted data for an unchanged warm prefix", async () => {
+  test("does not deep-clone large cached tool output on repeated warm conversions", async () => {
     // Given
     const ledger = cloneLedger()
-    const history = turn("warm")
+    const selected = model()
+    const prompt = user("warm")
+    const tool = toolPart("warm", "completed")
+    if (tool.state.status !== "completed") throw new Error("Expected completed tool")
+    tool.state.output = "x".repeat(512 * 1024)
+    const history = [prompt, assistant("warm", prompt.info.id, { parts: [tool] })]
     const cache = PromptHistoryConversion.make(undefined, ledger.clone)
-    await convert(cache, history, model())
+    const expected = await cold(history, selected)
+    await convert(cache, history, selected)
     ledger.take()
 
     // When
-    expect(await convert(cache, history, model())).toEqual(await cold(history, model()))
+    for (let index = 0; index < 50; index++) expect(await convert(cache, history, selected)).toEqual(expected)
 
     // Then
-    expect(ledger.take()).toEqual([{ kind: "model", messages: 2, parts: 2 }])
+    expect(ledger.characters()).toBe(0)
+    expect(ledger.take()).toEqual([])
   })
 
   test("clones and converts only a stable extension while preserving the old prefix", async () => {
@@ -65,7 +72,7 @@ describe("PromptHistoryConversion", () => {
 
     // Then
     expect(calls.at(-1)?.ids).toEqual(turn("second").map((message) => message.info.id))
-    expect(ledger.take()).toEqual([{ kind: "source", messages: 2, parts: 2 }, { kind: "model", messages: 4, parts: 4 }])
+    expect(ledger.take()).toEqual([{ kind: "source", messages: 2, parts: 2 }])
   })
 
   test("returns transient tail output without cloning the tail or assembled output", async () => {
@@ -81,7 +88,7 @@ describe("PromptHistoryConversion", () => {
     expect(await convert(cache, history, model())).toEqual(await cold(history, model()))
 
     // Then
-    expect(ledger.take()).toEqual([{ kind: "source", messages: 1, parts: 1 }, { kind: "model", messages: 2, parts: 2 }])
+    expect(ledger.take()).toEqual([])
   })
 
   test("transformed mode converts one private input and returns its fresh output directly", async () => {
