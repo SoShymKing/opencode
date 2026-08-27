@@ -12,6 +12,9 @@ import {
   backupPaths,
   inspectBackup,
   messageBytes,
+  messageID,
+  messageParts,
+  normalizedMessageBytes,
   setupExisting,
   useDatabase,
 } from "./fixture/database-migration"
@@ -50,7 +53,7 @@ describe("DatabaseMigration", () => {
         return {
           journal: yield* db.all<{ readonly id: string }>(sql`SELECT id FROM migration ORDER BY rowid`),
           dataBytes: yield* db.get<{ readonly bytes: string }>(
-            sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = 'message'`,
+            sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = ${messageID}`,
           ),
           parts: yield* db.get<{ readonly count: number }>(sql`SELECT count(*) AS count FROM session_message_part`),
         }
@@ -69,8 +72,8 @@ describe("DatabaseMigration", () => {
     })
     expect(source).toEqual({
       journal: canonicalIDs.map((id) => ({ id })),
-      dataBytes: { bytes: messageBytes },
-      parts: { count: 0 },
+      dataBytes: { bytes: normalizedMessageBytes },
+      parts: { count: messageParts.length },
     })
     expect((await readdir(tmp.path)).filter((name) => name.includes(".backup-"))).toEqual([path.basename(backup)])
 
@@ -132,7 +135,7 @@ describe("DatabaseMigration", () => {
     expect(state.journal.slice(0, split).map((row) => row.id)).toEqual(substituted.slice(0, split))
     expect(state.journal.slice(-2).map((row) => row.id)).toEqual(canonicalIDs)
     expect(state.drizzle.map((row) => row.name)).toEqual(substituted.slice(split))
-    expect(state.parts).toEqual({ count: 0 })
+    expect(state.parts).toEqual({ count: messageParts.length })
   })
 
   test("maps the old part marker without replay and preserves every legacy row", async () => {
@@ -213,16 +216,18 @@ describe("DatabaseMigration", () => {
     ).toEqual([{ id: "v01_baseline" }])
   })
 
-  test("v02 is DDL-only and leaves existing message bytes untouched", async () => {
+  test("v02 converts embedded assistant content", async () => {
     await useDatabase(":memory:", (db) =>
       Effect.gen(function* () {
         yield* setupExisting(db, { migrationIDs: ["v01_baseline"] })
         yield* db.transaction((tx) => sessionMessagePartMigration.up(tx))
 
         expect(
-          yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = 'message'`),
-        ).toEqual({ bytes: messageBytes })
-        expect(yield* db.get(sql`SELECT count(*) AS count FROM session_message_part`)).toEqual({ count: 0 })
+          yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = ${messageID}`),
+        ).toEqual({ bytes: normalizedMessageBytes })
+        expect(
+          yield* db.all(sql`SELECT position, id, type, data FROM session_message_part ORDER BY position`),
+        ).toEqual(messageParts)
       }),
     )
   })

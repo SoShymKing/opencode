@@ -8,7 +8,6 @@ import sessionMessagePartMigration from "./migration/v02_session_message_part"
 import { DatabaseLegacyV01Error } from "./legacy-v01"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
-type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
 type MessageRow = { readonly id: string; readonly type: string; readonly data: string }
 type PartRow = {
   readonly message_id: string
@@ -29,8 +28,6 @@ type StoredMessage = {
 }
 
 const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
-const identity = new Set(["id", "type"])
-const content = new Set(["content"])
 
 export function downgrade(db: Database) {
   return Effect.gen(function* () {
@@ -65,16 +62,11 @@ export function downgrade(db: Database) {
 
 export function upgrade(db: Database) {
   return Effect.gen(function* () {
-    const legacy = yield* validateDatabase(db, "legacy")
+    yield* validateDatabase(db, "legacy")
     yield* db.transaction(
       (tx) =>
         Effect.gen(function* () {
           yield* sessionMessagePartMigration.up(tx)
-          yield* Effect.forEach(
-            legacy.filter((message) => message.row.type === "assistant"),
-            (message) => splitAssistant(tx, message),
-            { discard: true },
-          )
           yield* tx.run("DELETE FROM migration")
           yield* tx.run(sql`INSERT INTO migration (id, time_completed) VALUES ('v01_baseline', ${Date.now()})`)
           yield* tx.run(
@@ -182,23 +174,6 @@ function readCurrent(db: Pick<Database, "all">) {
         )
         return { row, data, content: values } satisfies StoredMessage
       }),
-    )
-  })
-}
-
-function splitAssistant(tx: Transaction, message: StoredMessage) {
-  return Effect.gen(function* () {
-    const items = message.content
-    if (!items) return yield* failure(`assistant ${message.row.id} content is malformed`)
-    yield* tx.run(
-      sql`UPDATE session_message SET data = ${DatabaseLegacyV01Json.remove(message.data, content)} WHERE id = ${message.row.id}`,
-    )
-    yield* Effect.forEach(
-      items,
-      (part, position) =>
-        tx.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data)
-          VALUES (${message.row.id}, ${position}, ${part.id}, ${part.type}, ${DatabaseLegacyV01Json.remove(part.data, identity)})`),
-      { discard: true },
     )
   })
 }

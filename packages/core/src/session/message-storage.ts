@@ -103,10 +103,11 @@ export const hydrateSelection = Effect.fn("MessageStorage.hydrateSelection")(fun
     )
     .pipe(Effect.orDie)
 
+  const childrenByMessage = Map.groupBy(raw.children, (child) => child.messageID)
   return yield* Effect.forEach(raw.parents, (parent) =>
     Effect.gen(function* () {
       const envelope = yield* decodeEnvelope(parent)
-      const children = raw.children.filter((child) => child.messageID === parent.messageID)
+      const children = childrenByMessage.get(parent.messageID) ?? []
       if (envelope.type !== "assistant") {
         if (children.length > 0) return yield* failure(parent)
         return { sessionID: parent.sessionID, seq: parent.seq, message: envelope }

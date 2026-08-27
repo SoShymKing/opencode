@@ -232,19 +232,20 @@ describe("Session message storage", () => {
     Effect.gen(function* () {
       const db = (yield* Database.Service).db
       const sessionID = SessionSchema.ID.make("ses_hydrate_order")
-      const userID = SessionMessage.ID.make("msg_hydrate_user")
-      const assistantID = SessionMessage.ID.make("msg_hydrate_assistant")
+      const firstID = SessionMessage.ID.make("msg_hydrate_assistant_first")
+      const secondID = SessionMessage.ID.make("msg_hydrate_assistant_second")
       yield* setupSession(sessionID)
       yield* insertMessage({
         sessionID,
-        messageID: userID,
+        messageID: firstID,
         seq: 1,
-        type: "user",
-        dataText: JSON.stringify({ text: "question", time: { created: 1 } }),
+        type: "assistant",
+        dataText: assistantEnvelope,
+        parts: [{ position: 7, id: "first-only", type: "text", dataText: JSON.stringify({ text: "first owner" }) }],
       })
       yield* insertMessage({
         sessionID,
-        messageID: assistantID,
+        messageID: secondID,
         seq: 2,
         type: "assistant",
         dataText: assistantEnvelope,
@@ -265,14 +266,11 @@ describe("Session message storage", () => {
         order: "desc",
       })
 
-      expect(ascending.map((row) => row.message.id)).toEqual([userID, assistantID])
-      expect(descending.map((row) => row.message.id)).toEqual([assistantID, userID])
-      expect(ascending[1]?.message).toMatchObject({
-        content: [
-          { id: "first", text: "first" },
-          { id: "second", text: "second" },
-        ],
-      })
+      expect(ascending.map((row) => row.message)).toMatchObject([
+        { id: firstID, content: [{ id: "first-only", text: "first owner" }] },
+        { id: secondID, content: [{ id: "first", text: "first" }, { id: "second", text: "second" }] },
+      ])
+      expect(descending.map((row) => row.message.id)).toEqual([secondID, firstID])
     }),
   )
 

@@ -4,14 +4,36 @@ import path from "node:path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
-import sessionMessagePartMigration from "@opencode-ai/core/database/migration/v02_session_message_part"
 import { sql } from "drizzle-orm"
 import { Effect } from "effect"
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 export type MigrationDatabase = Effect.Success<typeof makeDb>
-export const messageData = '{"agent":"build","content":[{"type":"text","text":"unchanged"}]}'
+export const sessionID = "ses_migration"
+export const messageID = "msg_migration"
+export const messageContent = [
+  { id: "text-1", type: "text", text: "first" },
+  { id: "text-2", type: "text", text: "second" },
+] as const
+export const messageData = JSON.stringify({
+  agent: "build",
+  model: { providerID: "test", id: "model" },
+  content: messageContent,
+  time: { created: 1 },
+})
 export const messageBytes = Buffer.from(messageData).toString("hex").toUpperCase()
+export const normalizedMessageData = JSON.stringify({
+  agent: "build",
+  model: { providerID: "test", id: "model" },
+  time: { created: 1 },
+})
+export const normalizedMessageBytes = Buffer.from(normalizedMessageData).toString("hex").toUpperCase()
+export const messageParts = messageContent.map((item, position) => ({
+  position,
+  id: item.id,
+  type: item.type,
+  data: JSON.stringify({ text: item.text }),
+}))
 
 type ExistingOptions = {
   readonly migrationIDs?: readonly string[]
@@ -62,11 +84,34 @@ export function setupExisting(db: MigrationDatabase, options: ExistingOptions = 
         { discard: true },
       )
     }
-    yield* db.run(sql`INSERT INTO session (id) VALUES ('session')`)
+    yield* db.run(sql`INSERT INTO session (id) VALUES (${sessionID})`)
     yield* db.run(sql`INSERT INTO session_message (
       id, session_id, type, seq, time_created, time_updated, data
-    ) VALUES ('message', 'session', 'assistant', 0, 1, 1, ${messageData})`)
-    if (options.partComplete) yield* db.transaction((tx) => sessionMessagePartMigration.up(tx))
+    ) VALUES (${messageID}, ${sessionID}, 'assistant', 0, 1, 1, ${messageData})`)
+    if (options.partComplete) {
+      yield* db.run(`
+        CREATE TABLE session_message_part (
+          message_id text NOT NULL,
+          position integer NOT NULL,
+          id text NOT NULL,
+          type text NOT NULL,
+          data text NOT NULL CHECK(json_valid("data") AND json_type("data") = 'object'),
+          PRIMARY KEY(message_id, position),
+          FOREIGN KEY (message_id) REFERENCES session_message(id) ON UPDATE no action ON DELETE cascade
+        )
+      `)
+      yield* db.run(
+        `CREATE INDEX session_message_part_lookup_idx ON session_message_part (message_id,type,id,position desc)`,
+      )
+      yield* db.run(sql`UPDATE session_message SET data = ${normalizedMessageData} WHERE id = ${messageID}`)
+      yield* Effect.forEach(
+        messageParts,
+        (part) =>
+          db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data)
+            VALUES (${messageID}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`),
+        { discard: true },
+      )
+    }
   })
 }
 
@@ -91,9 +136,9 @@ export function inspectBackup(filename: string) {
     dataBytes: database
       .query<
         { readonly bytes: string },
-        []
-      >("SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = 'message'")
-      .get()?.bytes,
+        [string]
+      >("SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = ?")
+      .get(messageID)?.bytes,
   }
 }
 
