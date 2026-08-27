@@ -16,6 +16,7 @@ import {
   model,
   recorder,
   stepParts,
+  text,
   toolPart,
   turn,
   user,
@@ -35,6 +36,41 @@ function convert(
 }
 
 describe("PromptHistoryConversion", () => {
+  test("bounds only settled historical tool text without mutating source or attachments", async () => {
+    // Given
+    const selected = model({ apiNpm: "@ai-sdk/anthropic" })
+    const settledUser = user("historical", "U".repeat(2_500))
+    const settledTool = mediaToolPart("historical")
+    if (settledTool.state.status !== "completed") throw new Error("Expected completed settled tool")
+    settledTool.state.output = "S".repeat(2_500)
+    const tailUser = user("tail")
+    const tailTool = toolPart("tail", "completed")
+    if (tailTool.state.status !== "completed") throw new Error("Expected completed tail tool")
+    tailTool.state.output = "T".repeat(2_500)
+    const history = [
+      settledUser,
+      assistant("historical", settledUser.info.id, {
+        parts: [text(messageID("assistant_historical"), "prose", "A".repeat(2_500)), settledTool],
+      }),
+      tailUser,
+      assistant("tail", tailUser.info.id, { parts: [tailTool], finish: false }),
+    ]
+    const source = structuredClone(history)
+
+    // When
+    const output = JSON.stringify(await convert(PromptHistoryConversion.make(), history, selected))
+
+    // Then
+    expect(output).not.toContain("S".repeat(2_500))
+    expect(output).toContain("S".repeat(2_000))
+    expect(output).toContain("[Tool output truncated for compaction: omitted 500 chars]")
+    expect(output).toContain("U".repeat(2_500))
+    expect(output).toContain("A".repeat(2_500))
+    expect(output).toContain("T".repeat(2_500))
+    expect(output).toContain("document.pdf")
+    expect(history).toEqual(source)
+  })
+
   test("does not deep-clone large cached tool output on repeated warm conversions", async () => {
     // Given
     const ledger = cloneLedger()
@@ -45,8 +81,7 @@ describe("PromptHistoryConversion", () => {
     tool.state.output = "x".repeat(512 * 1024)
     const history = [prompt, assistant("warm", prompt.info.id, { parts: [tool] })]
     const cache = PromptHistoryConversion.make(undefined, ledger.clone)
-    const expected = await cold(history, selected)
-    await convert(cache, history, selected)
+    const expected = await convert(cache, history, selected)
     ledger.take()
 
     // When
