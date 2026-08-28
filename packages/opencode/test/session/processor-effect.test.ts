@@ -25,6 +25,7 @@ import { testEffect } from "../lib/effect"
 import { raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
+import { Plugin } from "@/plugin"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -313,6 +314,20 @@ const probedActiveToolEnv = LayerNode.compile(root, [
   [Session.node, sessionWithPartLookupProbe],
 ])
 const itProbedActiveTool = testEffect(probedActiveToolEnv)
+
+const chatParamsFailurePlugin = Layer.mock(Plugin.Service)({
+  trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) =>
+    name === "chat.params"
+      ? Effect.die(new TypeError("Attempting to define property on object that is not extensible"))
+      : Effect.succeed(output),
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+const chatParamsFailureEnv = LayerNode.compile(
+  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  [...replacements, [Plugin.node, chatParamsFailurePlugin]],
+)
+const itChatParamsFailure = testEffect(chatParamsFailureEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -2165,6 +2180,98 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           expect(call.state.error).toBe("Tool execution aborted")
           expect(call.state.metadata).toEqual({ step: 1, interrupted: true })
           expect(call.state.time.end).toBeDefined()
+        }
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+itChatParamsFailure.live("session.processor persists chat params errors before terminal events", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const seen = defer<void>()
+        const database = yield* Database.Service
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const sts = yield* SessionStatus.Service
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "fail params")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const snapshots: SessionV1.Assistant[] = []
+        const terminalEvents: string[] = []
+        const off = yield* events.listen((evt) => {
+          const isError =
+            evt.type === Session.Event.Error.type &&
+            (evt.data as typeof Session.Event.Error.data.Type).sessionID === chat.id
+          const isStatus =
+            evt.type === SessionStatus.Event.Status.type &&
+            (evt.data as typeof SessionStatus.Event.Status.data.Type).sessionID === chat.id &&
+            (evt.data as typeof SessionStatus.Event.Status.data.Type).status.type === "idle"
+          const isIdle =
+            evt.type === SessionStatus.Event.Idle.type &&
+            (evt.data as typeof SessionStatus.Event.Idle.data.Type).sessionID === chat.id
+          if (!isError && !isStatus && !isIdle) return Effect.void
+          terminalEvents.push(evt.type)
+          return MessageV2.get({ sessionID: chat.id, messageID: msg.id }).pipe(
+            Effect.provideService(Database.Service, database),
+            Effect.orDie,
+            Effect.tap((stored) =>
+              Effect.sync(() => {
+                if (stored.info.role === "assistant") snapshots.push(stored.info)
+                if (snapshots.length === 3) seen.resolve()
+              }),
+            ),
+            Effect.asVoid,
+          )
+        })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "fail params" }],
+          tools: {},
+        })
+        yield* Effect.promise(() => seen.promise)
+        const state = yield* sts.get(chat.id)
+        yield* off
+
+        expect(result).toBe("stop")
+        expect(yield* llm.calls).toBe(0)
+        expect(state).toEqual({ type: "idle" })
+        expect(terminalEvents).toEqual([
+          Session.Event.Error.type,
+          SessionStatus.Event.Status.type,
+          SessionStatus.Event.Idle.type,
+        ])
+        expect(snapshots).toHaveLength(3)
+        for (const stored of snapshots) {
+          expect(stored.error?.name).toBe("UnknownError")
+          expect(typeof stored.time.completed).toBe("number")
+          expect(stored.tokens).toEqual({
+            total: 0,
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: { read: 0, write: 0 },
+          })
         }
       }),
     { config: (url) => providerCfg(url) },

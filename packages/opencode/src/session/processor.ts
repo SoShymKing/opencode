@@ -1054,6 +1054,8 @@ const layer = Layer.effect(
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
+            ctx.assistantMessage.time.completed = Date.now()
+            yield* session.updateMessage(ctx.assistantMessage)
             yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
             yield* status.set(ctx.sessionID, { type: "idle" })
             return
@@ -1074,6 +1076,8 @@ const layer = Layer.effect(
           })
         }
         ctx.assistantMessage.error = error
+        ctx.assistantMessage.time.completed = Date.now()
+        yield* session.updateMessage(ctx.assistantMessage)
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
