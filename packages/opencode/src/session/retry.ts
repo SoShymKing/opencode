@@ -33,25 +33,29 @@ export type Retryable = {
 
 export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
-export const RETRY_MAX_DELAY = 30_000 // 30 seconds
 export const RETRY_UNEXPECTED_ABORT_LIMIT = 1
 export const RETRY_NO_RESPONSE_LIMIT = 1
 export const RETRY_MAIN_SESSION_NO_RESPONSE_LIMIT = 10
+export const RETRY_JITTER_FACTOR = 0.25
+export const RETRY_MAX_DELAY = 30_000 // 30 seconds
+export const RETRY_MAX_DELAY_NO_HEADERS = RETRY_MAX_DELAY
+export const RETRY_MAX_RETRIES = 5
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
   /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
   /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
-  /terminated|fetch failed|failed to fetch|network error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
   /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
   /try your request again|retry your request|resource exhausted|resource_exhausted/i,
+  /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
 
-export function delay(attempt: number, error?: SessionV1.APIError) {
+export function delay(attempt: number, error?: SessionV1.APIError, random = Math.random()) {
   if (error) {
     const headers = error.data.responseHeaders
     if (headers) {
@@ -76,10 +80,16 @@ export function delay(attempt: number, error?: SessionV1.APIError) {
           return cap(Math.ceil(parsed))
         }
       }
+      return cap(exponential(attempt, random))
     }
   }
 
-  return cap(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1))
+  return cap(Math.min(exponential(attempt, random), RETRY_MAX_DELAY_NO_HEADERS))
+}
+
+function exponential(attempt: number, random: number) {
+  const base = RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1)
+  return Math.ceil(base + base * RETRY_JITTER_FACTOR * random)
 }
 
 export function retryable(error: Err, provider: string, context?: RetryContext) {
@@ -129,7 +139,7 @@ export function retryable(error: Err, provider: string, context?: RetryContext) 
           reason: "free_tier_limit",
           provider,
           title: "Free limit reached",
-          message: "Subscribe to OpenCode Go for reliable access to the best open-source models, starting at $5/month.",
+          message: "Subscribe to OpenCode Go for reliable access to the best open-source models for $10/month.",
           label: "subscribe",
           link: GO_UPSELL_URL,
         },
@@ -217,6 +227,7 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider, { ...opts.context?.(), attempt: meta.attempt })
       if (!retry) return Cause.done(meta.attempt)
+      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
