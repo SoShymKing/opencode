@@ -91,7 +91,7 @@ describe("PromptHistoryConversion", () => {
     expect(projectionCalls).toBe(2)
   })
 
-  test("does not deep-clone large cached tool output on repeated warm conversions", async () => {
+  test("does not deep-clone large tool output during initial or warm conversions", async () => {
     // Given
     const ledger = cloneLedger()
     const selected = model()
@@ -102,7 +102,8 @@ describe("PromptHistoryConversion", () => {
     const history = [prompt, assistant("warm", prompt.info.id, { parts: [tool] })]
     const cache = PromptHistoryConversion.make(undefined, ledger.clone)
     const expected = await convert(cache, history, selected)
-    ledger.take()
+    expect(ledger.characters()).toBe(0)
+    expect(ledger.take()).toEqual([])
 
     // When
     for (let index = 0; index < 50; index++) expect(await convert(cache, history, selected)).toEqual(expected)
@@ -112,7 +113,7 @@ describe("PromptHistoryConversion", () => {
     expect(ledger.take()).toEqual([])
   })
 
-  test("clones and converts only a stable extension while preserving the old prefix", async () => {
+  test("copies and converts only a stable extension while preserving the old prefix", async () => {
     // Given
     const ledger = cloneLedger()
     const calls: Array<{ ids: string[]; model: string }> = []
@@ -127,7 +128,7 @@ describe("PromptHistoryConversion", () => {
 
     // Then
     expect(calls.at(-1)?.ids).toEqual(turn("second").map((message) => message.info.id))
-    expect(ledger.take()).toEqual([{ kind: "source", messages: 2, parts: 2 }])
+    expect(ledger.take()).toEqual([])
   })
 
   test("returns transient tail output without cloning the tail or assembled output", async () => {

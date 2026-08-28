@@ -66,7 +66,7 @@ export function make(
     const stable = input.messages.slice(0, end)
     const previous = cacheMatches(cache, stable, input.model) ? cache : undefined
     const extension = previous ? stable.slice(previous.source.length) : stable
-    const owned = extension.length === 0 ? [] : clone(extension)
+    const owned = extension.length === 0 ? [] : copyMutable(extension)
     const projected = owned.length === 0 ? [] : yield* project(copyMutable(owned))
     const converted = projected.length === 0 ? [] : yield* converter(projected, input.model)
     const next = {
