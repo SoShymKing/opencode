@@ -122,6 +122,12 @@ export function retryable(error: Err, provider: string, context?: RetryContext) 
     return { message: error.data.message }
   }
   if (SessionV1.APIError.isInstance(error)) {
+    if (
+      error.data.metadata?.providerErrorType === "invalid_request_error" &&
+      error.data.metadata.providerErrorParam === "input" &&
+      error.data.metadata.providerErrorCode === "invalid_file"
+    )
+      return undefined
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.

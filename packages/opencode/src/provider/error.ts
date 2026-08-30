@@ -3,6 +3,17 @@ import { STATUS_CODES } from "http"
 import { iife } from "@/util/iife"
 import type { ProviderV2 } from "@opencode-ai/core/provider"
 import { isContextOverflow } from "@opencode-ai/llm"
+import { Option, Schema } from "effect"
+
+const RejectedAttachmentError = Schema.Struct({
+  error: Schema.Struct({
+    type: Schema.Literal("invalid_request_error"),
+    param: Schema.Literal("input"),
+    code: Schema.Literal("invalid_file"),
+  }),
+})
+const decodeRejectedAttachmentData = Schema.decodeUnknownOption(RejectedAttachmentError)
+const decodeRejectedAttachmentBody = Schema.decodeUnknownOption(Schema.fromJsonString(RejectedAttachmentError))
 
 export class HeaderTimeoutError extends Error {
   public override readonly name = "ProviderHeaderTimeoutError"
@@ -45,14 +56,12 @@ function message(providerID: ProviderV2.ID, e: APICallError) {
       return msg
     }
 
-    try {
-      const body = JSON.parse(e.responseBody)
-      // try to extract common error message fields
-      const errMsg = body.message || body.error || body.error?.message
-      if (errMsg && typeof errMsg === "string") {
-        return `${msg}: ${errMsg}`
-      }
-    } catch {}
+    const body = json(e.responseBody)
+    // try to extract common error message fields
+    const errMsg = body?.message || body?.error || body?.error?.message
+    if (errMsg && typeof errMsg === "string") {
+      return `${msg}: ${errMsg}`
+    }
 
     // If responseBody is HTML (e.g. from a gateway or proxy error page),
     // provide a human-readable message instead of dumping raw markup
@@ -168,8 +177,37 @@ export type ParsedAPICallError =
       responseBody?: string
       metadata?: Record<string, string>
     }
+  | {
+      type: "rejected_attachment"
+      message: "Provider rejected an attachment."
+      statusCode?: number
+      isRetryable: false
+      responseHeaders?: never
+      responseBody?: never
+      metadata: {
+        providerErrorType: "invalid_request_error"
+        providerErrorParam: "input"
+        providerErrorCode: "invalid_file"
+      }
+    }
 
 export function parseAPICallError(input: { providerID: ProviderV2.ID; error: APICallError }): ParsedAPICallError {
+  const data = decodeRejectedAttachmentData(input.error.data)
+  const rejected = Option.isSome(data) ? data : decodeRejectedAttachmentBody(input.error.responseBody)
+  if (Option.isSome(rejected)) {
+    return {
+      type: "rejected_attachment",
+      message: "Provider rejected an attachment.",
+      statusCode: input.error.statusCode,
+      isRetryable: false,
+      metadata: {
+        providerErrorType: "invalid_request_error",
+        providerErrorParam: "input",
+        providerErrorCode: "invalid_file",
+      },
+    }
+  }
+
   const m = message(input.providerID, input.error)
   const body = json(input.error.responseBody)
   if (isContextOverflow(m) || input.error.statusCode === 413 || body?.error?.code === "context_length_exceeded") {

@@ -166,6 +166,24 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
+  test("does not retry rejected attachments before retry heuristics", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Rate limit exceeded, please try again later",
+        isRetryable: true,
+        statusCode: 429,
+        responseBody: '{"error":{"message":"upstream connection refused"}}',
+        metadata: {
+          providerErrorType: "invalid_request_error",
+          providerErrorParam: "input",
+          providerErrorCode: "invalid_file",
+        },
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
   test("retries serialized too_many_requests messages", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { type: "too_many_requests" } }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Too Many Requests" })
