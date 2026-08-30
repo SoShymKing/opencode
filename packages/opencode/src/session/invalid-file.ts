@@ -85,7 +85,7 @@ export function select(
       message.parts.some((part) => part.type === "step-finish"),
   )
   const batches = ordered.flatMap((message) => {
-    if (boundary && compare(message.info, boundary.info) <= 0) return []
+    if (boundary && compare(message.info, boundary.info) < 0) return []
     if (message.info.role === "user") {
       if (compare(message.info, parent.info) > 0) return []
       return [message.parts.filter(sendable)]
