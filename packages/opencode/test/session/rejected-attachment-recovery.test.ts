@@ -190,6 +190,15 @@ it.live("quarantines rejected attachment and recovers next turn after instance r
             attachments: [attachment],
           },
         })
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          sessionID: chat.id,
+          messageID: first.assistant.id,
+          type: "step-finish",
+          reason: "tool-calls",
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
         yield* sessions.updateMessage({
           ...first.assistant,
           finish: "tool-calls",
