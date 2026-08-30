@@ -16,6 +16,7 @@ import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
+import { InvalidFile } from "./invalid-file"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -597,13 +598,54 @@ const layer = Layer.effect(
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
+        const error = parse(e)
+        if (
+          SessionV1.APIError.isInstance(error) &&
+          error.data.metadata?.providerErrorType === "invalid_request_error" &&
+          error.data.metadata.providerErrorParam === "input" &&
+          error.data.metadata.providerErrorCode === "invalid_file"
+        ) {
+          const history = yield* session.messages({ sessionID: ctx.sessionID }).pipe(Effect.orDie)
+          const selected = InvalidFile.select(history, ctx.assistantMessage)
+          const quarantined = InvalidFile.merge(InvalidFile.collect(history), selected)
+          const message = selected.length
+            ? `Provider rejected attachment(s). OpenCode quarantined the listed attachment IDs from future provider requests. ${InvalidFile.notice(selected)} The originals remain preserved in session history. Send another message to continue.`
+            : "Provider rejected attachment(s). No attachment was quarantined because no eligible attachment batch was found. The originals remain preserved in session history. Send another message to continue."
+          const enriched = {
+            name: "APIError",
+            data: {
+              message,
+              ...(error.data.statusCode === undefined ? {} : { statusCode: error.data.statusCode }),
+              isRetryable: false,
+              metadata: {
+                providerErrorType: "invalid_request_error",
+                providerErrorParam: "input",
+                providerErrorCode: "invalid_file",
+                ...(quarantined.length ? { [InvalidFile.metadataKey]: InvalidFile.encode(quarantined) } : {}),
+              },
+            },
+          } satisfies SessionV1.APIError
+          yield* Effect.logError("process rejected attachment", {
+            "session.id": input.sessionID,
+            messageID: input.assistantMessage.id,
+            providerErrorType: "invalid_request_error",
+            providerErrorParam: "input",
+            providerErrorCode: "invalid_file",
+            selected: selected.map((file) => ({ partID: file.partID, mime: file.mime })),
+          })
+          ctx.assistantMessage.error = enriched
+          ctx.assistantMessage.finish = "error"
+          yield* session.updateMessage(ctx.assistantMessage)
+          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error: enriched })
+          yield* status.set(ctx.sessionID, { type: "idle" })
+          return
+        }
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
         })
-        const error = parse(e)
         if (SessionV1.ContextOverflowError.isInstance(error)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
             ctx.assistantMessage.error = error

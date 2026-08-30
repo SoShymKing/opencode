@@ -2,11 +2,12 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { llmClient } from "@opencode-ai/core/effect/app-node-platform"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
+import { ProviderError } from "@/provider/error"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Context, Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
-import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
+import { APICallError, streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
 import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
@@ -279,6 +280,9 @@ const live: Layer.Layer<
         type: "ai-sdk" as const,
         result: streamText({
           onError(error) {
+            const parsed = APICallError.isInstance(error.error)
+              ? ProviderError.parseAPICallError({ providerID: input.model.providerID, error: error.error })
+              : undefined
             bridge.fork(
               Effect.logError("stream error", {
                 providerID: input.model.providerID,
@@ -287,7 +291,13 @@ const live: Layer.Layer<
                 small: (input.small ?? false).toString(),
                 agent: input.agent.name,
                 mode: input.agent.mode,
-                error,
+                ...(parsed?.type === "rejected_attachment"
+                  ? {
+                      providerErrorType: "invalid_request_error",
+                      providerErrorParam: "input",
+                      providerErrorCode: "invalid_file",
+                    }
+                  : { error }),
               }),
             )
           },

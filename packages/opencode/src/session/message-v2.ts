@@ -29,6 +29,7 @@ import { lt } from "drizzle-orm"
 import { or } from "drizzle-orm"
 import { MessageTable, PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProviderError } from "@/provider/error"
+import { InvalidFile } from "@/session/invalid-file"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
@@ -133,6 +134,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
   model: Provider.Model,
   options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
 ) {
+  const quarantined = new Set(InvalidFile.collect(input).map((file) => file.partID))
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
   // Track media from tool results that need to be injected as user messages
@@ -209,7 +211,12 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             text: part.text,
           })
         // text/plain and directory files are converted into text parts, ignore them
-        if (part.type === "file" && part.mime !== "text/plain" && part.mime !== "application/x-directory") {
+        if (
+          part.type === "file" &&
+          part.mime !== "text/plain" &&
+          part.mime !== "application/x-directory" &&
+          !quarantined.has(part.id)
+        ) {
           if (options?.stripMedia && isMedia(part.mime)) {
             userMessage.parts.push({
               type: "text",
@@ -293,7 +300,10 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
             const outputText = part.state.time.compacted
               ? "[Old tool result content cleared]"
               : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
-            const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
+            const attachments =
+              part.state.time.compacted || options?.stripMedia
+                ? []
+                : (part.state.attachments ?? []).filter((attachment) => !quarantined.has(attachment.id))
 
             // For providers that don't support media in tool results, extract media files
             // (images, PDFs) to be sent as a separate user message
@@ -686,6 +696,21 @@ export function fromError(
           {
             message: parsed.message,
             responseBody: parsed.responseBody,
+          },
+          { cause: e },
+        ).toObject()
+      }
+      if (parsed.type === "rejected_attachment") {
+        return new APIError(
+          {
+            message: "Provider rejected an attachment.",
+            statusCode: parsed.statusCode,
+            isRetryable: false,
+            metadata: {
+              providerErrorType: "invalid_request_error",
+              providerErrorParam: "input",
+              providerErrorCode: "invalid_file",
+            },
           },
           { cause: e },
         ).toObject()
