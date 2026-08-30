@@ -930,7 +930,9 @@ describe("session.compaction.process", () => {
         metadata: { compaction_continue: true },
       })
       if (last?.parts[0]?.type === "text") {
-        expect(last.parts[0].text).toContain("Continue if you have next steps")
+        expect(last.parts[0].text).toContain(
+          "Do not treat this as a new request or restart planning, and do not expand its scope",
+        )
       }
     }),
   )
@@ -1127,7 +1129,8 @@ describe("session.compaction.process", () => {
           (msg) =>
             msg.info.role === "user" &&
             msg.parts.some(
-              (part) => part.type === "text" && part.synthetic && part.text.includes("Continue if you have next steps"),
+              (part) =>
+                part.type === "text" && part.synthetic && part.metadata?.compaction_continue === true,
             ),
         ),
       ).toBe(false)
