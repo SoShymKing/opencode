@@ -56,6 +56,76 @@ describe("FileSystem", () => {
     ),
   )
 
+  it.live("lists contained directory links as directories", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(async () => {
+          await fs.mkdir(path.join(directory, "actual"))
+          await fs.symlink(
+            path.join(directory, "actual"),
+            path.join(directory, "linked"),
+            process.platform === "win32" ? "junction" : "dir",
+          )
+        })
+        const entries = yield* (yield* FileSystem.Service).list()
+        expect(entries.map((entry) => ({ path: entry.path, type: entry.type }))).toContainEqual({
+          path: RelativePath.make("linked" + path.sep),
+          type: "directory",
+        })
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("omits directory links outside the location", () =>
+    withTmp((directory) =>
+      withTmp((outside) =>
+        Effect.gen(function* () {
+          const target = path.join(outside, "target")
+          yield* Effect.promise(async () => {
+            await fs.mkdir(target)
+            await fs.symlink(
+              target,
+              path.join(directory, "escaping"),
+              process.platform === "win32" ? "junction" : "dir",
+            )
+          })
+          const entries = yield* (yield* FileSystem.Service).list()
+          expect(entries.map((entry) => ({ path: entry.path, type: entry.type }))).not.toContainEqual({
+            path: RelativePath.make("escaping" + path.sep),
+            type: "directory",
+          })
+        }).pipe(provide(directory)),
+      ),
+    ),
+  )
+
+  it.live("omits dangling directory links without hiding siblings", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const target = path.join(directory, "target")
+        yield* Effect.promise(async () => {
+          await fs.mkdir(target)
+          await fs.mkdir(path.join(directory, "sibling"))
+          await fs.symlink(
+            target,
+            path.join(directory, "dangling"),
+            process.platform === "win32" ? "junction" : "dir",
+          )
+          await fs.rm(target, { recursive: true })
+        })
+        const entries = yield* (yield* FileSystem.Service).list()
+        expect(entries.map((entry) => ({ path: entry.path, type: entry.type }))).toContainEqual({
+          path: RelativePath.make("sibling" + path.sep),
+          type: "directory",
+        })
+        expect(entries.map((entry) => ({ path: entry.path, type: entry.type }))).not.toContainEqual({
+          path: RelativePath.make("dangling" + path.sep),
+          type: "directory",
+        })
+      }).pipe(provide(directory)),
+    ),
+  )
+
   it.live("rejects lexical escapes", () =>
     withTmp((directory) =>
       Effect.gen(function* () {

@@ -88,24 +88,40 @@ const baseLayer = Layer.effect(
         const target = yield* resolve(input.path)
         const info = yield* fs.stat(target.real).pipe(Effect.orDie)
         if (info.type !== "Directory") return yield* Effect.die(new Error("Path is not a directory"))
-        return yield* fs.readDirectoryEntries(target.real).pipe(
+        const entries = yield* fs.readDirectoryEntries(target.real).pipe(
           Effect.orDie,
-          Effect.map((items) =>
-            items
-              .flatMap((item) => {
-                if (item.type !== "file" && item.type !== "directory") return []
-                const absolute = path.join(target.absolute, item.name)
-                const relative = path.relative(target.directory, absolute)
-                return [
-                  Entry.make({
-                    path: RelativePath.make(relative + (item.type === "directory" ? path.sep : "")),
-                    type: item.type,
-                  }),
-                ]
-              })
-              .sort((a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === "directory" ? -1 : 1)),
+          Effect.flatMap((items) =>
+            Effect.forEach(
+              items,
+              (item) =>
+                Effect.gen(function* () {
+                  const absolute = path.join(target.absolute, item.name)
+                  const relative = path.relative(target.directory, absolute)
+                  if (item.type === "file" || item.type === "directory")
+                    return Entry.make({
+                      path: RelativePath.make(relative + (item.type === "directory" ? path.sep : "")),
+                      type: item.type,
+                    })
+                  const childReal = yield* fs
+                    .realPath(path.join(target.real, item.name))
+                    .pipe(Effect.catch(() => Effect.void))
+                  if (!childReal || !FSUtil.contains(target.root, childReal)) return undefined
+                  const childInfo = yield* fs.stat(childReal).pipe(Effect.catch(() => Effect.void))
+                  const type =
+                    childInfo?.type === "Directory" ? "directory" : childInfo?.type === "File" ? "file" : undefined
+                  if (!type) return undefined
+                  return Entry.make({
+                    path: RelativePath.make(relative + (type === "directory" ? path.sep : "")),
+                    type,
+                  })
+                }),
+              { concurrency: 16 },
+            ),
           ),
         )
+        return entries
+          .filter((item): item is Entry => item !== undefined)
+          .sort((a, b) => (a.type === b.type ? a.path.localeCompare(b.path) : a.type === "directory" ? -1 : 1))
       }),
     })
   }),
