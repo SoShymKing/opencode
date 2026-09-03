@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import { QueryClient } from "@tanstack/solid-query"
-import type { Config, OpencodeClient, Project } from "@opencode-ai/sdk/v2/client"
+import type { Config, OpencodeClient, Path, Project, ProviderAuthResponse } from "@opencode-ai/sdk/v2/client"
 import type { AgentApi, CatalogApi, CommandApi, ReferenceApi } from "@opencode-ai/client/promise"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import {
+  bootstrapGlobal,
   bootstrapDirectory,
   loadAgentsQuery,
   loadCommands,
@@ -21,6 +22,7 @@ import type { ServerApi } from "@/utils/server"
 type ProjectApi = ServerApi["project"]
 
 const provider = { all: new Map(), connected: [], default: {} } satisfies NormalizedProviderListResponse
+const projectPath = { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" } satisfies Path
 const api = {
   agent: { list: async () => ({ location: {}, data: [] }) },
   provider: { list: async () => ({ location: {}, data: [] }) },
@@ -76,6 +78,138 @@ function directoryState() {
 }
 
 describe("bootstrapDirectory", () => {
+  test("reuses provider, agent, and MCP data loaded by initial observers", async () => {
+    const reads: string[] = []
+    const started = Promise.withResolvers<void>()
+    const [store, setStore] = directoryState()
+    const queryClient = new QueryClient()
+    const nextApi: ServerApi = {
+      ...api,
+      agent: {
+        ...api.agent,
+        list: async () => {
+          reads.push("agent")
+          return { location: {}, data: [] }
+        },
+      },
+      command: {
+        ...api.command,
+        list: async () => ({ location: {}, data: [] }),
+      },
+      provider: {
+        ...api.provider,
+        list: async () => {
+          reads.push("provider")
+          return { location: {}, data: [] }
+        },
+      },
+      model: {
+        ...api.model,
+        list: async () => {
+          reads.push("model")
+          return { location: {}, data: [] }
+        },
+        default: async () => {
+          reads.push("default")
+          return { location: {}, data: null }
+        },
+      },
+      mcp: {
+        ...api.mcp,
+        list: async () => {
+          reads.push("mcp")
+          return { location: {}, data: [] }
+        },
+        resource: {
+          catalog: async () => {
+            reads.push("resource")
+            return { location: {}, data: { resources: [], templates: [] } }
+          },
+        },
+      },
+      reference: {
+        ...api.reference,
+        list: async () => {
+          started.resolve()
+          return { location: {}, data: [] }
+        },
+      },
+    }
+
+    queryClient.setQueryData([ServerScope.local, "/project", "providers"], provider)
+    queryClient.setQueryData([ServerScope.local, "/project", "agents"], [])
+    queryClient.setQueryData([ServerScope.local, "/project", "mcp"], {})
+    queryClient.setQueryData([ServerScope.local, "/project", "mcpResources"], {})
+
+    const input: Parameters<typeof bootstrapDirectory>[0] = {
+      directory: "/project",
+      scope: ServerScope.local,
+      mcp: true,
+      global: {
+        config: {},
+        path: projectPath,
+        project: [{ id: "project", worktree: "/project" } as Project],
+        provider,
+      },
+      sdk: {} as OpencodeClient,
+      api: nextApi,
+      store,
+      setStore,
+      vcsCache: { setStore() {} } as unknown as VcsCache,
+      loadSessions() {},
+      translate: (key) => key,
+      queryClient,
+      protocol: Promise.resolve("v2"),
+    }
+    const booting = bootstrapDirectory(input)
+
+    await started.promise
+    await booting
+
+    expect(reads).toEqual([])
+
+    await bootstrapDirectory(input)
+
+    expect(reads.sort()).toEqual(["agent", "default", "mcp", "model", "provider", "resource"])
+  })
+
+  test("resolves after deferred directory work completes", async () => {
+    const loading = Promise.withResolvers<void>()
+    const [store, setStore] = directoryState()
+    let complete = false
+
+    const booting = bootstrapDirectory({
+      directory: "/project",
+      scope: ServerScope.local,
+      mcp: false,
+      global: {
+        config: {},
+        path: projectPath,
+        project: [{ id: "project", worktree: "/project" } as Project],
+        provider,
+      },
+      sdk: {} as OpencodeClient,
+      api,
+      store,
+      setStore,
+      vcsCache: { setStore() {} } as unknown as VcsCache,
+      loadSessions: () => loading.promise,
+      translate: (key) => key,
+      queryClient: new QueryClient(),
+      protocol: Promise.resolve("v2"),
+    })
+    void booting.then(() => {
+      complete = true
+    })
+
+    await Promise.resolve()
+    const completedBeforeLoad = complete
+    loading.resolve()
+
+    expect(completedBeforeLoad).toBe(false)
+    await booting
+  })
+
   test("uses legacy MCP endpoints while refreshing a v1 directory", async () => {
     const legacyConfigReads: string[] = []
     const mcpReads: string[] = []
@@ -136,10 +270,6 @@ describe("bootstrapDirectory", () => {
       protocol: Promise.resolve("v1"),
     })
 
-    expect(store.status).toBe("partial")
-
-    await new Promise((resolve) => setTimeout(resolve, 80))
-
     expect(store.status).toBe("complete")
     expect(legacyConfigReads).toEqual(["directory"])
     expect(mcpReads.sort()).toEqual(["command", "resource", "status"])
@@ -175,11 +305,78 @@ describe("bootstrapDirectory", () => {
       protocol: Promise.resolve("v2"),
     })
 
-    expect(store.status).toBe("partial")
-
-    await new Promise((resolve) => setTimeout(resolve, 80))
-
     expect(store.status).toBe("complete")
+  })
+})
+
+describe("bootstrapGlobal", () => {
+  test("reuses global data loaded by initial observers", async () => {
+    const reads: string[] = []
+    const queryClient = new QueryClient()
+    const protocol = Promise.resolve("v2" as const)
+    const serverAPI: ServerApi = {
+      ...api,
+      project: {
+        ...api.project,
+        list: async () => {
+          reads.push("project")
+          return []
+        },
+      },
+      provider: {
+        ...api.provider,
+        list: async () => {
+          reads.push("provider")
+          return { location: {}, data: [] }
+        },
+      },
+      model: {
+        ...api.model,
+        list: async () => {
+          reads.push("model")
+          return { location: {}, data: [] }
+        },
+        default: async () => {
+          reads.push("default")
+          return { location: {}, data: null }
+        },
+      },
+    }
+    const sdk = {} as OpencodeClient
+    const [, setGlobalStore] = createStore({
+      ready: false,
+      path: projectPath,
+      project: [] satisfies Project[],
+      provider,
+      provider_auth: {} satisfies ProviderAuthResponse,
+      config: {} satisfies Config,
+      reload: undefined as undefined | "pending" | "complete",
+    })
+
+    queryClient.setQueryData(loadGlobalConfigQuery(ServerScope.local, sdk, protocol).queryKey, {})
+    queryClient.setQueryData(loadProvidersQuery(ServerScope.local, null, serverAPI, sdk, protocol).queryKey, provider)
+    queryClient.setQueryData(loadPathQuery(ServerScope.local, null, sdk, protocol).queryKey, projectPath)
+    queryClient.setQueryData(loadProjectsQuery(ServerScope.local, serverAPI.project).queryKey, [])
+
+    const input: Parameters<typeof bootstrapGlobal>[0] = {
+      serverSDK: sdk,
+      serverAPI,
+      protocol,
+      scope: ServerScope.local,
+      requestFailedTitle: "failed",
+      translate: (key) => key,
+      formatMoreCount: String,
+      setGlobalStore,
+      queryClient,
+    }
+
+    await bootstrapGlobal(input)
+
+    expect(reads).toEqual([])
+
+    await bootstrapGlobal({ ...input, refresh: true })
+
+    expect(reads.sort()).toEqual(["default", "model", "project", "provider"])
   })
 })
 
