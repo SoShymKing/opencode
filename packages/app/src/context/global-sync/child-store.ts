@@ -305,7 +305,7 @@ export function createChildStoreManager(input: {
     const shouldBootstrap = options.bootstrap ?? true
     if (shouldBootstrap) activate(key)
     if (shouldBootstrap && childStore[0].status === "loading") {
-      input.onBootstrap(directory)
+      input.onBootstrap(key)
     }
     return childStore
   }
@@ -317,7 +317,7 @@ export function createChildStoreManager(input: {
     const shouldBootstrap = options.bootstrap ?? true
     if (shouldBootstrap) activate(key)
     if (shouldBootstrap && childStore[0].status === "loading") {
-      input.onBootstrap(directory)
+      input.onBootstrap(key)
     }
     return childStore
   }

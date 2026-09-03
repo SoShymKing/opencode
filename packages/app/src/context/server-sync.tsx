@@ -324,6 +324,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         serverSDK: serverSDK.client,
         serverAPI: serverSDK.api,
         protocol: serverSDK.protocol,
+        refresh: bootedAt !== 0,
         scope: serverSDK.scope,
         requestFailedTitle: language.t("common.requestFailed"),
         translate: language.t,

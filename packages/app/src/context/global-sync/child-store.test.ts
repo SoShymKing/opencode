@@ -107,7 +107,7 @@ describe("createChildStoreManager", () => {
     expect(manager.children[directory]).toBeDefined()
   })
 
-  test("starts new child stores as loading and bootstraps them on first access", () => {
+  test("starts new child stores as loading and bootstraps with the directory query key", () => {
     const bootstraps: string[] = []
     let manager: ReturnType<typeof createChildStoreManager> | undefined
 
@@ -132,11 +132,11 @@ describe("createChildStoreManager", () => {
     try {
       if (!manager) throw new Error("manager required")
 
-      const [store] = manager.child("/project")
+      const [store] = manager.child("C:\\Users\\JH\\opencode")
 
       expect(store.status).toBe("loading")
       expect(store.limit).toBe(5)
-      expect(bootstraps).toEqual(["/project"])
+      expect(bootstraps).toEqual(["C:/Users/JH/opencode"])
     } finally {
       dispose()
     }

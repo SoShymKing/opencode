@@ -144,6 +144,7 @@ export async function bootstrapGlobal(input: {
   serverSDK: OpencodeClient
   serverAPI: CatalogApi & { readonly project: ProjectApi }
   protocol?: Promise<ServerProtocol>
+  refresh?: boolean
   scope: ServerScope
   requestFailedTitle: string
   translate: (key: string, vars?: Record<string, string | number>) => string
@@ -151,17 +152,20 @@ export async function bootstrapGlobal(input: {
   setGlobalStore: SetStoreFunction<GlobalStore>
   queryClient: QueryClient
 }) {
+  const configQuery = loadGlobalConfigQuery(input.scope, input.serverSDK, input.protocol)
+  const providersQuery = loadProvidersQuery(input.scope, null, input.serverAPI, input.serverSDK, input.protocol)
+  const pathQuery = loadPathQuery(input.scope, null, input.serverSDK, input.protocol)
+  const projectsQuery = loadProjectsQuery(input.scope, input.serverAPI.project)
   const slow = [
-    () => input.queryClient.fetchQuery(loadGlobalConfigQuery(input.scope, input.serverSDK, input.protocol)),
+    () => (input.refresh ? input.queryClient.fetchQuery(configQuery) : input.queryClient.ensureQueryData(configQuery)),
     () =>
-      input.queryClient.fetchQuery(
-        loadProvidersQuery(input.scope, null, input.serverAPI, input.serverSDK, input.protocol),
-      ),
-    () => input.queryClient.fetchQuery(loadPathQuery(input.scope, null, input.serverSDK, input.protocol)),
+      input.refresh ? input.queryClient.fetchQuery(providersQuery) : input.queryClient.ensureQueryData(providersQuery),
+    () => (input.refresh ? input.queryClient.fetchQuery(pathQuery) : input.queryClient.ensureQueryData(pathQuery)),
     () =>
-      input.queryClient
-        .fetchQuery(loadProjectsQuery(input.scope, input.serverAPI.project))
-        .then((data) => input.setGlobalStore("project", data)),
+      (input.refresh
+        ? input.queryClient.fetchQuery(projectsQuery)
+        : input.queryClient.ensureQueryData(projectsQuery)
+      ).then((data) => input.setGlobalStore("project", data)),
   ]
   await runAll(slow)
   // showErrors({
@@ -371,13 +375,31 @@ export async function bootstrapDirectory(input: {
   const revKey = ScopedKey.from(input.scope, input.directory)
   const rev = (providerRev.get(revKey) ?? 0) + 1
   providerRev.set(revKey, rev)
-  ;(async () => {
+  const agentsQuery = loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol)
+  const pathQuery = loadPathQuery(input.scope, input.directory, input.sdk, input.protocol)
+  const referencesQuery = loadReferencesQuery(
+    input.scope,
+    input.directory,
+    input.api.reference,
+    input.sdk,
+    input.protocol,
+  )
+  const mcpQuery = loadMcpQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol)
+  const mcpResourcesQuery = loadMcpResourcesQuery(
+    input.scope,
+    input.directory,
+    input.api.mcp,
+    input.sdk,
+    input.protocol,
+  )
+  const providersQuery = loadProvidersQuery(input.scope, input.directory, input.api, input.sdk, input.protocol)
+  await (async () => {
     const slow = [
       () => Promise.resolve(input.loadSessions(input.directory)),
       () =>
-        input.queryClient
-          .ensureQueryData(loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol))
-          .then((data) => input.setStore("agent", data)),
+        (loading ? input.queryClient.ensureQueryData(agentsQuery) : input.queryClient.fetchQuery(agentsQuery)).then(
+          (data) => input.setStore("agent", data),
+        ),
       () =>
         retry(async () => {
           if ((await input.protocol) !== "v1") return
@@ -417,12 +439,12 @@ export async function bootstrapDirectory(input: {
           )),
       !seededPath &&
         (() =>
-          input.queryClient
-            .ensureQueryData(loadPathQuery(input.scope, input.directory, input.sdk, input.protocol))
-            .then((data) => {
+          (loading ? input.queryClient.ensureQueryData(pathQuery) : input.queryClient.fetchQuery(pathQuery)).then(
+            (data) => {
               const next = projectID(data.directory ?? input.directory, input.global.project)
               if (next) input.setStore("project", next)
-            })),
+            },
+          )),
       () =>
         retry(async () => {
           if ((await input.protocol) !== "v1") return
@@ -438,9 +460,7 @@ export async function bootstrapDirectory(input: {
             input.setStore("command", commands),
           )),
       () =>
-        input.queryClient.fetchQuery(
-          loadReferencesQuery(input.scope, input.directory, input.api.reference, input.sdk, input.protocol),
-        ),
+        loading ? input.queryClient.ensureQueryData(referencesQuery) : input.queryClient.fetchQuery(referencesQuery),
       () =>
         retry(() =>
           (async () => {
@@ -515,26 +535,24 @@ export async function bootstrapDirectory(input: {
         ),
       () => Promise.resolve(input.loadSessions(input.directory)),
       input.mcp &&
-        (() =>
-          input.queryClient.fetchQuery(
-            loadMcpQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol),
-          )),
+        (() => (loading ? input.queryClient.ensureQueryData(mcpQuery) : input.queryClient.fetchQuery(mcpQuery))),
       input.mcp &&
         (() =>
-          input.queryClient.fetchQuery(
-            loadMcpResourcesQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol),
-          )),
+          loading
+            ? input.queryClient.ensureQueryData(mcpResourcesQuery)
+            : input.queryClient.fetchQuery(mcpResourcesQuery)),
       () =>
-        input.queryClient
-          .fetchQuery(loadProvidersQuery(input.scope, input.directory, input.api, input.sdk, input.protocol))
-          .catch((err) => {
-            const project = getFilename(input.directory)
-            showToast({
-              variant: "error",
-              title: input.translate("toast.project.reloadFailed.title", { project }),
-              description: formatServerError(err, input.translate),
-            })
-          }),
+        (loading
+          ? input.queryClient.ensureQueryData(providersQuery)
+          : input.queryClient.fetchQuery(providersQuery)
+        ).catch((err) => {
+          const project = getFilename(input.directory)
+          showToast({
+            variant: "error",
+            title: input.translate("toast.project.reloadFailed.title", { project }),
+            description: formatServerError(err, input.translate),
+          })
+        }),
     ].filter(Boolean) as (() => Promise<any>)[]
 
     await waitForPaint()
