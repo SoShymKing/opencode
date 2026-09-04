@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { createStore } from "solid-js/store"
+import { createStore, type SetStoreFunction } from "solid-js/store"
 import { QueryClient } from "@tanstack/solid-query"
-import type { Config, OpencodeClient, Path, Project, ProviderAuthResponse } from "@opencode-ai/sdk/v2/client"
-import type { AgentApi, CatalogApi, CommandApi, ReferenceApi } from "@opencode-ai/client/promise"
+import {
+  createOpencodeClient,
+  type Config,
+  type Path,
+  type Project,
+  type ProviderAuthResponse,
+  type VcsInfo,
+} from "@opencode-ai/sdk/v2/client"
+import { OpenCode } from "@opencode-ai/client/promise"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import {
   bootstrapGlobal,
@@ -18,27 +25,55 @@ import {
 import type { State, VcsCache } from "./types"
 import { ServerScope } from "@/utils/server-scope"
 import type { ServerApi } from "@/utils/server"
+import { ServerConnection } from "@/context/server"
 
 type ProjectApi = ServerApi["project"]
+type DirectoryApi = Parameters<typeof bootstrapDirectory>[0]["api"]
+type GlobalStore =
+  Parameters<typeof bootstrapGlobal>[0]["setGlobalStore"] extends SetStoreFunction<infer Store> ? Store : never
 
 const provider = { all: new Map(), connected: [], default: {} } satisfies NormalizedProviderListResponse
 const projectPath = { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" } satisfies Path
-const api = {
-  agent: { list: async () => ({ location: {}, data: [] }) },
-  provider: { list: async () => ({ location: {}, data: [] }) },
+const project = {
+  id: "project",
+  worktree: "/project",
+  time: { created: 0, updated: 0 },
+  sandboxes: [],
+} satisfies Project
+const location = { directory: "/project", project: { id: "project", directory: "/project" } }
+const baseApi = OpenCode.make({ baseUrl: "http://localhost" })
+const api: DirectoryApi = {
+  ...baseApi,
+  agent: { ...baseApi.agent, list: async () => ({ location, data: [] }) },
+  provider: { ...baseApi.provider, list: async () => ({ location, data: [] }) },
   model: {
-    list: async () => ({ location: {}, data: [] }),
-    default: async () => ({ location: {}, data: null }),
+    ...baseApi.model,
+    list: async () => ({ location, data: [] }),
+    default: async () => ({ location, data: null }),
   },
-  permission: { request: { list: async () => ({ location: {}, data: [] }) } },
+  permission: { ...baseApi.permission, request: { list: async () => ({ location, data: [] }) } },
   project: {
+    ...baseApi.project,
     list: async () => [],
     current: async () => ({ id: "project", directory: "/project" }),
   },
-  question: { request: { list: async () => ({ location: {}, data: [] }) } },
-  reference: { list: async () => ({ location: {}, data: [] }) },
-  vcs: { get: async () => ({ location: {}, data: {} }) },
-} as unknown as ServerApi
+  question: { ...baseApi.question, request: { list: async () => ({ location, data: [] }) } },
+  reference: { ...baseApi.reference, list: async () => ({ location, data: [] }) },
+  vcs: Object.assign({ ...baseApi.vcs }, { get: async () => ({ location, data: {} }) }),
+}
+
+function testFetch(respond: (request: Request) => Promise<Response>): typeof fetch {
+  return Object.assign(
+    (request: RequestInfo | URL, options?: RequestInit) =>
+      respond(request instanceof Request ? request : new Request(request, options)),
+    { preconnect: fetch.preconnect },
+  )
+}
+
+function vcsCache() {
+  const [store, setStore] = createStore<{ value: VcsInfo | undefined }>({ value: undefined })
+  return { store, setStore, ready: () => true } satisfies VcsCache
+}
 
 function directoryState() {
   return createStore<State>({
@@ -83,47 +118,47 @@ describe("bootstrapDirectory", () => {
     const started = Promise.withResolvers<void>()
     const [store, setStore] = directoryState()
     const queryClient = new QueryClient()
-    const nextApi: ServerApi = {
+    const nextApi: DirectoryApi = {
       ...api,
       agent: {
         ...api.agent,
         list: async () => {
           reads.push("agent")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
       },
       command: {
         ...api.command,
-        list: async () => ({ location: {}, data: [] }),
+        list: async () => ({ location, data: [] }),
       },
       provider: {
         ...api.provider,
         list: async () => {
           reads.push("provider")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
       },
       model: {
         ...api.model,
         list: async () => {
           reads.push("model")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
         default: async () => {
           reads.push("default")
-          return { location: {}, data: null }
+          return { location, data: null }
         },
       },
       mcp: {
         ...api.mcp,
         list: async () => {
           reads.push("mcp")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
         resource: {
           catalog: async () => {
             reads.push("resource")
-            return { location: {}, data: { resources: [], templates: [] } }
+            return { location, data: { resources: [], templates: [] } }
           },
         },
       },
@@ -131,7 +166,7 @@ describe("bootstrapDirectory", () => {
         ...api.reference,
         list: async () => {
           started.resolve()
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
       },
     }
@@ -148,14 +183,14 @@ describe("bootstrapDirectory", () => {
       global: {
         config: {},
         path: projectPath,
-        project: [{ id: "project", worktree: "/project" } as Project],
+        project: [project],
         provider,
       },
-      sdk: {} as OpencodeClient,
+      sdk: createOpencodeClient(),
       api: nextApi,
       store,
       setStore,
-      vcsCache: { setStore() {} } as unknown as VcsCache,
+      vcsCache: vcsCache(),
       loadSessions() {},
       translate: (key) => key,
       queryClient,
@@ -185,14 +220,14 @@ describe("bootstrapDirectory", () => {
       global: {
         config: {},
         path: projectPath,
-        project: [{ id: "project", worktree: "/project" } as Project],
+        project: [project],
         provider,
       },
-      sdk: {} as OpencodeClient,
+      sdk: createOpencodeClient(),
       api,
       store,
       setStore,
-      vcsCache: { setStore() {} } as unknown as VcsCache,
+      vcsCache: vcsCache(),
       loadSessions: () => loading.promise,
       translate: (key) => key,
       queryClient: new QueryClient(),
@@ -222,48 +257,29 @@ describe("bootstrapDirectory", () => {
       global: {
         config: {} satisfies Config,
         path: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
-        project: [{ id: "project", worktree: "/project" } as Project],
+        project: [project],
         provider,
       },
-      sdk: {
-        app: { agents: async () => ({ data: [{ name: "build", mode: "primary" }] }) },
-        config: {
-          get: async () => {
-            legacyConfigReads.push("directory")
-            return { data: {} }
-          },
-        },
-        session: { status: async () => ({ data: {} }) },
-        vcs: { get: async () => ({ data: undefined }) },
-        command: {
-          list: async () => {
-            mcpReads.push("command")
-            return { data: [] }
-          },
-        },
-        permission: { list: async () => ({ data: [] }) },
-        question: { list: async () => ({ data: [] }) },
-        v2: { reference: { list: async () => ({ data: { data: [] } }) } },
-        mcp: {
-          status: async () => {
-            mcpReads.push("status")
-            return { data: {} }
-          },
-        },
-        experimental: {
-          resource: {
-            list: async () => {
-              mcpReads.push("resource")
-              return { data: {} }
-            },
-          },
-        },
-        provider: { list: async () => ({ data: { all: [], connected: [], default: {} } }) },
-      } as unknown as OpencodeClient,
+      sdk: createOpencodeClient({
+        baseUrl: "http://localhost",
+        fetch: testFetch(async (request) => {
+          const pathname = new URL(request.url).pathname
+          if (pathname === "/config") legacyConfigReads.push("directory")
+          if (pathname === "/command") mcpReads.push("command")
+          if (pathname === "/mcp") mcpReads.push("status")
+          if (pathname.includes("resource")) mcpReads.push("resource")
+          if (pathname === "/agent") return Response.json([{ name: "build", mode: "primary" }])
+          if (pathname === "/provider") return Response.json({ all: [], connected: [], default: {} })
+          if (pathname.includes("reference")) return Response.json({ data: [] })
+          if (pathname === "/command" || pathname.includes("permission") || pathname.includes("question"))
+            return Response.json([])
+          return Response.json({})
+        }),
+      }),
       api,
       store,
       setStore,
-      vcsCache: { setStore() {} } as unknown as VcsCache,
+      vcsCache: vcsCache(),
       loadSessions() {},
       translate: (key) => key,
       queryClient: new QueryClient(),
@@ -285,20 +301,19 @@ describe("bootstrapDirectory", () => {
       global: {
         config: {} satisfies Config,
         path: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
-        project: [{ id: "project", worktree: "/project" } as Project],
+        project: [project],
         provider,
       },
-      sdk: {
-        config: {
-          get: async () => {
-            throw new Error("legacy directory config should not be called")
-          },
-        },
-      } as unknown as OpencodeClient,
+      sdk: createOpencodeClient({
+        baseUrl: "http://localhost",
+        fetch: testFetch(async () => {
+          throw new Error("legacy directory config should not be called")
+        }),
+      }),
       api,
       store,
       setStore,
-      vcsCache: { setStore() {} } as unknown as VcsCache,
+      vcsCache: vcsCache(),
       loadSessions() {},
       translate: (key) => key,
       queryClient: new QueryClient(),
@@ -314,10 +329,10 @@ describe("bootstrapGlobal", () => {
     const reads: string[] = []
     const queryClient = new QueryClient()
     const protocol = Promise.resolve("v2" as const)
-    const serverAPI: ServerApi = {
+    const serverAPI: Parameters<typeof bootstrapGlobal>[0]["serverAPI"] = {
       ...api,
       project: {
-        ...api.project,
+        ...baseApi.project,
         list: async () => {
           reads.push("project")
           return []
@@ -327,30 +342,30 @@ describe("bootstrapGlobal", () => {
         ...api.provider,
         list: async () => {
           reads.push("provider")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
       },
       model: {
         ...api.model,
         list: async () => {
           reads.push("model")
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
         default: async () => {
           reads.push("default")
-          return { location: {}, data: null }
+          return { location, data: null }
         },
       },
     }
-    const sdk = {} as OpencodeClient
-    const [, setGlobalStore] = createStore({
+    const sdk = createOpencodeClient()
+    const [, setGlobalStore] = createStore<GlobalStore>({
       ready: false,
       path: projectPath,
       project: [] satisfies Project[],
       provider,
       provider_auth: {} satisfies ProviderAuthResponse,
       config: {} satisfies Config,
-      reload: undefined as undefined | "pending" | "complete",
+      reload: undefined,
     })
 
     queryClient.setQueryData(loadGlobalConfigQuery(ServerScope.local, sdk, protocol).queryKey, {})
@@ -382,15 +397,12 @@ describe("bootstrapGlobal", () => {
 
 describe("config queries", () => {
   test("skips legacy global config for v2 servers", async () => {
-    const sdk = {
-      global: {
-        config: {
-          get: async () => {
-            throw new Error("legacy global config should not be called")
-          },
-        },
-      },
-    } as unknown as OpencodeClient
+    const sdk = createOpencodeClient({
+      baseUrl: "http://localhost",
+      fetch: testFetch(async () => {
+        throw new Error("legacy global config should not be called")
+      }),
+    })
 
     const result = await new QueryClient().fetchQuery(
       loadGlobalConfigQuery(ServerScope.local, sdk, Promise.resolve("v2")),
@@ -402,16 +414,13 @@ describe("config queries", () => {
   test("loads legacy global config for v1 servers", async () => {
     const calls: string[] = []
     const config = { shell: "zsh" } satisfies Config
-    const sdk = {
-      global: {
-        config: {
-          get: async () => {
-            calls.push("global")
-            return { data: config }
-          },
-        },
-      },
-    } as unknown as OpencodeClient
+    const sdk = createOpencodeClient({
+      baseUrl: "http://localhost",
+      fetch: testFetch(async () => {
+        calls.push("global")
+        return Response.json(config)
+      }),
+    })
 
     const result = await new QueryClient().fetchQuery(
       loadGlobalConfigQuery(ServerScope.local, sdk, Promise.resolve("v1")),
@@ -424,9 +433,8 @@ describe("config queries", () => {
 
 describe("query keys", () => {
   test("partitions identical directories by server scope", () => {
-    const client = {} as Parameters<typeof loadPathQuery>[2]
-    const api = {} as CatalogApi
-    const remote = "https://debian.example" as typeof ServerScope.local
+    const client = createOpencodeClient()
+    const remote = ServerScope.fromServerKey(ServerConnection.Key.make("https://debian.example"))
 
     expect([...loadPathQuery(ServerScope.local, "/repo", client).queryKey]).toEqual(["local", "/repo", "path"])
     expect([...loadPathQuery(remote, "/repo", client).queryKey]).toEqual(["https://debian.example", "/repo", "path"])
@@ -437,22 +445,24 @@ describe("query keys", () => {
     const calls: unknown[] = []
     const api = {
       provider: {
+        ...baseApi.provider,
         list: async (input: unknown) => {
           calls.push(["provider", input])
-          return { location: {}, data: [{ id: "openai", name: "OpenAI", package: "@ai-sdk/openai" }] }
+          return { location, data: [{ id: "openai", name: "OpenAI", package: "@ai-sdk/openai" }] }
         },
       },
       model: {
+        ...baseApi.model,
         list: async (input: unknown) => {
           calls.push(["model", input])
-          return { location: {}, data: [] }
+          return { location, data: [] }
         },
         default: async (input: unknown) => {
           calls.push(["default", input])
-          return { location: {}, data: null }
+          return { location, data: null }
         },
       },
-    } as unknown as CatalogApi
+    } satisfies Parameters<typeof loadProvidersQuery>[2]
 
     const result = await new QueryClient().fetchQuery(loadProvidersQuery(ServerScope.local, "/repo", api))
 
@@ -469,9 +479,9 @@ describe("query keys", () => {
     const api = {
       list: async (input: unknown) => {
         calls.push(input)
-        return { location: {}, data: [] }
+        return { location, data: [] }
       },
-    } as unknown as AgentApi
+    } satisfies Parameters<typeof loadAgentsQuery>[2]
 
     const result = await new QueryClient().fetchQuery(loadAgentsQuery(ServerScope.local, "/repo", api))
 
@@ -485,11 +495,11 @@ describe("query keys", () => {
       list: async (input: unknown) => {
         calls.push(input)
         return {
-          location: {},
+          location,
           data: [{ name: "review", template: "Review files" /* source: "command" as const */ }],
         }
       },
-    } as unknown as CommandApi
+    } satisfies Parameters<typeof loadCommands>[1]
 
     const result = await loadCommands("/repo", api)
 
@@ -499,11 +509,12 @@ describe("query keys", () => {
 
   test("loads projects from the current endpoint", async () => {
     const api = {
+      ...baseApi.project,
       list: async () => [
         { id: "b", worktree: "/b", time: { created: 1, updated: 1 }, sandboxes: [] },
         { id: "a", worktree: "/a", time: { created: 1, updated: 1 }, sandboxes: [] },
       ],
-    } as unknown as ProjectApi
+    } satisfies ProjectApi
 
     const result = await new QueryClient().fetchQuery(loadProjectsQuery(ServerScope.local, api))
 
@@ -512,12 +523,17 @@ describe("query keys", () => {
 
   test("loads references from the current location-scoped endpoint", async () => {
     const calls: unknown[] = []
+    const reference: Awaited<ReturnType<Parameters<typeof loadReferencesQuery>[2]["list"]>>["data"][number] = {
+      name: "AGENTS.md",
+      path: "/repo/AGENTS.md",
+      source: { type: "local", path: "/repo/AGENTS.md" },
+    }
     const api = {
       list: async (input: unknown) => {
         calls.push(input)
-        return { location: {}, data: [{ name: "AGENTS.md", path: "/repo/AGENTS.md", source: "instructions" }] }
+        return { location, data: [reference] }
       },
-    } as unknown as ReferenceApi
+    } satisfies Parameters<typeof loadReferencesQuery>[2]
 
     const result = await new QueryClient().fetchQuery(loadReferencesQuery(ServerScope.local, "/repo", api))
 
