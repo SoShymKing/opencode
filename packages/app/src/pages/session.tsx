@@ -47,7 +47,6 @@ import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
-import { ModelsProvider } from "@/context/models"
 import { useNotification } from "@/context/notification"
 import { PromptProvider, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
@@ -60,7 +59,6 @@ import { useTabs } from "@/context/tabs"
 import { TerminalProvider, useTerminal } from "@/context/terminal"
 import { PromptInput } from "@/components/prompt-input"
 import { PromptInputV2Composer, usePromptInputV2Controller } from "@/components/prompt-input-v2"
-import { useSettingsCommand } from "@/components/settings-dialog"
 import { setCursorPosition } from "@/components/prompt-input/editor-dom"
 import { promptLength } from "@/components/prompt-input/history"
 import { type FollowupDraft, sendFollowupDraft } from "@/components/prompt-input/submit"
@@ -158,23 +156,14 @@ export function SessionPage() {
 // workspace-scoped state (terminal, directory providers) lives below.
 export function TargetSessionRouteContent() {
   const params = useParams<{ serverKey: string; id: string }>()
-  const serverSync = useServerSync()
-  const directory = createMemo(() => serverSync().session.lineage.peek(params.id)?.session.directory)
   return (
-    // Settings must keep the target-server SDK, sync, and models context and remain registered
-    // when session content falls back to the route error boundary.
-    <TargetServerScopedProviders directory={directory} sessionID={() => params.id}>
-      <TargetSessionSettingsCommand />
+    <>
+      <MarkSessionNotificationsViewed sessionID={() => params.id} />
       <SessionRouteErrorBoundary sessionID={params.id} serverKey={requireServerKey(params.serverKey)} padded>
         <ResolvedTargetSessionRoute />
       </SessionRouteErrorBoundary>
-    </TargetServerScopedProviders>
+    </>
   )
-}
-
-function TargetSessionSettingsCommand() {
-  useSettingsCommand()
-  return null
 }
 
 export function SessionRouteErrorBoundary(
@@ -289,17 +278,6 @@ function TargetSessionPage() {
     <Show when={`${serverSDK().scope}\0${sdk().directory}`} keyed>
       <SessionPage />
     </Show>
-  )
-}
-
-function TargetServerScopedProviders(
-  props: ParentProps<{ directory?: () => string | undefined; sessionID?: () => string | undefined }>,
-) {
-  return (
-    <>
-      <MarkSessionNotificationsViewed sessionID={props.sessionID} />
-      <ModelsProvider directory={props.directory}>{props.children}</ModelsProvider>
-    </>
   )
 }
 

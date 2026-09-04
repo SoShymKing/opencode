@@ -3,7 +3,6 @@ import * as Sentry from "@sentry/solid"
 import { I18nProvider } from "@opencode-ai/ui/context"
 import { DialogProvider } from "@opencode-ai/ui/context/dialog"
 import { FileComponentProvider } from "@opencode-ai/ui/context/file"
-import { File } from "@opencode-ai/session-ui/file"
 import { Font } from "@opencode-ai/ui/font"
 import { Splash } from "@opencode-ai/ui/logo"
 import { ThemeProvider } from "@opencode-ai/ui/theme/context"
@@ -12,6 +11,7 @@ import { type BaseRouterProps, Navigate, Route, Router, useNavigate, useParams, 
 import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
 import { Effect } from "effect"
 import { base64Encode } from "@opencode-ai/core/util/encode"
+import { useSettingsCommand } from "@/components/settings-dialog"
 import {
   type Component,
   createEffect,
@@ -55,11 +55,18 @@ import { useCheckServerHealth } from "./utils/server-health"
 import { legacySessionHref, legacySessionServer, requireServerKey, sessionHref } from "./utils/session-route"
 import { createSessionLineage } from "@/pages/session/session-lineage"
 
-import { SessionPage, SessionRouteErrorBoundary, TargetSessionRouteContent } from "@/pages/session"
 import { NewHome } from "@/pages/home"
 import { LegacyHome } from "@/pages/home/legacy-home"
 
+const File = lazy(() => import("@opencode-ai/session-ui/file").then((module) => ({ default: module.File })))
 const NewSession = lazy(() => import("@/pages/new-session"))
+const SessionPage = lazy(() => import("@/pages/session").then((module) => ({ default: module.SessionPage })))
+const SessionRouteErrorBoundary = lazy(() =>
+  import("@/pages/session").then((module) => ({ default: module.SessionRouteErrorBoundary })),
+)
+const TargetSessionRouteContent = lazy(() =>
+  import("@/pages/session").then((module) => ({ default: module.TargetSessionRouteContent })),
+)
 
 const SessionRoute = () => {
   const settings = useSettings()
@@ -119,9 +126,27 @@ function TargetServerRoute(props: ParentProps) {
 
 const TargetSessionRoute = () => (
   <TargetServerRoute>
-    <TargetSessionRouteContent />
+    <TargetSessionRouteShell />
   </TargetServerRoute>
 )
+
+function TargetSessionRouteShell() {
+  const params = useParams<{ id: string }>()
+  const serverSync = useServerSync()
+  const directory = createMemo(() => serverSync().session.lineage.peek(params.id)?.session.directory)
+
+  return (
+    <ModelsProvider directory={directory}>
+      <TargetSessionSettingsCommand />
+      <TargetSessionRouteContent />
+    </ModelsProvider>
+  )
+}
+
+function TargetSessionSettingsCommand() {
+  useSettingsCommand()
+  return null
+}
 
 function LegacyTargetSessionRoute() {
   const params = useParams<{ serverKey: string; id: string }>()
