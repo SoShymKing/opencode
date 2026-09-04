@@ -1,13 +1,15 @@
 import { beforeAll, describe, expect, mock, test } from "bun:test"
 import { createRoot, getOwner, type Owner } from "solid-js"
-import { createStore } from "solid-js/store"
+import { queryOptions } from "@tanstack/solid-query"
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
-import type { State } from "./types"
+import type { Agent, Config, LspStatus, Path, Project, ReferenceInfo } from "@opencode-ai/sdk/v2/client"
+import type { McpResource, McpServer } from "@opencode-ai/client/promise"
 import type { QueryOptionsApi } from "../server-sync"
 import { ServerScope } from "@/utils/server-scope"
+import type { PathKey } from "@/utils/path-key"
 
 let createChildStoreManager: typeof import("./child-store").createChildStoreManager
-const querySingles: Array<() => { queryKey?: unknown[]; enabled?: boolean }> = []
+const querySingles: Array<() => { queryKey?: readonly unknown[]; enabled?: boolean }> = []
 const persist: typeof import("@/utils/persist").persisted = (_target, store) => [
   store[0],
   store[1],
@@ -15,30 +17,66 @@ const persist: typeof import("@/utils/persist").persisted = (_target, store) => 
   Object.assign(() => true, { promise: undefined }),
 ]
 
-const child = () => createStore({} as State)
 const provider = { all: new Map(), connected: [], default: {} } satisfies NormalizedProviderListResponse
 
 const queryOptionsApi = {
-  globalConfig: () => ({ queryKey: ["globalConfig"], queryFn: async () => ({}) }),
-  projects: () => ({ queryKey: ["projects"], queryFn: async () => [] }),
-  providers: (directory: string | null) => ({ queryKey: [directory, "providers"], queryFn: async () => provider }),
-  path: (directory: string | null) => ({
-    queryKey: [directory, "path"],
-    queryFn: async () => ({
-      state: "",
-      config: "",
-      worktree: "",
-      directory: directory ?? "",
-      home: "",
+  globalConfig: () =>
+    queryOptions<Config, Error, Config, string[]>({
+      queryKey: [ServerScope.local, "config"],
+      queryFn: async () => ({}),
     }),
-  }),
-  agents: (directory: string) => ({ queryKey: [directory, "agents"], queryFn: async () => [] }),
-  mcp: (directory: string) => ({ queryKey: [directory, "mcp"], queryFn: async () => ({}) }),
-  mcpResources: (directory: string) => ({ queryKey: [directory, "mcpResources"], queryFn: async () => ({}) }),
-  lsp: (directory: string) => ({ queryKey: [directory, "lsp"], queryFn: async () => [] }),
-  references: (directory: string) => ({ queryKey: [directory, "references"], queryFn: async () => [] }),
-  sessions: (directory: string) => ({ queryKey: [directory, "loadSessions"] as const }),
-} as unknown as QueryOptionsApi
+  projects: () =>
+    queryOptions<Project[], Error, Project[], string[]>({
+      queryKey: [ServerScope.local, "project"],
+      queryFn: async () => [],
+    }),
+  providers: (directory: PathKey | null) =>
+    queryOptions<NormalizedProviderListResponse, Error, NormalizedProviderListResponse, (string | null)[]>({
+      queryKey: [ServerScope.local, directory, "providers"],
+      queryFn: async () => provider,
+    }),
+  path: (directory: PathKey | null) =>
+    queryOptions<Path>({
+      queryKey: [ServerScope.local, directory, "path"],
+      queryFn: async () => ({
+        state: "",
+        config: "",
+        worktree: "",
+        directory: directory ?? "",
+        home: "",
+      }),
+    }),
+  agents: (directory: PathKey) =>
+    queryOptions<Agent[], Error, Agent[], string[]>({
+      queryKey: [ServerScope.local, directory, "agents"],
+      queryFn: async () => [],
+    }),
+  mcp: (directory: PathKey) =>
+    queryOptions<
+      Record<string, McpServer["status"]>,
+      Error,
+      Record<string, McpServer["status"]>,
+      readonly [ServerScope, string, "mcp"]
+    >({ queryKey: [ServerScope.local, directory, "mcp"], queryFn: async () => ({}) }),
+  mcpResources: (directory: PathKey) =>
+    queryOptions<
+      Record<string, McpResource>,
+      Error,
+      Record<string, McpResource>,
+      readonly [ServerScope, string, "mcpResources"]
+    >({ queryKey: [ServerScope.local, directory, "mcpResources"], queryFn: async () => ({}) }),
+  lsp: (directory: PathKey) =>
+    queryOptions<LspStatus[], Error, LspStatus[], readonly [ServerScope, string, "lsp"]>({
+      queryKey: [ServerScope.local, directory, "lsp"],
+      queryFn: async () => [],
+    }),
+  references: (directory: PathKey) =>
+    queryOptions<ReferenceInfo[]>({
+      queryKey: [ServerScope.local, directory, "references"],
+      queryFn: async () => [],
+    }),
+  sessions: (directory: PathKey) => ({ queryKey: [ServerScope.local, directory, "loadSessions"] as const }),
+} satisfies QueryOptionsApi
 
 function createOwner(callback: (owner: Owner) => void) {
   return createRoot((dispose) => {
@@ -52,17 +90,17 @@ function createOwner(callback: (owner: Owner) => void) {
 
 beforeAll(async () => {
   mock.module("@tanstack/solid-query", () => ({
-    useQuery: (options: () => { queryKey?: unknown[]; enabled?: boolean }) => {
+    useQuery: (options: () => { queryKey?: readonly unknown[]; enabled?: boolean }) => {
       querySingles.push(options)
       return {
         get isLoading() {
-          return options().queryKey?.[1] === "path"
+          return options().queryKey?.[2] === "path"
         },
         get data() {
-          if (options().queryKey?.[1] === "path") throw new Error("pending path data read")
-          if (options().queryKey?.[1] === "mcp") return options().enabled ? { demo: { status: "disabled" } } : undefined
-          if (options().queryKey?.[1] === "lsp") return []
-          if (options().queryKey?.[1] === "providers") return provider
+          if (options().queryKey?.[2] === "path") throw new Error("pending path data read")
+          if (options().queryKey?.[2] === "mcp") return options().enabled ? { demo: { status: "disabled" } } : undefined
+          if (options().queryKey?.[2] === "lsp") return []
+          if (options().queryKey?.[2] === "providers") return provider
           return undefined
         },
       }
@@ -74,37 +112,39 @@ beforeAll(async () => {
 
 describe("createChildStoreManager", () => {
   test("does not evict the active directory during mark", () => {
-    const owner = createRoot((dispose) => {
-      const current = getOwner()
+    let manager: ReturnType<typeof createChildStoreManager> | undefined
+    const dispose = createOwner((owner) => {
+      manager = createChildStoreManager({
+        owner,
+        scope: ServerScope.local,
+        persist,
+        isBooting: () => false,
+        isLoadingSessions: () => false,
+        onBootstrap() {},
+        onMcp() {},
+        onDispose() {},
+        translate: (key) => key,
+        queryOptions: queryOptionsApi,
+        global: { provider },
+      })
+    })
+
+    try {
+      if (!manager) throw new Error("manager required")
+      const activeManager = manager
+      Array.from({ length: 30 }, (_, index) => `/pinned-${index}`).forEach((directory) => {
+        activeManager.ensureChild(directory)
+        activeManager.pin(directory)
+      })
+
+      const directory = "/active"
+      activeManager.ensureChild(directory)
+      activeManager.mark(directory)
+
+      expect(activeManager.children[directory]).toBeDefined()
+    } finally {
       dispose()
-      return current
-    })
-    if (!owner) throw new Error("owner required")
-
-    const manager = createChildStoreManager({
-      owner,
-      scope: ServerScope.local,
-      persist,
-      isBooting: () => false,
-      isLoadingSessions: () => false,
-      onBootstrap() {},
-      onMcp() {},
-      onDispose() {},
-      translate: (key) => key,
-      queryOptions: queryOptionsApi,
-      global: { provider },
-    })
-
-    Array.from({ length: 30 }, (_, index) => `/pinned-${index}`).forEach((directory) => {
-      manager.children[directory] = child()
-      manager.pin(directory)
-    })
-
-    const directory = "/active"
-    manager.children[directory] = child()
-    manager.mark(directory)
-
-    expect(manager.children[directory]).toBeDefined()
+    }
   })
 
   test("starts new child stores as loading and bootstraps with the directory query key", () => {

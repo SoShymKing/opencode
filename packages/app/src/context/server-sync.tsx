@@ -9,7 +9,7 @@ import type {
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { type Accessor, batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
-import { createStore, produce, reconcile } from "solid-js/store"
+import { createStore, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
 import { ServerSDK } from "./server-sdk"
@@ -43,7 +43,6 @@ import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
-import { retry } from "@opencode-ai/core/util/retry"
 import type { ServerScope } from "@/utils/server-scope"
 import { createHomeSessionIndexCache } from "./global-sync/home-session-index"
 import { persisted } from "@/utils/persist"
@@ -309,14 +308,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     setGlobalStore("project", next)
   }
 
-  const setBootStore = ((...input: unknown[]) => {
-    if (input[0] === "project" && Array.isArray(input[1])) {
-      setProjects(input[1] as Project[])
-      return input[1]
-    }
-    return (setGlobalStore as (...args: unknown[]) => unknown)(...input)
-  }) as typeof setGlobalStore
-
   const bootstrap = useQuery(() => ({
     queryKey: [serverSDK.scope, "bootstrap"],
     queryFn: async () => {
@@ -329,21 +320,13 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         requestFailedTitle: language.t("common.requestFailed"),
         translate: language.t,
         formatMoreCount: (count) => language.t("common.moreCountSuffix", { count }),
-        setGlobalStore: setBootStore,
+        setGlobalStore,
         queryClient,
       })
       bootedAt = Date.now()
       return bootedAt
     },
   }))
-
-  const set = ((...input: unknown[]) => {
-    if (input[0] === "project" && (Array.isArray(input[1]) || typeof input[1] === "function")) {
-      setProjects(input[1] as Project[] | ((draft: Project[]) => Project[]))
-      return input[1]
-    }
-    return (setGlobalStore as (...args: unknown[]) => unknown)(...input)
-  }) as typeof setGlobalStore
 
   const paused = () => untrack(() => globalStore.reload) !== undefined
 
@@ -552,7 +535,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         project: globalStore.project,
         refresh: () => {
           if (recent) return
-          bootstrap.refetch()
+          void bootstrap.refetch()
         },
         setGlobalProject: setProjects,
       })
@@ -562,7 +545,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         eventType === "agent.updated" ||
         eventType === "project.directories.updated"
       )
-        bootstrap.refetch()
+        void bootstrap.refetch()
       if (eventType === "server.connected" || eventType === "global.disposed") {
         if (recent) return
         for (const directory of Object.keys(children.children)) {
@@ -661,11 +644,11 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const updateConfigMutation = useMutation(() => ({
     mutationFn: (config: Config) => serverSDK.client.global.config.update({ config }),
     onSuccess: () => {
-      bootstrap.refetch()
+      void bootstrap.refetch()
       // Invalidate all provider queries so newly configured custom providers
       // appear immediately in the available provider list across all directories.
-      queryClient.invalidateQueries({ queryKey: [serverSDK.scope, null, "providers"] })
-      queryClient.invalidateQueries({
+      void queryClient.invalidateQueries({ queryKey: [serverSDK.scope, null, "providers"] })
+      void queryClient.invalidateQueries({
         predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
       })
     },
@@ -673,7 +656,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   return {
     data: globalStore,
-    set,
+    set: setGlobalStore,
     get ready() {
       return globalStore.ready
     },
@@ -738,7 +721,7 @@ export function createServerSyncContext(serverSDK: ServerSDK) {
 
 export type ServerSync = ReturnType<typeof createServerSyncContext>
 
-export const { use: useServerSync, provider: ServerSyncProvider } = createSimpleContext({
+const serverSyncContext = createSimpleContext({
   name: "ServerSync",
   // Returns an accessor so the resolved server can change reactively without
   // re-instantiating the subtree (mirrors useServerSDK).
@@ -754,6 +737,9 @@ export const { use: useServerSync, provider: ServerSyncProvider } = createSimple
     })
   },
 })
+
+export const useServerSync = () => serverSyncContext.use()
+export const ServerSyncProvider = serverSyncContext.provider
 
 export function useQueryOptions() {
   const sync = useServerSync()

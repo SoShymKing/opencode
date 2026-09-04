@@ -2,10 +2,8 @@ import type {
   Config,
   OpencodeClient,
   Path,
-  PermissionRequest,
   Project,
   ProviderAuthResponse,
-  QuestionRequest,
   ReferenceInfo,
   Session,
 } from "@opencode-ai/sdk/v2/client"
@@ -85,24 +83,8 @@ export function clearProviderRev(scope: ServerScope, directory: string) {
   providerRev.delete(ScopedKey.from(scope, directory))
 }
 
-function runAll(list: Array<() => Promise<unknown>>) {
-  return Promise.allSettled(list.map((item) => item()))
-}
-
-function showErrors(input: {
-  errors: unknown[]
-  title: string
-  translate: (key: string, vars?: Record<string, string | number>) => string
-  formatMoreCount: (count: number) => string
-}) {
-  if (input.errors.length === 0) return
-  const message = formatServerError(input.errors[0], input.translate)
-  const more = input.errors.length > 1 ? input.formatMoreCount(input.errors.length - 1) : ""
-  showToast({
-    variant: "error",
-    title: input.title,
-    description: message + more,
-  })
+function runAll(list: Array<false | (() => Promise<unknown>)>) {
+  return Promise.allSettled(list.filter((item) => item !== false).map((item) => item()))
 }
 
 export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, protocol?: Promise<ServerProtocol>) =>
@@ -168,12 +150,6 @@ export async function bootstrapGlobal(input: {
       ).then((data) => input.setGlobalStore("project", data)),
   ]
   await runAll(slow)
-  // showErrors({
-  //   errors: errors(),
-  //   title: input.requestFailedTitle,
-  //   translate: input.translate,
-  //   formatMoreCount: input.formatMoreCount,
-  // })
 }
 
 function groupBySession<T extends { id: string; sessionID: string }>(input: T[]) {
@@ -506,9 +482,7 @@ export async function bootstrapDirectory(input: {
               .then((result) => result.data)
           })().then((questions) => {
             const ids = questions.map((question) => question.sessionID)
-            const grouped = groupBySession(
-              questions.filter((question) => !!question.id && !!question.sessionID) as QuestionRequest[],
-            )
+            const grouped = groupBySession(questions.filter((question) => !!question.id && !!question.sessionID))
             const warm = input.session
               ? Promise.all(ids.map((sessionID) => input.session!.resolve(sessionID))).then(() => undefined)
               : warmSessions({ ids, store: input.store, setStore: input.setStore, api: input.api.session })
@@ -553,7 +527,7 @@ export async function bootstrapDirectory(input: {
             description: formatServerError(err, input.translate),
           })
         }),
-    ].filter(Boolean) as (() => Promise<any>)[]
+    ]
 
     await waitForPaint()
     const slowErrs = errors(await runAll(slow))
