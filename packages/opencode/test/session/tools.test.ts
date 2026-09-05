@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import type { CallToolResult, Tool as MCPToolDef } from "@modelcontextprotocol/sdk/types.js"
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Agent } from "@/agent/agent"
@@ -38,8 +38,8 @@ const message = {
   cost: 0,
   tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
 } satisfies SessionV1.Assistant
-const agent: Agent.Info = { name: "build", mode: "primary", options: {}, permission: [] }
-const session: Session.Info = {
+const outputAgent: Agent.Info = { name: "build", mode: "primary", options: {}, permission: [] }
+const outputSession: Session.Info = {
   id: sessionID,
   slug: "tools-test",
   projectID: ProjectV2.ID.make("tools-test"),
@@ -62,7 +62,7 @@ const mcpDefinition = {
   name: "raw",
   description: "MCP test tool",
   inputSchema: { type: "object", properties: {} },
-} satisfies MCPToolDef
+} satisfies import("@modelcontextprotocol/sdk/types.js").Tool
 const trigger: Plugin.Interface["trigger"] = (name, _input, output) => {
   if (name === "tool.execute.after" && isRecord(output) && output.output === INITIAL_OUTPUT) {
     Object.assign(output, { output: EXPANDED_OUTPUT })
@@ -70,7 +70,7 @@ const trigger: Plugin.Interface["trigger"] = (name, _input, output) => {
   return Effect.succeed(output)
 }
 
-const it = testEffect(
+const outputIt = testEffect(
   Layer.mergeAll(
     Layer.mock(Plugin.Service, { trigger }),
     Layer.mock(Permission.Service, { ask: () => Effect.void }),
@@ -89,10 +89,10 @@ const it = testEffect(
   ),
 )
 
-const input = {
-  agent,
+const outputInput = {
+  agent: outputAgent,
   model: selectedModel,
-  session,
+  session: outputSession,
   processor: {
     message,
     updateToolCall: () => Effect.succeed(undefined),
@@ -107,29 +107,29 @@ const input = {
   },
 }
 
-const execute = Effect.fn("test.executeTool")(function* (name: string) {
-  const tools = yield* resolveWithBridge(input, yield* EffectBridge.make())
+const executeOutputTool = Effect.fn("test.executeTool")(function* (name: string) {
+  const tools = yield* resolveWithBridge(outputInput, yield* EffectBridge.make())
   const run = tools[name]?.execute
   if (!run) return yield* Effect.die(new Error(`${name} tool unavailable`))
   return yield* Effect.promise(() => Promise.resolve(run({}, { toolCallId: `call-${name}`, messages: [] })))
 })
 
 describe("session tools output boundaries", () => {
-  it.effect("bounds built-in output after an after-hook expands it", () =>
+  outputIt.effect("bounds built-in output after an after-hook expands it", () =>
     Effect.gen(function* () {
-      const result = yield* execute("built_in")
+      const result = yield* executeOutputTool("built_in")
       if (!isRecord(result) || typeof result.output !== "string") {
-        return yield* Effect.die(new Error("built-in tool returned an invalid result"))
+        yield* Effect.die(new Error("built-in tool returned an invalid result"))
       }
       expect(result.output.length).toBeLessThanOrEqual(LIMIT)
     }),
   )
 
-  it.effect("drops raw MCP content after producing bounded output", () =>
+  outputIt.effect("drops raw MCP content after producing bounded output", () =>
     Effect.gen(function* () {
-      const result = yield* execute("server_raw")
+      const result = yield* executeOutputTool("server_raw")
       if (!isRecord(result) || typeof result.output !== "string") {
-        return yield* Effect.die(new Error("MCP tool returned an invalid result"))
+        yield* Effect.die(new Error("MCP tool returned an invalid result"))
       }
       expect(result.output.length).toBeLessThanOrEqual(LIMIT)
       expect("content" in result).toBe(false)
