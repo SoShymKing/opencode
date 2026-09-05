@@ -82,7 +82,7 @@ export const resolveWithBridge = Effect.fn("SessionTools.resolveWithBridge")(fun
             metadata: val.metadata,
             status: "running",
             input: args,
-            time: { start: Date.now() },
+            time: match.state.status === "running" ? match.state.time : { start: Date.now() },
           },
         }
       }),
