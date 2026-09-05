@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Effect } from "effect"
@@ -15,6 +15,13 @@ const withTmp = <A, E, R>(f: (directory: AbsolutePath) => Effect.Effect<A, E, R>
     Effect.promise(() => tmpdir()),
     (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
   ).pipe(Effect.flatMap((tmp) => f(AbsolutePath.make(tmp.path))))
+
+test("does not runtime-import the parent filesystem module", async () => {
+  const imports = new Bun.Transpiler({ loader: "ts" }).scanImports(
+    await Bun.file(path.join(import.meta.dir, "../../src/filesystem/search.ts")).text(),
+  )
+  expect(imports).not.toContainEqual({ kind: "import-statement", path: "../filesystem" })
+})
 
 describe("Ripgrep", () => {
   it.live("globs files as an array", () =>
