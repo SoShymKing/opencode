@@ -1,6 +1,6 @@
 import { getFilename } from "@opencode-ai/core/util/path"
 import { type Session } from "@opencode-ai/sdk/v2/client"
-import { pathKey } from "@/utils/path-key"
+import { projectPathKey } from "@/utils/path-key"
 import type { ServerConnection } from "@/context/server"
 import type { HomeProjectSelection } from "@/context/layout"
 
@@ -16,7 +16,7 @@ export function compareSessionTime(a: Session, b: Session) {
 }
 
 const isRootVisibleSession = (session: Session, directory: string) =>
-  pathKey(session.directory) === pathKey(directory) && !session.parentID && !session.time?.archived
+  projectPathKey(session.directory) === projectPathKey(directory) && !session.parentID && !session.time?.archived
 
 export const roots = (store: SessionStore) =>
   (store.session ?? []).filter((session) => isRootVisibleSession(session, store.path.directory))
@@ -54,7 +54,8 @@ export function toggleHomeProjectSelection(
   server: ServerConnection.Key,
   directory: string,
 ): HomeProjectSelection {
-  if (current?.server === server && current.directory === directory) return { server }
+  if (current?.server === server && current.directory && projectPathKey(current.directory) === projectPathKey(directory))
+    return { server }
   return { server, directory }
 }
 
@@ -65,7 +66,12 @@ export function closeHomeProject(
   directory: string,
 ) {
   projects.close(directory)
-  if (selected?.server === server && selected.directory === directory) return { server }
+  if (
+    selected?.server === server &&
+    selected.directory &&
+    projectPathKey(selected.directory) === projectPathKey(directory)
+  )
+    return { server }
   return selected
 }
 
@@ -98,13 +104,15 @@ export function projectForSession<T extends { id?: string; worktree: string; san
   projects: T[],
   byID: Map<string, T> = new Map(projects.flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
 ) {
-  const direct = byID.get(session.projectID)
-  if (direct) return direct
-  const directory = pathKey(session.directory)
-  return projects.find(
+  // Shared repo and global IDs cannot distinguish opened directories; prefer an exact path match.
+  const directory = projectPathKey(session.directory)
+  const exact = projects.find(
     (project) =>
-      pathKey(project.worktree) === directory || project.sandboxes?.some((sandbox) => pathKey(sandbox) === directory),
+      projectPathKey(project.worktree) === directory ||
+      project.sandboxes?.some((sandbox) => projectPathKey(sandbox) === directory),
   )
+  if (exact) return exact
+  return byID.get(session.projectID)
 }
 
 export const errorMessage = (err: unknown, fallback: string) => {
@@ -117,11 +125,11 @@ export const errorMessage = (err: unknown, fallback: string) => {
 }
 
 export const effectiveWorkspaceOrder = (local: string, dirs: string[], persisted?: string[]) => {
-  const root = pathKey(local)
+  const root = projectPathKey(local)
   const live = new Map<string, string>()
 
   for (const dir of dirs) {
-    const key = pathKey(dir)
+    const key = projectPathKey(dir)
     if (key === root) continue
     if (!live.has(key)) live.set(key, dir)
   }
@@ -130,7 +138,7 @@ export const effectiveWorkspaceOrder = (local: string, dirs: string[], persisted
 
   const result = [local]
   for (const dir of persisted) {
-    const key = pathKey(dir)
+    const key = projectPathKey(dir)
     if (key === root) continue
     const match = live.get(key)
     if (!match) continue

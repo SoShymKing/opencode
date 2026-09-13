@@ -1,4 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
+import { createStore } from "solid-js/store"
+import { renderToString } from "solid-js/web"
 import { ServerScope } from "./server-scope"
 
 type PersistTestingType = typeof import("./persist").PersistTesting
@@ -50,6 +52,8 @@ const storage = new MemoryStorage()
 let persistTesting: PersistTestingType
 let Persist: PersistType
 let removePersisted: RemovePersistedType
+let persisted: typeof import("./persist").persisted
+let migrateCanonicalLocalServerState: typeof import("../context/server").migrateCanonicalLocalServerState
 
 beforeAll(async () => {
   mock.module("@/context/platform", () => ({
@@ -60,6 +64,9 @@ beforeAll(async () => {
   persistTesting = mod.PersistTesting
   Persist = mod.Persist
   removePersisted = mod.removePersisted
+  persisted = mod.persisted
+  const server = await import("../context/server")
+  migrateCanonicalLocalServerState = server.migrateCanonicalLocalServerState
 })
 
 beforeEach(() => {
@@ -75,6 +82,59 @@ beforeEach(() => {
 })
 
 describe("persist localStorage resilience", () => {
+  test("hydrates and rewrites first-wins server projects when persisted duplicates are restored twice", () => {
+    const first = { worktree: "C:\\Repo\\", expanded: false }
+    const middle = { worktree: "/middle", expanded: true }
+    const slash = { worktree: "/slash/", expanded: false }
+    const remote = { worktree: "c:/Repo", expanded: true }
+    const state = {
+      list: [],
+      projects: {
+        local: [first, middle, { worktree: "c:/Repo", expanded: true }, slash, { worktree: "/slash", expanded: true }],
+        "https://remote.example": [remote, middle, first, slash, { worktree: "/slash", expanded: true }],
+      },
+      lastProject: { local: "c:/Repo", "https://remote.example": "C:\\Repo\\" },
+      recentlyClosed: {},
+    }
+    storage.setItem("opencode.global.dat:server", JSON.stringify(state))
+
+    const restores = [1, 2].map(() => {
+      const hydrated = renderToString(() => {
+        const [store] = persisted(
+          { ...Persist.global("server", ["server.v3"]), migrate: migrateCanonicalLocalServerState },
+          createStore({ list: [], projects: {}, lastProject: {}, recentlyClosed: {} }),
+        )
+        return JSON.stringify(store)
+      })
+      return { hydrated, stored: storage.getItem("opencode.global.dat:server") }
+    })
+
+    const expected = JSON.stringify({
+      ...state,
+      projects: {
+        local: [first, middle, slash],
+        "https://remote.example": [remote, middle, slash],
+      },
+    })
+    expect(restores).toEqual([
+      { hydrated: expected, stored: expected },
+      { hydrated: expected, stored: expected },
+    ])
+  })
+
+  test("keeps uppercase and lowercase drive workspace storage identities distinct", () => {
+    const upper = Persist.workspace("C:/Repo", "prompt")
+    const lower = Persist.workspace("c:/Repo", "prompt")
+
+    expect(upper.storage).toBe(persistTesting.workspaceStorage("C:/Repo"))
+    expect(lower.storage).toBe(persistTesting.workspaceStorage("c:/Repo"))
+    expect(upper.storage).not.toBe(lower.storage)
+    expect(upper.key).toBe("workspace:prompt")
+    expect(lower.key).toBe(upper.key)
+    expect(upper.legacyStorageNames).toEqual([persistTesting.workspaceStorage("C:\\Repo")])
+    expect(lower.legacyStorageNames).toEqual([persistTesting.workspaceStorage("c:\\Repo")])
+  })
+
   test("does not cache values as persisted when quota write and eviction fail", () => {
     const storageApi = persistTesting.localStorageWithPrefix("opencode.quota.scope")
     storageApi.setItem("value", '{"value":1}')

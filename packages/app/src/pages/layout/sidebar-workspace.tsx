@@ -18,7 +18,7 @@ import { type Session } from "@opencode-ai/sdk/v2/client"
 import { type LocalProject } from "@/context/layout"
 import { useServerSync, useQueryOptions } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
-import { pathKey } from "@/utils/path-key"
+import { pathKey, projectPathKey } from "@/utils/path-key"
 import { NewSessionItem, SessionItem, SessionSkeleton } from "./sidebar-items"
 import { sortedRootSessions } from "./helpers"
 import { useIsFetching } from "@tanstack/solid-query"
@@ -72,7 +72,9 @@ export const WorkspaceDragOverlay = (props: {
 
     const [workspaceStore] = serverSync().child(directory, { bootstrap: false })
     const kind =
-      directory === project.worktree ? language.t("workspace.type.local") : language.t("workspace.type.sandbox")
+      projectPathKey(directory) === projectPathKey(project.worktree)
+        ? language.t("workspace.type.local")
+        : language.t("workspace.type.sandbox")
     const name = props.workspaceLabel(directory, workspaceStore.vcs?.branch, project.id)
     return `${kind} : ${name}`
   })
@@ -313,8 +315,8 @@ export const SortableWorkspace = (props: {
   })
   const slug = createMemo(() => base64Encode(props.directory))
   const sessions = createMemo(() => sortedRootSessions(workspaceStore, props.sortNow()))
-  const local = createMemo(() => props.directory === props.project.worktree)
-  const active = createMemo(() => pathKey(props.ctx.currentDir()) === pathKey(props.directory))
+  const local = createMemo(() => projectPathKey(props.directory) === projectPathKey(props.project.worktree))
+  const active = createMemo(() => projectPathKey(props.ctx.currentDir()) === projectPathKey(props.directory))
   const workspaceValue = createMemo(() => {
     const branch = workspaceStore.vcs?.branch
     const name = branch ?? getFilename(props.directory)

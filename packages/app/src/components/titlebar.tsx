@@ -39,6 +39,7 @@ import type { PromptSession } from "@/context/prompt"
 import "./titlebar.css"
 import { newTabTooltipKeybind } from "./command-tooltip-keybind"
 import { normalizeSessionInfo } from "@/utils/session"
+import { projectPathKey } from "@/utils/path-key"
 
 const legacyTitlebarHeight = 40
 const v2TitlebarHeight = 36
@@ -284,12 +285,13 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
 
               if (route.type === "home") {
                 const selection = layout.home.selection()
+                const directory = selection.directory
                 const conn = global.servers.list().find((item) => ServerConnection.key(item) === selection.server)
-                const project = conn
+                const project = conn && directory
                   ? global
                       .ensureServerCtx(conn)
                       .projects.list()
-                      .find((item) => item.worktree === selection.directory)
+                      .find((item) => projectPathKey(item.worktree) === projectPathKey(directory))
                   : undefined
                 if (conn && project) {
                   tabs.newDraft({ server: ServerConnection.key(conn), directory: project.worktree }, "")

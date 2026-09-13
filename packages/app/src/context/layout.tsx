@@ -10,7 +10,7 @@ import { usePlatform } from "./platform"
 import { Project } from "@opencode-ai/sdk/v2"
 import { normalizeProjectInfo } from "./global-sync/utils"
 import { Persist, persisted, removePersisted } from "@/utils/persist"
-import { pathKey } from "@/utils/path-key"
+import { projectPathKey } from "@/utils/path-key"
 import { decode64 } from "@/utils/base64"
 import { same } from "@/utils/same"
 import { createScrollPersistence, type SessionScroll } from "./layout-scroll"
@@ -447,7 +447,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       const projectID = childStore.project
       const metadata = projectID
         ? serverSync().data.project.find((x) => x.id === projectID)
-        : serverSync().data.project.find((x) => x.worktree === project.worktree)
+        : serverSync().data.project.find((x) => projectPathKey(x.worktree) === projectPathKey(project.worktree))
 
       // Preserve local icon override from per-workspace localStorage cache (childStore.icon).
       // Without this, different subdirectories of the same git repo would share the same
@@ -464,7 +464,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       for (const project of serverSync().data.project) {
         const sandboxes = project.sandboxes ?? []
         for (const sandbox of sandboxes) {
-          map.set(sandbox, project.worktree)
+          map.set(projectPathKey(sandbox), project.worktree)
         }
       }
       return map
@@ -481,11 +481,12 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         const current = chain[chain.length - 1]
         if (!current) return directory
 
-        const next = map.get(current)
+        const next = map.get(projectPathKey(current))
         if (!next) return current
 
-        if (visited.has(next)) return directory
-        visited.add(next)
+        const nextKey = projectPathKey(next)
+        if (visited.has(nextKey)) return directory
+        visited.add(nextKey)
         chain.push(next)
       }
 
@@ -494,18 +495,19 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
 
     createEffect(() => {
       const projects = server.projects.list()
-      const seen = new Set(projects.map((project) => project.worktree))
+      const seen = new Set(projects.map((project) => projectPathKey(project.worktree)))
 
       batch(() => {
         for (const project of projects) {
           const root = rootFor(project.worktree)
-          if (root === project.worktree) continue
+          if (projectPathKey(root) === projectPathKey(project.worktree)) continue
 
           server.projects.remove(project.worktree)
 
-          if (!seen.has(root)) {
+          const rootKey = projectPathKey(root)
+          if (!seen.has(rootKey)) {
             server.projects.open(root)
-            seen.add(root)
+            seen.add(rootKey)
           }
 
           if (project.expanded) server.projects.expand(root)
@@ -633,16 +635,16 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       projects: {
         list,
         recentlyClosed: createMemo(() => {
-          const known = new Set(serverSync().data.project.map((project) => pathKey(project.worktree)))
+          const known = new Set(serverSync().data.project.map((project) => projectPathKey(project.worktree)))
           return server.projects
             .recentlyClosed()
-            .filter((worktree) => known.has(pathKey(worktree)))
+            .filter((worktree) => known.has(projectPathKey(worktree)))
             .slice(0, RECENTLY_CLOSED_DISPLAY_LIMIT)
             .map((worktree) => enrich({ worktree, expanded: false }))
         }),
         open(directory: string) {
           const root = rootFor(directory)
-          if (server.projects.list().find((x) => x.worktree === root)) return
+          if (server.projects.list().find((x) => projectPathKey(x.worktree) === projectPathKey(root))) return
           void serverSync().project.loadSessions(root)
           server.projects.open(root)
         },

@@ -96,6 +96,46 @@ test("active server removal falls back across built-in and persisted servers", (
 })
 
 describe("createServerProjects", () => {
+  describe.each(["local", "https://one.example", "https://two.example"])("normalized mutations in %s", (server) => {
+    test.each(["open", "remove", "close", "expand", "collapse", "move"] as const)(
+      "%s finds the stored project when given a lowercase drive variant",
+      (operation) => {
+        createRoot((dispose) => {
+          const first = { worktree: "C:\\Repo\\", expanded: operation === "collapse" }
+          const before = { worktree: "/before", expanded: false }
+          const after = { worktree: "/after", expanded: true }
+          const other = [{ worktree: "c:/Repo", expanded: false }]
+          const [store, setStore] = createStore({
+            projects: structuredClone({ [server]: [before, first, after], untouched: other }),
+            lastProject: { [server]: "C:\\Repo\\", untouched: "c:/Repo" },
+            recentlyClosed: { [server]: ["C:/Repo", "/closed"], untouched: ["c:/Repo"] },
+          })
+          const scope = () => ServerScope.fromServerKey(ServerConnection.Key.make(server))
+          const projects = createServerProjects({ scope, store, setStore })
+
+          operation === "move" ? projects.move("c:/Repo", 2) : projects[operation]("c:/Repo")
+
+          const expected = {
+            open: [before, first, after],
+            remove: [before, after],
+            close: [before, after],
+            expand: [before, { ...first, expanded: true }, after],
+            collapse: [before, { ...first, expanded: false }, after],
+            move: [before, after, first],
+          }
+          const closed = { open: ["/closed"], close: ["c:/Repo", "/closed"] }
+          dispose()
+          expect(store.projects).toEqual({ [server]: expected[operation], untouched: other })
+          expect(store.lastProject).toEqual({ [server]: "C:\\Repo\\", untouched: "c:/Repo" })
+          expect(store.recentlyClosed).toEqual({
+            [server]: operation === "open" || operation === "close" ? closed[operation] : ["C:/Repo", "/closed"],
+            untouched: ["c:/Repo"],
+          })
+        })
+      },
+    )
+  })
+
   test("keeps active and explicit server buckets in one reactive store", () => {
     createRoot((dispose) => {
       const [scope] = createSignal(ServerScope.local)
@@ -200,6 +240,77 @@ describe("createServerProjects", () => {
 })
 
 describe("migrateCanonicalLocalServerState", () => {
+  test.each([undefined, "local", "https://absent.example", "https://canonical.example"])(
+    "restores first entries in every scope when canonical is %s",
+    (canonical) => {
+      const first = { worktree: "C:\\Repo\\", expanded: false, setting: "first" }
+      const middle = { worktree: "/middle", expanded: true }
+      const slash = { worktree: "/slash/", expanded: false }
+      const tail = { worktree: "/tail", expanded: false }
+      const invalid = [null, 7, { expanded: true }, { worktree: 7 }]
+      const bucket = [
+        first,
+        middle,
+        { worktree: "c:/Repo", expanded: true },
+        slash,
+        { worktree: "/slash", expanded: true },
+        tail,
+        ...invalid,
+      ]
+      const remoteFirst = { worktree: "c:/Repo", expanded: true, setting: "remote" }
+      const canonicalFirst = { ...first, expanded: true, setting: "canonical" }
+      const value = {
+        projects: {
+          local: bucket,
+          "https://canonical.example": [
+            canonicalFirst,
+            ...bucket.slice(1),
+            { worktree: "/canonical-only", expanded: true },
+          ],
+          "https://one.example": [remoteFirst, ...bucket],
+          "https://two.example": bucket,
+          malformed: { keep: true },
+        },
+        lastProject: {
+          local: "c:/Repo",
+          "https://canonical.example": "/canonical-only",
+          "https://one.example": "C:/Repo",
+        },
+      }
+      const key = canonical === undefined ? undefined : ServerConnection.Key.make(canonical)
+      const restored = migrateCanonicalLocalServerState(value, key)
+      const survivors = [first, middle, slash, tail, ...invalid]
+      const merged = canonical === "https://canonical.example"
+      const expected = {
+        projects: {
+          local: merged ? [...survivors, ...invalid, { worktree: "/canonical-only", expanded: true }] : survivors,
+          ...(!merged
+            ? {
+                "https://canonical.example": [
+                  canonicalFirst,
+                  ...survivors.slice(1),
+                  { worktree: "/canonical-only", expanded: true },
+                ],
+              }
+            : {}),
+          "https://one.example": [remoteFirst, middle, slash, tail, ...invalid],
+          "https://two.example": survivors,
+          malformed: { keep: true },
+        },
+        lastProject: merged ? { local: "c:/Repo", "https://one.example": "C:/Repo" } : value.lastProject,
+      }
+
+      expect(restored).toEqual(expected)
+      expect(migrateCanonicalLocalServerState(restored, key)).toEqual(expected)
+    },
+  )
+
+  test.each(
+    [null, 7, [], { projects: null }, { projects: [] }, { projects: { local: "invalid" } }].map((value) => ({ value })),
+  )("preserves invalid records and buckets: %j", ({ value }) => {
+    expect(migrateCanonicalLocalServerState(value, ServerConnection.Key.make("https://absent.example"))).toEqual(value)
+  })
+
   test("moves an existing canonical web bucket into local scope", () => {
     expect(
       migrateCanonicalLocalServerState(
