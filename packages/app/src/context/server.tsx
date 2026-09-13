@@ -2,7 +2,7 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { type Accessor, batch, createMemo } from "solid-js"
 import { createStore, type SetStoreFunction, type Store } from "solid-js/store"
 import { Persist, persisted } from "@/utils/persist"
-import { pathKey } from "@/utils/path-key"
+import { projectPathKey } from "@/utils/path-key"
 import { ServerScope } from "@/utils/server-scope"
 
 type StoredProject = { worktree: string; expanded: boolean }
@@ -43,34 +43,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function migrateCanonicalLocalServerState(value: unknown, canonicalLocalServer?: ServerConnection.Key) {
-  if (!canonicalLocalServer || canonicalLocalServer === "local") return value
   if (!isRecord(value)) return value
-  const projects = isRecord(value.projects) ? value.projects : undefined
+  const canonical = canonicalLocalServer !== "local" ? canonicalLocalServer : undefined
+  const projects = isRecord(value.projects) ? { ...value.projects } : undefined
   const lastProject = isRecord(value.lastProject) ? value.lastProject : undefined
-  const previousProjects = projects?.[canonicalLocalServer]
-  const previousLastProject = lastProject?.[canonicalLocalServer]
-  if (!Array.isArray(previousProjects) && typeof previousLastProject !== "string") return value
+  const previousProjects = canonical ? projects?.[canonical] : undefined
+  const previousLastProject = canonical ? lastProject?.[canonical] : undefined
 
   const next = { ...value }
-  if (projects && Array.isArray(previousProjects)) {
+  if (canonical && projects && Array.isArray(previousProjects)) {
     const local = Array.isArray(projects.local) ? projects.local : []
-    const worktrees = new Set(
-      local.flatMap((project) => (isRecord(project) && typeof project.worktree === "string" ? [project.worktree] : [])),
-    )
-    const migrated = previousProjects.filter((project) => {
-      if (!isRecord(project) || typeof project.worktree !== "string") return true
-      if (worktrees.has(project.worktree)) return false
-      worktrees.add(project.worktree)
-      return true
-    })
-    const nextProjects: Record<string, unknown> = { ...projects, local: [...local, ...migrated] }
-    delete nextProjects[canonicalLocalServer]
-    next.projects = nextProjects
+    projects.local = [...local, ...previousProjects]
+    delete projects[canonical]
   }
-  if (lastProject && typeof previousLastProject === "string") {
+  if (projects) {
+    next.projects = Object.fromEntries(
+      Object.entries(projects).map(([scope, bucket]) => {
+        if (!Array.isArray(bucket)) return [scope, bucket]
+        const worktrees = new Set<string>()
+        return [
+          scope,
+          bucket.filter((project: unknown) => {
+            if (!isRecord(project) || typeof project.worktree !== "string") return true
+            const key = projectPathKey(project.worktree)
+            if (worktrees.has(key)) return false
+            worktrees.add(key)
+            return true
+          }),
+        ]
+      }),
+    )
+  }
+  if (canonical && lastProject && typeof previousLastProject === "string") {
     const nextLastProject = { ...lastProject }
     if (typeof nextLastProject.local !== "string") nextLastProject.local = previousLastProject
-    delete nextLastProject[canonicalLocalServer]
+    delete nextLastProject[canonical]
     next.lastProject = nextLastProject
   }
   return next
@@ -85,10 +92,11 @@ export function createServerProjects<T extends ServerProjectState>(input: {
   const current = () => input.store.projects[input.scope()] ?? []
   const currentClosed = () => input.store.recentlyClosed?.[input.scope()] ?? []
   const remove = (directory: string) => {
+    const key = projectPathKey(directory)
     setStore(
       "projects",
       input.scope(),
-      current().filter((project) => project.worktree !== directory),
+      current().filter((project) => projectPathKey(project.worktree) !== key),
     )
   }
   return {
@@ -97,39 +105,42 @@ export function createServerProjects<T extends ServerProjectState>(input: {
     remove,
     open(directory: string) {
       const scope = input.scope()
-      const key = pathKey(directory)
+      const key = projectPathKey(directory)
       const closed = currentClosed()
-      if (closed.some((worktree) => pathKey(worktree) === key)) {
+      if (closed.some((worktree) => projectPathKey(worktree) === key)) {
         setStore(
           "recentlyClosed",
           scope,
-          closed.filter((worktree) => pathKey(worktree) !== key),
+          closed.filter((worktree) => projectPathKey(worktree) !== key),
         )
       }
-      if (current().some((project) => project.worktree === directory)) return
+      if (current().some((project) => projectPathKey(project.worktree) === key)) return
       setStore("projects", scope, [{ worktree: directory, expanded: true }, ...current()])
     },
     // User-initiated close: removes the project and records it in recently closed.
     // Internal, non-user removals (e.g. sandbox/worktree normalization) should use remove().
     close(directory: string) {
       remove(directory)
-      const key = pathKey(directory)
-      const closed = [directory, ...currentClosed().filter((worktree) => pathKey(worktree) !== key)].slice(
+      const key = projectPathKey(directory)
+      const closed = [directory, ...currentClosed().filter((worktree) => projectPathKey(worktree) !== key)].slice(
         0,
         RECENTLY_CLOSED_HISTORY_LIMIT,
       )
       setStore("recentlyClosed", input.scope(), closed)
     },
     expand(directory: string) {
-      const index = current().findIndex((project) => project.worktree === directory)
+      const key = projectPathKey(directory)
+      const index = current().findIndex((project) => projectPathKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", true)
     },
     collapse(directory: string) {
-      const index = current().findIndex((project) => project.worktree === directory)
+      const key = projectPathKey(directory)
+      const index = current().findIndex((project) => projectPathKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", false)
     },
     move(directory: string, toIndex: number) {
-      const fromIndex = current().findIndex((project) => project.worktree === directory)
+      const key = projectPathKey(directory)
+      const fromIndex = current().findIndex((project) => projectPathKey(project.worktree) === key)
       if (fromIndex === -1 || fromIndex === toIndex) return
       const next = [...current()]
       const [item] = next.splice(fromIndex, 1)

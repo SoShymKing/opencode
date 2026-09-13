@@ -20,6 +20,7 @@ import { ServerRowMenuView, serverMenuLabels } from "@/components/server/server-
 import { ServerHealthIndicator } from "@/components/server/server-row"
 import { type ServerHealth } from "@/utils/server-health"
 import { fileManagerApp } from "@/utils/file-manager"
+import { projectPathKey } from "@/utils/path-key"
 
 const HOME_PROJECT_NAV_LABEL = "min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
 
@@ -366,6 +367,14 @@ function HomeProjectSlot(
     (previous) => props.items.find((item) => item.worktree === props.worktree) ?? previous,
     initial,
   )
+  const selected = createMemo(() => {
+    const selection = props.selection()
+    if (!selection.directory) return false
+    return (
+      selection.server === ServerConnection.key(props.server) &&
+      projectPathKey(selection.directory) === projectPathKey(props.worktree)
+    )
+  })
 
   return (
     <HomeProjectRow
@@ -374,10 +383,7 @@ function HomeProjectSlot(
       server={props.server}
       index={props.index}
       serverSelected={props.selection().server === ServerConnection.key(props.server)}
-      selected={
-        props.selection().server === ServerConnection.key(props.server) &&
-        props.selection().directory === props.worktree
-      }
+      selected={selected()}
       unseen={props.unseenCount(props.server, project())}
     />
   )

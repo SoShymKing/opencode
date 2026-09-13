@@ -22,3 +22,6 @@ export const pathKey = (path: string) => {
   if (isDrive(trimmed)) return `${trimmed}/` as PathKey
   return trimmed as PathKey
 }
+
+// Keep project comparisons separate from persisted workspace storage keys.
+export const projectPathKey = (path: string) => pathKey(path).replace(/^[a-z]:/, (drive) => drive.toUpperCase())

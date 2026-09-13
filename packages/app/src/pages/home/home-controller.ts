@@ -5,6 +5,7 @@ import { useServerSync } from "@/context/server-sync"
 import { useTabs } from "@/context/tabs"
 import { toggleHomeProjectSelection } from "@/pages/layout/helpers"
 import { createEffect, createMemo } from "solid-js"
+import { projectPathKey } from "@/utils/path-key"
 
 export function createHomeController() {
   const sync = useServerSync()
@@ -27,13 +28,20 @@ export function createHomeController() {
     () => focusedServerCtx()?.projects.recentlyClosed() ?? layout.projects.recentlyClosed(),
   )
   const homedir = createMemo(() => focusedSync().data.path.home ?? "")
-  const selectedProject = createMemo(() => projects().find((project) => project.worktree === selection().directory))
-  const newSessionProject = createMemo(
-    () =>
-      selectedProject() ??
-      projects().find((project) => project.worktree === focusedServerCtx()?.projects.last()) ??
-      projects()[0],
-  )
+  const selectedProject = createMemo(() => {
+    const directory = selection().directory
+    if (!directory) return
+    const key = projectPathKey(directory)
+    return projects().find((project) => projectPathKey(project.worktree) === key)
+  })
+  const newSessionProject = createMemo(() => {
+    const selected = selectedProject()
+    if (selected) return selected
+    const last = focusedServerCtx()?.projects.last()
+    if (!last) return projects()[0]
+    const key = projectPathKey(last)
+    return projects().find((project) => projectPathKey(project.worktree) === key) ?? projects()[0]
+  })
 
   createEffect(() => {
     const list = global.servers.list()
@@ -81,7 +89,7 @@ export function createHomeController() {
           !global
             .ensureServerCtx(conn)
             .projects.list()
-            .some((project) => project.worktree === directory)
+            .some((project) => projectPathKey(project.worktree) === projectPathKey(directory))
         )
           return
         setSelection(toggleHomeProjectSelection(selection(), key, directory))
@@ -91,7 +99,7 @@ export function createHomeController() {
         if (!directory) return
         const ctx = global.ensureServerCtx(conn)
         directories.forEach((item) => {
-          if (ctx.projects.list().some((project) => project.worktree === item)) return
+          if (ctx.projects.list().some((project) => projectPathKey(project.worktree) === projectPathKey(item))) return
           const location = { directory: item }
           void ctx.sdk.api.file
             .list({ path: ".", location })

@@ -20,10 +20,11 @@ import {
   homeSessionServerStatus,
   latestRootSession,
   projectForSession,
+  roots,
   sortedRootSessions,
   toggleHomeProjectSelection,
 } from "./helpers"
-import { pathKey } from "@/utils/path-key"
+import { pathKey, projectPathKey } from "@/utils/path-key"
 import { ServerConnection } from "@/context/server"
 
 const serverKey = ServerConnection.Key.make
@@ -114,6 +115,53 @@ describe("layout deep links", () => {
 })
 
 describe("projectForSession", () => {
+  test.each([
+    ["C:/Repo", "c:/Repo"],
+    ["c:/Repo", "C:/Repo"],
+  ])("matches worktree %s when session drive case differs: %s", (worktree, directory) => {
+    const project = { id: "global", worktree }
+    const projects = [{ id: "global", worktree: "C:/Users/JH" }, project]
+
+    const result = projectForSession(session({ id: "drive", directory }), projects)
+
+    expect(result).toBe(project)
+  })
+
+  test.each([
+    ["C:/Sandbox", "c:/Sandbox"],
+    ["c:/Sandbox", "C:/Sandbox"],
+  ])("matches sandbox %s when session drive case differs: %s", (sandbox, directory) => {
+    const project = { id: "repo", worktree: "C:/Repo", sandboxes: [sandbox] }
+
+    const result = projectForSession(session({ id: "drive-sandbox", directory }), [project])
+
+    expect(result).toBe(project)
+  })
+
+  test.each([
+    ["C:/Repo", "c:/repo"],
+    ["/Repo", "/repo"],
+    ["//Server/Share/Repo", "//server/Share/Repo"],
+    ["//Server/Share/Repo", "//Server/Share/repo"],
+  ])("keeps path case distinct for %s and %s without project ID fallback", (worktree, directory) => {
+    const project = { id: "repo", worktree, sandboxes: [worktree] }
+
+    const result = projectForSession(session({ id: "case-distinct", directory }), [project])
+
+    expect(result).toBeUndefined()
+  })
+
+  test.each([
+    ["/Repo/", "/Repo"],
+    ["\\\\Server\\Share\\Repo\\", "//Server/Share/Repo"],
+  ])("preserves normalized path matching for %s and %s", (worktree, directory) => {
+    const project = { id: "repo", worktree }
+
+    const result = projectForSession(session({ id: "normalized", directory }), [project])
+
+    expect(result).toBe(project)
+  })
+
   test.each(["/repo/beta", "/repo/tango"])("matches exact worktree %s when projects share a repo id", (directory) => {
     const projects = [
       { id: "repo", worktree: "/repo/beta" },
@@ -197,6 +245,117 @@ describe("projectForSession", () => {
 })
 
 describe("layout workspace helpers", () => {
+  test("preserves lowercase drive spelling in storage path keys", () => {
+    expect(String(pathKey("c:/Repo"))).toBe("c:/Repo")
+  })
+
+  test.each([
+    ["c:/Repo", "C:/Repo"],
+    ["C:\\Repo\\", "C:/Repo"],
+    ["/Repo", "/Repo"],
+    ["/repo", "/repo"],
+    ["//Server/Share", "//Server/Share"],
+  ])("normalizes only Windows drive spelling for project identity: %s", (directory, expected) => {
+    expect(String(projectPathKey(directory))).toBe(expected)
+  })
+
+  test.each([
+    ["C:/Repo", "c:/Repo"],
+    ["c:/Repo", "C:/Repo"],
+    ["/Repo/", "/Repo"],
+    ["\\\\Server\\Share\\Repo\\", "//Server/Share/Repo"],
+  ])("filters visible roots for %s when session directory is %s", (directory, equivalent) => {
+    const visible = session({ id: "visible", directory: equivalent })
+    const sessions = [
+      visible,
+      session({ id: "child", directory: equivalent, parentID: "visible" }),
+      session({ id: "archived", directory: equivalent, time: { created: 1, updated: 1, archived: 1 } }),
+      session({ id: "different", directory: `${equivalent}/other` }),
+    ]
+
+    const result = roots({ path: { directory }, session: sessions })
+
+    expect(result).toEqual([visible])
+  })
+
+  test.each([
+    ["C:/Repo", "c:/repo"],
+    ["/Repo", "/repo"],
+    ["//Server/Share/Repo", "//server/Share/Repo"],
+  ])("excludes roots when path case differs beyond the drive: %s and %s", (directory, distinct) => {
+    const sessions = [session({ id: "distinct", directory: distinct })]
+
+    const result = roots({ path: { directory }, session: sessions })
+
+    expect(result).toEqual([])
+  })
+
+  test("deduplicates drive variants while preserving local spelling, first raw workspace and persisted order", () => {
+    const local = "c:\\Repo\\"
+    const dirs = ["C:/Repo", "c:\\Alpha\\", "C:/Alpha", "C:/Beta", "c:/Beta", "C:/Gamma"]
+    const persisted = ["C:/Repo", "c:/Beta", "C:/Alpha", "c:/Alpha", "C:/missing"]
+
+    const result = effectiveWorkspaceOrder(local, dirs, persisted)
+
+    expect(result).toEqual([local, "C:/Beta", "c:\\Alpha\\", "C:/Gamma"])
+  })
+
+  test("deduplicates drive variants in live order without persisted workspaces", () => {
+    const dirs = ["c:/Repo", "c:/Alpha", "C:/Alpha", "C:/Beta"]
+
+    const result = effectiveWorkspaceOrder("C:/Repo", dirs)
+
+    expect(result).toEqual(["C:/Repo", "c:/Alpha", "C:/Beta"])
+  })
+
+  test("keeps folder, POSIX and UNC case distinct in workspace order", () => {
+    const dirs = ["C:/repo", "/Repo", "/repo", "//Server/Share", "//server/Share"]
+
+    const result = effectiveWorkspaceOrder("C:/Repo", dirs)
+
+    expect(result).toEqual(["C:/Repo", ...dirs])
+  })
+
+  test.each([
+    { selected: "C:/Repo", directory: "c:/Repo", sameServer: true, clears: true },
+    { selected: "c:/Repo", directory: "C:/Repo", sameServer: true, clears: true },
+    { selected: "C:/Repo", directory: "c:/Repo", sameServer: false, clears: false },
+    { selected: "C:/Repo", directory: "c:/repo", sameServer: true, clears: false },
+    { selected: "/Repo", directory: "/repo", sameServer: true, clears: false },
+    { selected: "//Server/Share", directory: "//server/Share", sameServer: true, clears: false },
+  ])("toggles Home selection with path and server identity: %j", (input) => {
+    const server = serverKey("https://windows.example")
+    const current = {
+      server: input.sameServer ? server : serverKey("https://other.example"),
+      directory: input.selected,
+    }
+
+    const result = toggleHomeProjectSelection(current, server, input.directory)
+
+    expect(result).toEqual(input.clears ? { server } : { server, directory: input.directory })
+  })
+
+  test.each([
+    { selected: "C:/Repo", directory: "c:/Repo", sameServer: true, clears: true },
+    { selected: "c:/Repo", directory: "C:/Repo", sameServer: true, clears: true },
+    { selected: "C:/Repo", directory: "c:/Repo", sameServer: false, clears: false },
+    { selected: "C:/Repo", directory: "c:/repo", sameServer: true, clears: false },
+    { selected: "/Repo", directory: "/repo", sameServer: true, clears: false },
+    { selected: "//Server/Share", directory: "//server/Share", sameServer: true, clears: false },
+  ])("closes Home selection with path and server identity: %j", (input) => {
+    const server = serverKey("https://windows.example")
+    const current = {
+      server: input.sameServer ? server : serverKey("https://other.example"),
+      directory: input.selected,
+    }
+    const closed: string[] = []
+
+    const result = closeHomeProject(current, server, { close: (directory) => closed.push(directory) }, input.directory)
+
+    expect(closed).toEqual([input.directory])
+    expect(result).toEqual(input.clears ? { server } : current)
+  })
+
   test("normalizes trailing slash in workspace key", () => {
     expect(String(pathKey("/tmp/demo///"))).toBe("/tmp/demo")
     expect(String(pathKey("C:\\tmp\\demo\\\\"))).toBe("C:/tmp/demo")
