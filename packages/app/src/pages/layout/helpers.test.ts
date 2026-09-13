@@ -19,6 +19,7 @@ import {
   homeProjectDirectories,
   homeSessionServerStatus,
   latestRootSession,
+  projectForSession,
   sortedRootSessions,
   toggleHomeProjectSelection,
 } from "./helpers"
@@ -109,6 +110,89 @@ describe("layout deep links", () => {
 
     expect(drainPendingDeepLinks(target)).toEqual(["opencode://open-project?directory=/a"])
     expect(drainPendingDeepLinks(target)).toEqual([])
+  })
+})
+
+describe("projectForSession", () => {
+  test.each(["/repo/beta", "/repo/tango"])("matches exact worktree %s when projects share a repo id", (directory) => {
+    const projects = [
+      { id: "repo", worktree: "/repo/beta" },
+      { id: "repo", worktree: "/repo/tango" },
+    ]
+
+    const result = projectForSession(session({ id: "ses_repo", projectID: "repo", directory }), projects)
+
+    expect(result?.worktree).toBe(directory)
+  })
+
+  test.each(["/tmp/alpha", "/tmp/bravo"])(
+    "matches exact worktree %s when non-Git projects share the global id",
+    (directory) => {
+      const projects = [
+        { id: "global", worktree: "/tmp/alpha" },
+        { id: "global", worktree: "/tmp/bravo" },
+      ]
+
+      const result = projectForSession(session({ id: "ses_global", projectID: "global", directory }), projects)
+
+      expect(result?.worktree).toBe(directory)
+    },
+  )
+
+  test("falls back to project id when the session is below the repo directory", () => {
+    const project = { id: "repo", worktree: "/repo" }
+
+    const result = projectForSession(session({ id: "ses_nested", projectID: "repo", directory: "/repo/src" }), [
+      project,
+    ])
+
+    expect(result).toBe(project)
+  })
+
+  test("matches a sandbox when the session project id differs", () => {
+    const project = { id: "repo", worktree: "/repo", sandboxes: ["/sandbox"] }
+
+    const result = projectForSession(session({ id: "ses_sandbox", projectID: "other", directory: "/sandbox" }), [
+      project,
+    ])
+
+    expect(result).toBe(project)
+  })
+
+  test("returns undefined when neither path nor project id matches", () => {
+    const project = { id: "repo", worktree: "/repo", sandboxes: ["/sandbox"] }
+
+    const result = projectForSession(session({ id: "ses_missing", projectID: "other", directory: "/elsewhere" }), [
+      project,
+    ])
+
+    expect(result).toBeUndefined()
+  })
+
+  test("matches normalized Windows worktree instead of another global-id JH project", () => {
+    const project = { id: "global", worktree: "C:/Users/JH/demo/" }
+    const projects = [project, { id: "global", worktree: "C:/Users/JH" }]
+
+    const result = projectForSession(
+      session({ id: "ses_windows", projectID: "global", directory: "C:\\Users\\JH\\demo" }),
+      projects,
+    )
+
+    expect(result).toBe(project)
+  })
+
+  test.each(["/repo", "/sandbox"])("prefers exact path %s over a conflicting explicit byID map", (directory) => {
+    const project = { id: "repo", worktree: "/repo", sandboxes: ["/sandbox"] }
+    const conflicting = { id: "other", worktree: "/other" }
+    const byID = new Map([["other", conflicting]])
+
+    const result = projectForSession(
+      session({ id: "ses_explicit", projectID: "other", directory }),
+      [project, conflicting],
+      byID,
+    )
+
+    expect(result).toBe(project)
   })
 })
 

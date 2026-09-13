@@ -98,13 +98,14 @@ export function projectForSession<T extends { id?: string; worktree: string; san
   projects: T[],
   byID: Map<string, T> = new Map(projects.flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
 ) {
-  const direct = byID.get(session.projectID)
-  if (direct) return direct
+  // Shared repo and global IDs cannot distinguish opened directories; prefer an exact path match.
   const directory = pathKey(session.directory)
-  return projects.find(
+  const exact = projects.find(
     (project) =>
       pathKey(project.worktree) === directory || project.sandboxes?.some((sandbox) => pathKey(sandbox) === directory),
   )
+  if (exact) return exact
+  return byID.get(session.projectID)
 }
 
 export const errorMessage = (err: unknown, fallback: string) => {
