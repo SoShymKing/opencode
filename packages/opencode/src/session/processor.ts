@@ -275,7 +275,7 @@ const layer = Layer.effect(
         }
       }
 
-      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent, markProgress: () => void) {
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -303,6 +303,7 @@ const layer = Layer.effect(
               field: "text",
               delta: value.text,
             })
+            if (value.text) markProgress()
             return
 
           case "reasoning-end":
@@ -521,6 +522,7 @@ const layer = Layer.effect(
               field: "text",
               delta: value.text,
             })
+            if (value.text) markProgress()
             return
 
           case "text-end":
@@ -639,6 +641,10 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+        let progressed = false
+        const markProgress = () => {
+          progressed = true
+        }
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -648,13 +654,14 @@ const layer = Layer.effect(
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
+            progressed = false
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) => handleEvent(event, markProgress)),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
@@ -675,6 +682,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                progress: () => progressed,
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",
