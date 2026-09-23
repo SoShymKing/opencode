@@ -124,7 +124,7 @@ describe("session.retry.delay", () => {
     }),
   )
 
-  it.instance("policy stops after five retries", () =>
+  it.instance("policy stops after five retries without progress", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
       const error = apiError({ "retry-after-ms": "0" })
@@ -132,6 +132,7 @@ describe("session.retry.delay", () => {
         SessionRetry.policy({
           provider: "test",
           parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          progress: () => false,
           set: (info) =>
             Effect.sync(() => {
               attempts.push(info.attempt)
@@ -172,7 +173,7 @@ describe("session.retry.delay", () => {
     }),
   )
 
-  it.instance("policy caps progress-aware retries at ten total", () =>
+  it.instance("policy allows progress-aware retries past 100 total", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
       const error = apiError({ "retry-after-ms": "0" })
@@ -187,9 +188,9 @@ describe("session.retry.delay", () => {
       }
       const step = yield* Schedule.toStepWithMetadata(SessionRetry.policy(options))
 
-      yield* Effect.forEach(Array.from({ length: 11 }), () => Effect.ignore(step(error)))
+      yield* Effect.forEach(Array.from({ length: 101 }), () => Effect.ignore(step(error)))
 
-      expect(attempts).toStrictEqual(Array.from({ length: 10 }, () => 1))
+      expect(attempts).toStrictEqual(Array.from({ length: 101 }, () => 1))
     }),
   )
 })

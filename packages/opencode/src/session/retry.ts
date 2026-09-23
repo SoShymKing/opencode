@@ -29,7 +29,7 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
-const RETRY_MAX_TOTAL_RETRIES = 100
+const RETRY_MAX_TOTAL_RETRIES = 0
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -196,7 +196,10 @@ export function policy(opts: {
         if (!retry) return Cause.done(meta.attempt)
         if (opts.progress?.()) lastProgress = meta.attempt - 1
         const attempt = meta.attempt - lastProgress
-        if (attempt > RETRY_MAX_RETRIES || (opts.progress && meta.attempt > RETRY_MAX_TOTAL_RETRIES))
+        if (
+          attempt > RETRY_MAX_RETRIES ||
+          (opts.progress && RETRY_MAX_TOTAL_RETRIES > 0 && meta.attempt > RETRY_MAX_TOTAL_RETRIES)
+        )
           return Cause.done(meta.attempt)
         return Effect.gen(function* () {
           const wait = delay(attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
