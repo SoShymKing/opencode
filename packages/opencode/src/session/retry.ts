@@ -40,6 +40,7 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY_NO_HEADERS = RETRY_MAX_DELAY
 export const RETRY_MAX_RETRIES = 5
+const RETRY_MAX_TOTAL_RETRIES = 0
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -225,26 +226,43 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
+  progress?: () => boolean
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
   context?: () => RetryContext
 }) {
   return Schedule.fromStepWithMetadata(
-    Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
-      const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider, { ...opts.context?.(), attempt: meta.attempt })
-      if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
-      return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
-        const now = yield* Clock.currentTimeMillis
-        yield* opts.set({
-          attempt: meta.attempt,
-          message: retry.message,
-          action: retry.action,
-          next: now + wait,
+    Effect.sync(() => {
+      let lastProgress = 0
+      return (meta: Schedule.InputMetadata<unknown>) => {
+        const error = opts.parse(meta.input)
+        const retry = retryable(error, opts.provider, { ...opts.context?.(), attempt: meta.attempt })
+        if (!retry) return Cause.done(meta.attempt)
+        const safety =
+          MessageV2.AbortedError.isInstance(error) ||
+          MessageV2.UnexpectedProviderAbortError.isInstance(error) ||
+          MessageV2.PostToolContinuationTimeoutError.isInstance(error) ||
+          MessageV2.EmptyAssistantResponseError.isInstance(error) ||
+          MessageV2.NoResponseError.isInstance(error)
+        if (!safety && opts.progress?.()) lastProgress = meta.attempt - 1
+        const attempt = safety ? meta.attempt : meta.attempt - lastProgress
+        if (
+          !safety &&
+          (attempt > RETRY_MAX_RETRIES ||
+            (opts.progress && RETRY_MAX_TOTAL_RETRIES > 0 && meta.attempt > RETRY_MAX_TOTAL_RETRIES))
+        )
+          return Cause.done(meta.attempt)
+        return Effect.gen(function* () {
+          const wait = delay(attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+          const now = yield* Clock.currentTimeMillis
+          yield* opts.set({
+            attempt,
+            message: retry.message,
+            action: retry.action,
+            next: now + wait,
+          })
+          return [attempt, Duration.millis(wait)] as [number, Duration.Duration]
         })
-        return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
-      })
+      }
     }),
   )
 }

@@ -4,7 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Cause, Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -141,7 +141,7 @@ describe("session.retry.delay", () => {
     }),
   )
 
-  it.instance("policy stops after five retries", () =>
+  it.instance("policy stops after five retries without progress", () =>
     Effect.gen(function* () {
       const attempts: number[] = []
       const error = apiError({ "retry-after-ms": "0" })
@@ -149,6 +149,7 @@ describe("session.retry.delay", () => {
         SessionRetry.policy({
           provider: "test",
           parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          progress: () => false,
           set: (info) =>
             Effect.sync(() => {
               attempts.push(info.attempt)
@@ -161,6 +162,138 @@ describe("session.retry.delay", () => {
       )
 
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
+    }),
+  )
+
+  it.instance("policy resets consecutive attempt after progress", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = apiError({ "retry-after-ms": "0" })
+      let progressed = false
+      const options = {
+        provider: "test",
+        parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+        progress: () => progressed,
+        set: (info: { attempt: number }) =>
+          Effect.sync(() => {
+            attempts.push(info.attempt)
+          }),
+      }
+      const step = yield* Schedule.toStepWithMetadata(SessionRetry.policy(options))
+
+      yield* step(error)
+      yield* step(error)
+      progressed = true
+      yield* step(error)
+
+      expect(attempts).toStrictEqual([1, 2, 1])
+    }),
+  )
+
+  it.instance("policy allows progress-aware retries past 100 total", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = apiError({ "retry-after-ms": "0" })
+      const options = {
+        provider: "test",
+        parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+        progress: () => true,
+        set: (info: { attempt: number }) =>
+          Effect.sync(() => {
+            attempts.push(info.attempt)
+          }),
+      }
+      const step = yield* Schedule.toStepWithMetadata(SessionRetry.policy(options))
+
+      yield* Effect.forEach(Array.from({ length: 101 }), () => Effect.ignore(step(error)))
+
+      expect(attempts).toStrictEqual(Array.from({ length: 101 }, () => 1))
+    }),
+  )
+
+  it.effect("policy allows ten main-session no-response retries before stopping", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = new MessageV2.NoResponseError({
+        message: "Provider returned no response",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject()
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: retryProvider,
+          parse: Schema.decodeUnknownSync(MessageV2.NoResponseError.Schema),
+          context: () => ({ subagent: false, empty: true }),
+          set: (info) =>
+            Effect.sync(() => {
+              attempts.push(info.attempt)
+            }),
+        }),
+      )
+
+      yield* Effect.forEach(Array.from({ length: 10 }), () => step(0, error))
+      expect(attempts).toStrictEqual(Array.from({ length: 10 }, (_, index) => index + 1))
+      const done = yield* Effect.flip(step(0, error))
+      expect(Cause.isDone(done)).toBe(true)
+      expect(done).toMatchObject({ value: 11 })
+      expect(attempts).toHaveLength(10)
+    }),
+  )
+
+  it.effect("policy stops child no-response after one retry", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = new MessageV2.NoResponseError({
+        message: "Provider returned no response",
+        abortSource: "unknown",
+        phase: "message_finalization",
+        retryable: true,
+      }).toObject()
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: retryProvider,
+          parse: Schema.decodeUnknownSync(MessageV2.NoResponseError.Schema),
+          context: () => ({ subagent: true, empty: true }),
+          set: (info) =>
+            Effect.sync(() => {
+              attempts.push(info.attempt)
+            }),
+        }),
+      )
+
+      yield* step(0, error)
+      const done = yield* Effect.flip(step(0, error))
+      expect(Cause.isDone(done)).toBe(true)
+      expect(done).toMatchObject({ value: 2 })
+      expect(attempts).toStrictEqual([1])
+    }),
+  )
+
+  it.effect("policy does not renew unexpected-abort retries after progress", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const error = unexpectedProviderAbortError()
+      let progressed = false
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: retryProvider,
+          parse: Schema.decodeUnknownSync(MessageV2.UnexpectedProviderAbortError.Schema),
+          progress: () => progressed,
+          context: () => ({ empty: true }),
+          set: (info) =>
+            Effect.sync(() => {
+              attempts.push(info.attempt)
+            }),
+        }),
+      )
+
+      yield* step(0, error)
+      progressed = true
+      const done = yield* Effect.flip(step(0, error))
+      expect(Cause.isDone(done)).toBe(true)
+      expect(done).toMatchObject({ value: 2 })
+      expect(attempts).toStrictEqual([1])
     }),
   )
 })

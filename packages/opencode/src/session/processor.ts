@@ -470,7 +470,7 @@ const layer = Layer.effect(
       const tokenTotal = (tokens: SessionV1.Assistant["tokens"]) =>
         tokens.total ?? tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 
-      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+      const handleEvent = Effect.fnUntraced(function* (value: StreamEvent, markProgress: () => void) {
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -518,6 +518,7 @@ const layer = Layer.effect(
               field: "text",
               delta: value.text,
             })
+            if (value.text) markProgress()
             return
 
           case "reasoning-end":
@@ -925,6 +926,7 @@ const layer = Layer.effect(
               field: "text",
               delta: value.text,
             })
+            if (value.text) markProgress()
             return
 
           case "text-end":
@@ -1150,6 +1152,10 @@ const layer = Layer.effect(
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+        let progressed = false
+        const markProgress = () => {
+          progressed = true
+        }
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
@@ -1169,6 +1175,7 @@ const layer = Layer.effect(
               isPostToolContinuation: streamInput.internal?.postToolContinuation === true,
               retryAttempt,
             }
+            progressed = false
             ctx.currentText = undefined
             ctx.currentTextID = undefined
             ctx.reasoningMap = {}
@@ -1187,7 +1194,7 @@ const layer = Layer.effect(
                   activity.lastStreamEventAt = now
                 }).pipe(
                   Effect.andThen(Deferred.succeed(firstStreamEvent, undefined).pipe(Effect.ignore)),
-                  Effect.andThen(handleEvent(event)),
+                  Effect.andThen(handleEvent(event, markProgress)),
                 ),
               ),
               Stream.takeUntil(() => ctx.needsCompaction),
@@ -1265,6 +1272,7 @@ const layer = Layer.effect(
                   postToolContinuation: activity.isPostToolContinuation,
                   subagent: streamInput.parentSessionID !== undefined,
                 }),
+                progress: () => progressed,
                 set: (info) => {
                   retryAttempt = info.attempt
                   activity.retryAttempt = info.attempt

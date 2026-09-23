@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import path from "path"
@@ -1387,6 +1387,96 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(states).toStrictEqual([1])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests restart displayed retry attempt after meaningful progress", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+
+        yield* llm.error(503, { error: "boom" })
+        yield* llm.push(
+          raw({
+            chunks: [
+              { id: "chatcmpl-reason", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+              {
+                id: "chatcmpl-reason",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { reasoning_content: "thinking" } }],
+              },
+              {
+                id: "chatcmpl-reason",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "network_error" }],
+              },
+            ],
+          }),
+          raw({
+            chunks: [
+              { id: "chatcmpl-text", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+              {
+                id: "chatcmpl-text",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { content: "partial" } }],
+              },
+              {
+                id: "chatcmpl-text",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "network_error" }],
+              },
+            ],
+          }),
+          reply().text("done").stop(),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry with progress")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const attempts: number[] = []
+        const off = yield* events.listen((evt) => {
+          if (evt.type !== SessionStatus.Event.Status.type || !Schema.is(SessionStatus.Event.Status.data)(evt.data))
+            return Effect.void
+          const data = evt.data
+          if (data.sessionID === chat.id && data.status.type === "retry") attempts.push(data.status.attempt)
+          return Effect.void
+        })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry with progress" }],
+          tools: {},
+        })
+
+        yield* off
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(4)
+        expect(parts.some((part) => part.type === "reasoning" && part.text === "thinking")).toBe(true)
+        expect(parts.some((part) => part.type === "text" && part.text === "partial")).toBe(true)
+        expect(attempts).toStrictEqual([1, 1, 1])
       }),
     { config: (url) => providerCfg(url) },
   ),
