@@ -249,9 +249,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
-const backgroundNoLLMServer = testEffect(
-  makePrompt({ runtimeFlags: backgroundRuntimeFlags }) as unknown as Layer.Layer<any, any, never>,
-)
+const backgroundNoLLMServer = testEffect(makePrompt({ runtimeFlags: backgroundRuntimeFlags }))
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
   makeHttp({
@@ -1131,6 +1129,329 @@ it.instance(
       yield* Fiber.await(fiber)
     }),
   10_000,
+)
+
+const selectionConfig = {
+  ...cfg,
+  default_agent: "plan",
+  agent: {
+    build: { model: "test/test-model", variant: "xhigh" },
+    plan: { model: "test/plan-model", variant: "medium" },
+  },
+  provider: {
+    ...cfg.provider,
+    test: {
+      ...cfg.provider.test,
+      models: {
+        "test-model": { ...cfg.provider.test.models["test-model"], variants: { xhigh: {}, high: {} } },
+        "custom-model": {
+          ...cfg.provider.test.models["test-model"],
+          id: "custom-model",
+          variants: { low: {}, high: {} },
+        },
+        "plan-model": {
+          ...cfg.provider.test.models["test-model"],
+          id: "plan-model",
+          variants: { medium: {} },
+        },
+      },
+    },
+  },
+}
+const customRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("custom-model") }
+const defaultVariants = ["default", undefined] as const
+
+defaultVariants.forEach((variant) => {
+  noLLMServer.instance(
+    `selection preservation keeps durable ${variant ?? "absent"} variant instead of agent xhigh`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({
+          agent: "build",
+          model: { providerID: ref.providerID, id: ref.modelID, variant },
+        })
+
+        const next = yield* prompt.prompt({ sessionID: session.id, noReply: true, parts: [] })
+
+        if (next.info.role !== "user") throw new Error("expected user message")
+        expect(next.info.agent).toBe("build")
+        expect(next.info.model).toEqual(ref)
+      }),
+    { config: selectionConfig },
+  )
+
+  noLLMServer.instance(
+    `selection preservation keeps history-only ${variant ?? "absent"} variant instead of agent xhigh`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({})
+        yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { ...ref, variant },
+          time: { created: Date.now() },
+        })
+
+        const next = yield* prompt.prompt({ sessionID: session.id, noReply: true, parts: [] })
+
+        if (next.info.role !== "user") throw new Error("expected user message")
+        expect(next.info.agent).toBe("build")
+        expect(next.info.model).toEqual(ref)
+        expect(yield* sessions.get(session.id)).toMatchObject({
+          agent: "build",
+          model: { providerID: ref.providerID, id: ref.modelID, variant: "default" },
+        })
+      }),
+    { config: selectionConfig },
+  )
+})
+
+const forkVariants = ["low", "default", undefined] as const
+forkVariants.forEach((variant) => {
+  noLLMServer.instance(
+    `selection preservation keeps custom model and ${variant ?? "absent"} variant on same explicit fork agent`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const parent = yield* sessions.create({})
+        yield* prompt.prompt({
+          sessionID: parent.id,
+          agent: "build",
+          model: customRef,
+          variant,
+          noReply: true,
+          parts: [],
+        })
+        const fork = yield* sessions.fork({ sessionID: parent.id })
+        expect(fork.agent).toBeUndefined()
+        expect(fork.model).toBeUndefined()
+
+        const next = yield* prompt.prompt({ sessionID: fork.id, agent: "build", noReply: true, parts: [] })
+
+        if (next.info.role !== "user") throw new Error("expected user message")
+        expect(next.info.agent).toBe("build")
+        expect(next.info.model).toEqual({ ...customRef, variant: variant === "default" ? undefined : variant })
+        expect(yield* sessions.get(fork.id)).toMatchObject({
+          agent: "build",
+          model: { providerID: customRef.providerID, id: customRef.modelID, variant: variant ?? "default" },
+        })
+      }),
+    { config: selectionConfig },
+  )
+})
+
+noLLMServer.instance(
+  "selection preservation inherits fork agent and custom selection when routing is omitted",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({})
+      yield* prompt.prompt({
+        sessionID: parent.id,
+        agent: "build",
+        model: customRef,
+        variant: "low",
+        noReply: true,
+        parts: [],
+      })
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+
+      const next = yield* prompt.prompt({ sessionID: fork.id, noReply: true, parts: [] })
+
+      if (next.info.role !== "user") throw new Error("expected user message")
+      expect(next.info.agent).toBe("build")
+      expect(next.info.model).toEqual({ ...customRef, variant: "low" })
+    }),
+  { config: selectionConfig },
+)
+
+noLLMServer.instance(
+  "selection preservation adopts configured model and variant on a genuine fork agent switch",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({})
+      yield* prompt.prompt({
+        sessionID: parent.id,
+        agent: "build",
+        model: customRef,
+        variant: "low",
+        noReply: true,
+        parts: [],
+      })
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+
+      const next = yield* prompt.prompt({ sessionID: fork.id, agent: "plan", noReply: true, parts: [] })
+
+      if (next.info.role !== "user") throw new Error("expected user message")
+      expect(next.info.agent).toBe("plan")
+      expect(next.info.model).toEqual({
+        providerID: ref.providerID,
+        modelID: ModelV2.ID.make("plan-model"),
+        variant: "medium",
+      })
+    }),
+  { config: selectionConfig },
+)
+
+noLLMServer.instance(
+  "selection preservation uses provider default on a fork switch without a configured model",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({})
+      yield* prompt.prompt({
+        sessionID: parent.id,
+        agent: "build",
+        model: customRef,
+        variant: "low",
+        noReply: true,
+        parts: [],
+      })
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+
+      const next = yield* prompt.prompt({ sessionID: fork.id, agent: "plan", noReply: true, parts: [] })
+
+      if (next.info.role !== "user") throw new Error("expected user message")
+      expect(next.info.agent).toBe("plan")
+      expect(next.info.model).toEqual(ref)
+    }),
+  {
+    config: {
+      ...selectionConfig,
+      model: "test/test-model",
+      agent: { ...selectionConfig.agent, plan: {} },
+    },
+  },
+)
+
+const historyAgents = ["build", "plan"] as const
+historyAgents.forEach((agent) => {
+  noLLMServer.instance(
+    `selection preservation uses only compatible history when durable ${agent} model is missing`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({ agent })
+        yield* sessions.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: session.id,
+          agent: "build",
+          model: { ...customRef, variant: "low" },
+          time: { created: Date.now() },
+        })
+
+        const next = yield* prompt.prompt({ sessionID: session.id, noReply: true, parts: [] })
+
+        if (next.info.role !== "user") throw new Error("expected user message")
+        expect(next.info.agent).toBe(agent)
+        expect(next.info.model).toEqual(
+          agent === "build"
+            ? { ...customRef, variant: "low" }
+            : { providerID: ref.providerID, modelID: ModelV2.ID.make("plan-model"), variant: "medium" },
+        )
+      }),
+    { config: selectionConfig },
+  )
+})
+
+const overrideVariants = ["high", "default", undefined] as const
+overrideVariants.forEach((variant) => {
+  noLLMServer.instance(
+    `selection preservation honors explicit model with ${variant ?? "configured"} variant over fork history`,
+    () =>
+      Effect.gen(function* () {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const parent = yield* sessions.create({})
+        yield* prompt.prompt({
+          sessionID: parent.id,
+          agent: "build",
+          model: customRef,
+          variant: "low",
+          noReply: true,
+          parts: [],
+        })
+        const fork = yield* sessions.fork({ sessionID: parent.id })
+
+        const next = yield* prompt.prompt({
+          sessionID: fork.id,
+          agent: "build",
+          model: ref,
+          variant,
+          noReply: true,
+          parts: [],
+        })
+
+        if (next.info.role !== "user") throw new Error("expected user message")
+        expect(next.info.model).toEqual({ ...ref, variant: variant ?? "xhigh" })
+      }),
+    { config: selectionConfig },
+  )
+})
+
+noLLMServer.instance(
+  "selection preservation honors explicit variant without replacing the inherited fork model",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({})
+      yield* prompt.prompt({
+        sessionID: parent.id,
+        agent: "build",
+        model: customRef,
+        variant: "low",
+        noReply: true,
+        parts: [],
+      })
+      const fork = yield* sessions.fork({ sessionID: parent.id })
+
+      const next = yield* prompt.prompt({
+        sessionID: fork.id,
+        agent: "build",
+        variant: "high",
+        noReply: true,
+        parts: [],
+      })
+
+      if (next.info.role !== "user") throw new Error("expected user message")
+      expect(next.info.model).toEqual({ ...customRef, variant: "high" })
+    }),
+  { config: selectionConfig },
+)
+
+noLLMServer.instance(
+  "selection preservation uses configured defaults for a new session without a selection",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({})
+
+      const next = yield* prompt.prompt({ sessionID: session.id, noReply: true, parts: [] })
+
+      if (next.info.role !== "user") throw new Error("expected user message")
+      expect(next.info.agent).toBe("plan")
+      expect(next.info.model).toEqual({
+        providerID: ref.providerID,
+        modelID: ModelV2.ID.make("plan-model"),
+        variant: "medium",
+      })
+    }),
+  { config: selectionConfig },
 )
 
 it.instance(

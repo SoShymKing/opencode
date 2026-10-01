@@ -637,14 +637,14 @@ const layer = Layer.effect(
       // agent/model, so synthetic prompts that omit either field do not fall
       // back to configured defaults.
       const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      const prev =
-        input.agent || current.agent
-          ? undefined
-          : (yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database))).findLast(
-              (m): m is SessionV1.WithParts & { info: SessionV1.User } =>
-                m.info.role === "user" && !!m.info.agent,
-            )
-      const agentName = input.agent ?? current.agent ?? prev?.info.agent
+      const previous =
+        !current.agent || (!input.model && !current.model)
+          ? yield* sessions
+              .findMessage(input.sessionID, (m) => m.info.role === "user" && !!m.info.agent)
+              .pipe(Effect.orDie)
+          : Option.none()
+      const prev = Option.isSome(previous) && previous.value.info.role === "user" ? previous.value.info : undefined
+      const agentName = input.agent ?? current.agent ?? prev?.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -656,25 +656,38 @@ const layer = Layer.effect(
 
       // A genuine agent switch gets the new agent's configured model; an
       // injected prompt for the current agent keeps the session model.
-      const switched = !!current.agent && ag.name !== current.agent
-      const sessionModel =
-        !switched && current.model
-          ? {
-              providerID: ProviderV2.ID.make(current.model.providerID),
-              modelID: ModelV2.ID.make(current.model.id),
-              variant: current.model.variant === "default" ? undefined : current.model.variant,
-            }
-          : undefined
-      const model = input.model ?? sessionModel ?? prev?.info.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      const priorAgent = current.agent ?? prev?.agent
+      const switched = !!priorAgent && ag.name !== priorAgent
+      const inherited =
+        input.model || switched
+          ? undefined
+          : current.model
+            ? {
+                providerID: ProviderV2.ID.make(current.model.providerID),
+                modelID: ModelV2.ID.make(current.model.id),
+                variant: current.model.variant,
+              }
+            : prev?.agent === ag.name
+              ? prev.model
+              : undefined
+      const model = input.model ?? inherited ?? ag.model ?? (yield* provider.defaultModel().pipe(Effect.orDie))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !input.variant && !inherited && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
-              .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
+              .pipe(Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)))
           : undefined
-      const modelVariant = model === sessionModel ? sessionModel.variant : model === prev?.info.model ? prev.info.model.variant : undefined
-      const variant = input.variant ?? modelVariant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      // An inherited default/absent variant is a selection, not a request for the agent's configured variant.
+      const variant =
+        input.variant ??
+        (inherited
+          ? inherited.variant === "default"
+            ? undefined
+            : inherited.variant
+          : ag.variant && full?.variants?.[ag.variant]
+            ? ag.variant
+            : undefined)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
