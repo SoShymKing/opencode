@@ -4,13 +4,14 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
 import { Provider } from "@/provider/provider"
+import { ProviderError } from "@/provider/error"
 
 import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
@@ -425,13 +426,17 @@ function processorInput(input: {
   } satisfies LLM.StreamInput
 }
 
-const processorHarness = Effect.fn("test.processorHarness")(function* (directory: string, text: string) {
+const processorHarness = Effect.fn("test.processorHarness")(function* (directory: string, text: string, modelRef = ref) {
   const { processors, session, provider } = yield* boot()
   const chat = yield* session.create({})
   const parent = yield* user(chat.id, text)
   const msg = yield* assistant(chat.id, parent.id, path.resolve(directory))
-  const model = yield* provider.getModel(ref.providerID, ref.modelID)
-  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+  const model = yield* provider.getModel(modelRef.providerID, modelRef.modelID)
+  const handle = yield* processors.create({
+    assistantMessage: { ...msg, providerID: modelRef.providerID, modelID: modelRef.modelID },
+    sessionID: chat.id,
+    model,
+  })
   return { handle, input: processorInput({ parent, sessionID: chat.id, model, text }) }
 })
 
@@ -930,6 +935,161 @@ partialAbortIt.live("session.processor effect tests do not retry unexpected abor
     { config: cfg },
   ),
 )
+
+const retryDiagnosticsRef = {
+  providerID: ProviderV2.ID.make("retry-provider"),
+  modelID: ModelV2.ID.make("retry-model"),
+}
+const retryDiagnosticsCfg = {
+  ...cfg,
+  provider: {
+    ...cfg.provider,
+    [retryDiagnosticsRef.providerID]: {
+      ...cfg.provider.test,
+      id: retryDiagnosticsRef.providerID,
+      models: {
+        [retryDiagnosticsRef.modelID]: { ...cfg.provider.test.models["test-model"], id: retryDiagnosticsRef.modelID },
+      },
+    },
+  },
+}
+const retryDiagnosticsIt = testEffect(Layer.empty)
+
+for (const scenario of [
+  {
+    name: "identify transport failure after visible progress",
+    watchdog: false,
+    stream: Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.textStart({ id: "retry-text" }),
+      LLMEvent.textDelta({ id: "retry-text", text: "partial" }),
+    ).pipe(Stream.concat(Stream.fail(new ProviderError.ResponseStreamError("Connection closed after text")))),
+    expected: {
+      errorName: "APIError",
+      abortSource: "unknown",
+      phase: "post_tool_continuation",
+      firstStreamEventAt: expect.any(Number),
+      firstVisiblePartAt: expect.any(Number),
+    },
+  },
+  {
+    name: "preserve structured abort source and phase",
+    watchdog: false,
+    stream: Stream.make(LLMEvent.stepStart({ index: 0 })).pipe(
+      Stream.concat(
+        Stream.fail(
+          new MessageV2.UnexpectedProviderAbortError({
+            message: "Network interrupted the stream",
+            abortSource: "network_abort",
+            phase: "model_stream",
+            retryable: true,
+          }),
+        ),
+      ),
+    ),
+    expected: {
+      errorName: "UnexpectedProviderAbortError",
+      abortSource: "network_abort",
+      phase: "model_stream",
+      firstStreamEventAt: expect.any(Number),
+    },
+  },
+  {
+    name: "retain genuine first-event watchdog labels",
+    watchdog: true,
+    stream: Stream.never,
+    expected: {
+      abortSource: "post_tool_first_event_timeout",
+      phase: "post_tool_continuation",
+      firstStreamEventAt: undefined,
+      firstVisiblePartAt: undefined,
+      partCount: 0,
+    },
+  },
+  {
+    name: "identify empty assistant finalization",
+    watchdog: false,
+    stream: Stream.empty,
+    expected: {
+      errorName: "EmptyAssistantResponseError",
+      abortSource: "unknown",
+      phase: "message_finalization",
+    },
+  },
+]) {
+  retryDiagnosticsIt.effect(`session.processor retry diagnostics ${scenario.name}`, () =>
+    Effect.gen(function* () {
+      // Given
+      const started = yield* Deferred.make<void>()
+      const retryReady = yield* Deferred.make<void>()
+      const logs: ReturnType<typeof Logger.formatStructured.log>[] = []
+      const stream: Stream.Stream<LLMEvent, unknown> = scenario.stream
+      const llm = llmMock(
+        Stream.fromEffect(Deferred.succeed(started, undefined)).pipe(Stream.drain, Stream.concat(stream)),
+        assistantSuccessStream("retried"),
+      )
+
+      yield* provideTmpdirInstance(
+        (dir) =>
+          Effect.gen(function* () {
+            const harness = yield* processorHarness(dir, "retry diagnostics", retryDiagnosticsRef)
+            const events = yield* EventV2Bridge.Service
+            const off = yield* events.listen((event) => {
+              if (
+                event.type !== SessionStatus.Event.Status.type ||
+                !Schema.is(SessionStatus.Event.Status.data)(event.data)
+              )
+                return Effect.void
+              if (event.data.sessionID === harness.input.sessionID && event.data.status.type === "retry")
+                return Deferred.succeed(retryReady, undefined).pipe(Effect.asVoid)
+              return Effect.void
+            })
+            yield* Effect.addFinalizer(() => off)
+
+            // When
+            const run = yield* harness.handle
+              .process({
+                ...harness.input,
+                user: { ...harness.input.user, model: retryDiagnosticsRef },
+                internal: { postToolContinuation: true, postToolFirstEventTimeoutMs: 100 },
+              })
+              .pipe(
+                Effect.provide(Logger.layer([Logger.make((entry) => logs.push(Logger.formatStructured.log(entry)))])),
+                Effect.forkChild,
+              )
+            yield* Deferred.await(started)
+            if (scenario.watchdog) yield* TestClock.adjust("100 millis")
+            yield* Deferred.await(retryReady)
+            yield* TestClock.adjust("3 seconds")
+            const result = yield* Fiber.join(run)
+
+            // Then
+            expect(result).toBe("continue")
+            expect(llm.calls()).toBe(2)
+            const retries = logs.flatMap((entry) =>
+              Array.isArray(entry.message) && entry.message[0] === "model.no_response.retrying_continuation"
+                ? [entry.message[1]]
+                : [],
+            )
+            expect(retries).toHaveLength(1)
+            expect(
+              logs.some(
+                (entry) =>
+                  Array.isArray(entry.message) && entry.message[0] === "model.no_response.post_tool_first_event_timeout",
+              ),
+            ).toBe(scenario.watchdog)
+            expect(retries[0]).toMatchObject({
+              providerID: retryDiagnosticsRef.providerID,
+              modelID: retryDiagnosticsRef.modelID,
+              attempt: 1,
+              ...scenario.expected,
+            })
+          }),
+        { config: retryDiagnosticsCfg },
+      ).pipe(Effect.provide(processorEnv(llm.layer)))
+    }),
+  )
+}
 
 const postToolTimeoutRetryLLM = llmMock(delayedFirstEventStream(50), assistantSuccessStream("after-timeout"))
 const postToolTimeoutRetryIt = testEffect(processorEnv(postToolTimeoutRetryLLM.layer))

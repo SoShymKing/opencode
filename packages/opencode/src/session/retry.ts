@@ -227,7 +227,13 @@ export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   progress?: () => boolean
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  set: (input: {
+    attempt: number
+    error: Err
+    message: string
+    action?: Retryable["action"]
+    next: number
+  }) => Effect.Effect<void>
   context?: () => RetryContext
 }) {
   return Schedule.fromStepWithMetadata(
@@ -256,6 +262,7 @@ export function policy(opts: {
           const now = yield* Clock.currentTimeMillis
           yield* opts.set({
             attempt,
+            error,
             message: retry.message,
             action: retry.action,
             next: now + wait,
