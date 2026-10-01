@@ -645,7 +645,18 @@ const layer = Layer.effect(
     })
 
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
-      const agentName = input.agent
+      // The durable session row survives compaction and records the current
+      // agent/model, so synthetic prompts that omit either field do not fall
+      // back to configured defaults.
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const previous =
+        !current.agent || (!input.model && !current.model)
+          ? yield* sessions
+              .findMessage(input.sessionID, (m) => m.info.role === "user" && !!m.info.agent)
+              .pipe(Effect.orDie)
+          : Option.none()
+      const prev = Option.isSome(previous) && previous.value.info.role === "user" ? previous.value.info : undefined
+      const agentName = input.agent ?? current.agent ?? prev?.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -655,15 +666,40 @@ const layer = Layer.effect(
         throw error
       }
 
-      const model = input.model ?? ag.model ?? (yield* currentModel(input.sessionID))
+      // A genuine agent switch gets the new agent's configured model; an
+      // injected prompt for the current agent keeps the session model.
+      const priorAgent = current.agent ?? prev?.agent
+      const switched = !!priorAgent && ag.name !== priorAgent
+      const inherited =
+        input.model || switched
+          ? undefined
+          : current.model
+            ? {
+                providerID: ProviderV2.ID.make(current.model.providerID),
+                modelID: ModelV2.ID.make(current.model.id),
+                variant: current.model.variant,
+              }
+            : prev?.agent === ag.name
+              ? prev.model
+              : undefined
+      const model = input.model ?? inherited ?? ag.model ?? (yield* provider.defaultModel().pipe(Effect.orDie))
       const same = ag.model && model.providerID === ag.model.providerID && model.modelID === ag.model.modelID
       const full =
-        !input.variant && ag.variant && same
+        !input.variant && !inherited && ag.variant && same
           ? yield* provider
               .getModel(model.providerID, model.modelID)
-              .pipe(Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)))
+              .pipe(Effect.catchTag("ProviderModelNotFoundError", () => Effect.succeed(undefined)))
           : undefined
-      const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
+      // An inherited default/absent variant is a selection, not a request for the agent's configured variant.
+      const variant =
+        input.variant ??
+        (inherited
+          ? inherited.variant === "default"
+            ? undefined
+            : inherited.variant
+          : ag.variant && full?.variants?.[ag.variant]
+            ? ag.variant
+            : undefined)
 
       const info: SessionV1.User = {
         id: input.messageID ?? MessageID.ascending(),
@@ -681,7 +717,6 @@ const layer = Layer.effect(
         format: input.format,
       }
 
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (
         current.agent !== info.agent ||
         current.model?.providerID !== info.model.providerID ||
