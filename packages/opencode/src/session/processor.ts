@@ -1291,8 +1291,11 @@ const layer = Layer.effect(
                     if (activity.isPostToolContinuation) {
                       yield* Effect.logWarning("model.no_response.retrying_continuation", {
                         ...diagnostics(),
-                        abortSource: "post_tool_first_event_timeout",
-                        phase: "post_tool_continuation",
+                        errorName: info.error.name,
+                        abortSource: isRecord(info.error.data) ? (info.error.data.abortSource ?? "unknown") : "unknown",
+                        phase: isRecord(info.error.data)
+                          ? (info.error.data.phase ?? "post_tool_continuation")
+                          : "post_tool_continuation",
                         attempt: info.attempt,
                       })
                     }
