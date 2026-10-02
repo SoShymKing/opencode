@@ -42,6 +42,7 @@ type StreamInput = {
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
   readonly onStreamEventCount?: (count: number) => Effect.Effect<void>
+  readonly onStreamEnd?: Effect.Effect<void>
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -132,7 +133,11 @@ export function stream(input: StreamInput): StreamResult {
             ),
             Stream.concat(
               Stream.fromEffectDrain(
-                FiberSet.awaitEmpty(settlements).pipe(Effect.andThen(Queue.end(results)), Effect.asVoid),
+                (input.onStreamEnd ?? Effect.void).pipe(
+                  Effect.andThen(FiberSet.awaitEmpty(settlements)),
+                  Effect.andThen(Queue.end(results)),
+                  Effect.asVoid,
+                ),
               ),
             ),
           )

@@ -46,6 +46,7 @@ export type StreamInput = {
   retries?: number
   toolChoice?: "auto" | "required" | "none"
   onStreamEventCount?: (count: number | undefined) => Effect.Effect<void>
+  onStreamEnd?: Effect.Effect<void>
 }
 
 export type StreamRequest = StreamInput & {
@@ -241,6 +242,7 @@ const live: Layer.Layer<
           headers: prepared.headers,
           abort: input.abort,
           onStreamEventCount: input.onStreamEventCount,
+          onStreamEnd: input.onStreamEnd,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected", {
@@ -344,7 +346,20 @@ const live: Layer.Layer<
                   streamEventCount.value = 0
                   if (input.onStreamEventCount)
                     await bridge.promise(input.onStreamEventCount(rawCapable ? 0 : undefined))
-                  return doStream()
+                  const result = await doStream()
+                  return {
+                    ...result,
+                    stream: result.stream.pipeThrough(new TransformStream({
+                      async transform(event, controller) {
+                        if (event.type === "raw" && input.onStreamEventCount)
+                          await bridge.promise(input.onStreamEventCount(++streamEventCount.value))
+                        controller.enqueue(event)
+                      },
+                      async flush() {
+                        if (input.onStreamEnd) await bridge.promise(input.onStreamEnd)
+                      },
+                    })),
+                  }
                 },
                 async transformParams(args) {
                   if (args.type === "stream") {
@@ -392,11 +407,6 @@ const live: Layer.Layer<
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
-              Stream.tap((event) =>
-                event.type === "raw" && input.onStreamEventCount
-                  ? input.onStreamEventCount(++result.streamEventCount.value)
-                  : Effect.void,
-              ),
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )
