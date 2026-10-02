@@ -23,6 +23,7 @@ type Entry<E> = {
 
 export const make = <Key, E>(options: {
   readonly drain: (key: Key, force: boolean) => Effect.Effect<void, E>
+  readonly onSettled?: (key: Key, exit: Exit.Exit<void, E>) => Effect.Effect<void>
 }): Effect.Effect<Coordinator<Key, E>, never, Scope.Scope> =>
   Effect.gen(function* () {
     const active = new Map<Key, Entry<E>>()
@@ -39,7 +40,7 @@ export const make = <Key, E>(options: {
       const owner = fork(
         (successor ? Effect.yieldNow : Deferred.await(ready)).pipe(
           Effect.andThen(Effect.suspend(() => options.drain(key, force))),
-          Effect.onExit((exit) => Effect.sync(() => settle(key, entry, exit))),
+          Effect.onExit((exit) => settle(key, entry, exit)),
           Effect.exit,
           Effect.asVoid,
         ),
@@ -48,13 +49,15 @@ export const make = <Key, E>(options: {
       if (!successor) Deferred.doneUnsafe(ready, Effect.void)
     }
 
-    const settle = (key: Key, entry: Entry<E>, exit: Exit.Exit<void, E>) => {
+    const settle = (key: Key, entry: Entry<E>, exit: Exit.Exit<void, E>) => Effect.gen(function* () {
       if (Exit.isSuccess(exit) && !entry.stopping && entry.pendingWake) {
         entry.pendingWake = false
         start(key, entry, false, true)
         return
       }
 
+      entry.stopping = true
+      yield* options.onSettled?.(key, exit) ?? Effect.void
       const successor = entry.pendingWake ? makeEntry() : undefined
       if (successor === undefined) active.delete(key)
       else {
@@ -62,7 +65,7 @@ export const make = <Key, E>(options: {
         start(key, successor, false, true)
       }
       Deferred.doneUnsafe(entry.done, exit)
-    }
+    })
 
     const run = (key: Key): Effect.Effect<void, E> =>
       Effect.uninterruptibleMask((restore) => {
