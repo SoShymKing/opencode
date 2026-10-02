@@ -70,6 +70,8 @@ import { useSettings } from "@/context/settings"
 import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
+import { useServerSync } from "@/context/server-sync"
+import { getRelativeTime } from "@/utils/time"
 import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { sessionTitle } from "@/utils/session-title"
 import { scheduleConnectedMeasure } from "./measure"
@@ -133,9 +135,28 @@ function TimelineThinkingRow(props: {
   reasoningHeading?: string
   showReasoningSummaries: boolean
   streamEventCount?: number
+  activity?: TimelineRowMap["Thinking"]["activity"]
+  terminal?: TimelineRowMap["Thinking"]["terminal"]
+  tools?: TimelineRowMap["Thinking"]["tools"]
 }) {
   const language = useLanguage()
+  const [clock, setClock] = createStore({ now: Date.now() })
+  createEffect(on(() => !!props.activity && props.activity.lastStreamEventAt !== undefined, (active) => {
+    if (!active) return
+    setClock("now", Date.now())
+    const timer = setInterval(() => setClock("now", Date.now()), 1000)
+    onCleanup(() => clearInterval(timer))
+  }))
+  const lastReceived = createMemo(() => {
+    const timestamp = props.activity?.lastStreamEventAt
+    if (timestamp === undefined) return
+    return language.t("session.activity.lastReceived", {
+      seconds: Math.max(0, Math.floor((clock.now - timestamp) / 1000)),
+    })
+  })
   const label = createMemo(() => {
+    if (props.terminal) return language.t(`session.activity.${props.terminal.reason}`)
+    if (props.activity) return language.t(`session.activity.${props.activity.model}`, { count: props.streamEventCount ?? "?" })
     const count = props.streamEventCount
     return count === undefined
       ? language.t("ui.sessionTurn.status.thinkingStreamsUnknown")
@@ -143,10 +164,15 @@ function TimelineThinkingRow(props: {
   })
 
   return (
-    <div data-slot="session-turn-thinking">
-      <bdi dir="auto">
-        <TextShimmer text={label()} />
+    <div data-slot="session-turn-thinking" class="flex-wrap" role="status" data-model-stage={props.activity?.model} data-terminal={props.terminal?.reason}>
+      <bdi dir="auto" class="min-w-0 max-w-full shrink-0 break-words">
+        <Show when={!props.terminal} fallback={<span>{label()}</span>}>
+          <TextShimmer text={label()} class="max-w-full [&_span]:min-w-0 [&_span]:whitespace-normal" />
+        </Show>
       </bdi>
+      <Show when={lastReceived()}>{(text) => <bdi dir="auto" class="shrink-0 whitespace-nowrap text-text-weak">{text()}</bdi>}</Show>
+      <Show when={props.tools}>{(tools) => <bdi dir="auto" class="shrink-0 whitespace-nowrap">{language.t(`session.activity.tools.${tools()}`)}</bdi>}</Show>
+      <Show when={props.terminal?.message}>{(message) => <bdi dir="auto">{message()}</bdi>}</Show>
       <Show when={!props.showReasoningSummaries}>
         <TextReveal text={props.reasoningHeading} class="session-turn-thinking-heading" travel={25} duration={700} />
       </Show>
@@ -274,6 +300,7 @@ export function MessageTimeline(props: {
   const serverSDK = useServerSDK()
   const sdk = useSDK()
   const sync = useSync()
+  const serverSync = useServerSync()
   const settings = useSettings()
   const dialog = useDialog()
   const sessionArchive = useSessionArchive()
@@ -350,10 +377,10 @@ export function MessageTimeline(props: {
     status: sessionStatus,
     showReasoningSummaries: settings.general.showReasoningSummaries,
     inlineComments: settings.general.newLayoutDesigns,
+    pending: () => serverSync().session.data.pending_input[sessionID() ?? ""] ?? {},
   })
   const activeMessageID = projection.activeMessageID
   const assistantMessagesByParent = projection.assistantMessagesByParent
-  const lastAssistantGroupKey = projection.lastAssistantGroupKey
   const messageByID = projection.messageByID
   const messageLastRowIndex = projection.messageLastRowIndex
   const messageRowIndex = projection.messageRowIndex
@@ -1003,9 +1030,6 @@ export function MessageTimeline(props: {
           parts={parts()}
           open={open()}
           onOpenChange={(value) => setToolOpen(contextOpenKey(), value)}
-          busy={
-            workingTurn(row().userMessageID) && lastAssistantGroupKey().get(row().userMessageID) === row().group.key
-          }
           onSizeChange={onSizeChange}
         />
       )
@@ -1152,6 +1176,11 @@ export function MessageTimeline(props: {
                       useV2Actions={settings.general.newLayoutDesigns()}
                       comments={messageComments()}
                     />
+                    <Show when={userMessageRow().pending}>
+                      <div data-slot="session-input-pending" class="flex justify-end pt-1 text-12-regular text-text-weak">
+                        <bdi dir="auto" class="rounded px-2 py-0.5 bg-background-stronger">{language.t("session.input.pending")}</bdi>
+                      </div>
+                    </Show>
                   </div>
                 </div>
               )}
@@ -1198,6 +1227,9 @@ export function MessageTimeline(props: {
               <TimelineThinkingRow
                 reasoningHeading={thinkingRow().reasoningHeading}
                 streamEventCount={thinkingRow().streamEventCount}
+                activity={thinkingRow().activity}
+                terminal={thinkingRow().terminal}
+                tools={thinkingRow().tools}
                 showReasoningSummaries={settings.general.showReasoningSummaries()}
               />
             </div>

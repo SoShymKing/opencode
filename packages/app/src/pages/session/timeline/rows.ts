@@ -1,6 +1,7 @@
 import { parseCommentNote, readCommentMetadata } from "@/utils/comment-note"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
-import { AssistantMessage, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
+import { AssistantMessage, Part, UserMessage } from "@opencode-ai/sdk/v2"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { groupParts, renderable, type PartGroup } from "@opencode-ai/session-ui/message-part"
 import { TimelineRow, type SummaryDiff } from "./timeline-row"
 import { uniqueSummaryDiffs } from "./summary-diffs"
@@ -16,6 +17,7 @@ export type TimelineRowMap = {
   UserMessage: {
     userMessageID: string
     anchor: boolean
+    pending?: boolean
   }
   TurnDivider: {
     userMessageID: string
@@ -26,7 +28,14 @@ export type TimelineRowMap = {
     group: PartGroup
     previousAssistantPart: boolean
   }
-  Thinking: { userMessageID: string; reasoningHeading?: string; streamEventCount?: number }
+  Thinking: {
+    userMessageID: string
+    reasoningHeading?: string
+    streamEventCount?: number
+    activity?: typeof SessionStatusEvent.Activity.Encoded
+    terminal?: typeof SessionStatusEvent.Terminal.Encoded
+    tools?: "pending" | "running"
+  }
   Retry: { userMessageID: string }
   DiffSummary: { userMessageID: string; diffs: SummaryDiff[] }
   Error: { userMessageID: string; text: string }
@@ -38,9 +47,10 @@ export namespace Timeline {
     getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
     getMessageParts: (messageID: string) => Part[],
     showReasoning: boolean,
-    status: SessionStatus["type"],
+    status: typeof SessionStatusEvent.Info.Encoded,
     inlineComments: boolean,
     projectedUserMessages: UserMessage[],
+    pending: Record<string, boolean> = {},
   ) {
     const turns: { user: UserMessage; assistants: AssistantMessage[] }[] = []
     const turnByUserID = new Map<string, (typeof turns)[number]>()
@@ -80,9 +90,12 @@ export namespace Timeline {
       if (index >= 0) turns.splice(index, 0, turn)
       turnByUserID.set(user.id, turn)
     })
-    const activeMessageID = turns.at(-1)?.user.id
+    const latestMessageID = turns.at(-1)?.user.id
+    const owner = status.type === "idle" ? status.terminal?.userMessageID : status.activity?.userMessageID
+    const activeMessageID = owner ?? turns.findLast((turn) => !pending[turn.user.id])?.user.id ?? latestMessageID
     return {
       activeMessageID,
+      latestMessageID,
       rows: turns.flatMap((turn, index) =>
         constructMessageRows(
           turn.user,
@@ -93,6 +106,7 @@ export namespace Timeline {
           status,
           turn.user.id === activeMessageID,
           inlineComments,
+          pending[turn.user.id] === true,
         ),
       ),
     }
@@ -104,10 +118,11 @@ export namespace Timeline {
     assistantMessages: AssistantMessage[],
     index: number,
     showReasoning: boolean,
-    status: SessionStatus["type"],
+    status: typeof SessionStatusEvent.Info.Encoded,
     isActive: boolean,
     // v2 renders comments inside the user message attachments row instead of a strip row
     inlineComments: boolean,
+    pending = false,
   ) {
     const rows: TimelineRow.TimelineRow[] = []
 
@@ -156,6 +171,7 @@ export namespace Timeline {
       new TimelineRow.UserMessage({
         userMessageID: userMessage.id,
         anchor: inlineComments || comments.length === 0,
+        pending,
       }),
     )
 
@@ -190,7 +206,9 @@ export namespace Timeline {
       assistantGroupIndex += 1
     })
 
-    if (isActive && status === "busy" && !error && (showReasoning ? assistantPartRefs.length === 0 : true)) {
+    const activity = status.type !== "idle" ? status.activity : undefined
+    const terminal = status.type === "idle" ? status.terminal : undefined
+    if (isActive && (activity || terminal || (status.type === "busy" && !error && (showReasoning ? assistantPartRefs.length === 0 : true)))) {
       const latest = assistantMessages.at(-1)
       const heading = assistantMessages
         .flatMap((message) => getMessageParts(message.id))
@@ -201,15 +219,20 @@ export namespace Timeline {
         new TimelineRow.Thinking({
           userMessageID: userMessage.id,
           reasoningHeading: heading,
-          streamEventCount: latest && latest.time.completed === undefined ? latest.streamEventCount : 0,
+          streamEventCount: activity ? activity.streamEventCount : latest && latest.time.completed === undefined ? latest.streamEventCount : 0,
+          activity,
+          terminal,
+          tools: activity && assistantMessages.flatMap((message) => getMessageParts(message.id)).some((part) => part.type === "tool" && part.state.status === "running")
+            ? "running"
+            : activity && assistantMessages.flatMap((message) => getMessageParts(message.id)).some((part) => part.type === "tool" && part.state.status === "pending") ? "pending" : undefined,
         }),
       )
     }
 
-    if (isActive && status === "retry") rows.push(new TimelineRow.Retry({ userMessageID: userMessage.id }))
+    if (isActive && status.type === "retry") rows.push(new TimelineRow.Retry({ userMessageID: userMessage.id }))
 
     const diffs = uniqueSummaryDiffs(userMessage.summary?.diffs)
-    if (diffs.length > 0 && (status === "idle" || !isActive)) {
+    if (diffs.length > 0 && (status.type === "idle" || !isActive)) {
       rows.push(
         new TimelineRow.DiffSummary({
           userMessageID: userMessage.id,

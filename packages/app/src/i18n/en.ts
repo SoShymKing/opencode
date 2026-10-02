@@ -1,6 +1,18 @@
 import { DESKTOP_NATIVE_ENGLISH } from "./desktop-native"
 
 export const dict = {
+  "session.input.pending": "Waiting to run",
+  "session.activity.preparing": "Preparing model request (streams: {{count}})",
+  "session.activity.waiting": "Waiting for model response (streams: {{count}})",
+  "session.activity.receiving": "Receiving model response (streams: {{count}})",
+  "session.activity.settling": "Model stream ended; follow-up processing (streams: {{count}})",
+  "session.activity.none": "No model request active",
+  "session.activity.lastReceived": "Last received {{seconds}}s ago",
+  "session.activity.tools.pending": "Tool input pending",
+  "session.activity.tools.running": "Tool running",
+  "session.activity.completed": "Response completed",
+  "session.activity.cancelled": "Response cancelled",
+  "session.activity.error": "Response failed",
   ...DESKTOP_NATIVE_ENGLISH,
   "command.category.suggested": "Suggested",
   "command.category.view": "View",

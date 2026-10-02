@@ -1,6 +1,7 @@
 import type { SnapshotFileDiff } from "@opencode-ai/sdk/v2"
 import type { PartGroup } from "@opencode-ai/session-ui/message-part"
 import { Data, Equal } from "effect"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 export type SummaryDiff = SnapshotFileDiff & { file: string }
 
@@ -14,6 +15,7 @@ export namespace TimelineRow {
   export class UserMessage extends Data.TaggedClass("UserMessage")<{
     userMessageID: string
     anchor: boolean
+    pending?: boolean
   }> {}
   export class TurnDivider extends Data.TaggedClass("TurnDivider")<{
     userMessageID: string
@@ -28,6 +30,9 @@ export namespace TimelineRow {
     userMessageID: string
     reasoningHeading?: string
     streamEventCount?: number
+    activity?: typeof SessionStatusEvent.Activity.Encoded
+    terminal?: typeof SessionStatusEvent.Terminal.Encoded
+    tools?: "pending" | "running"
   }> {}
   export class DiffSummary extends Data.TaggedClass("DiffSummary")<{
     userMessageID: string

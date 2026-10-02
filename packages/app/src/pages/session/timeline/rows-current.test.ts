@@ -18,6 +18,59 @@ mock.module("@opencode-ai/session-ui/message-part", () => ({
 const { Timeline, TimelineRow } = await import("./rows")
 
 describe("current session timeline rows", () => {
+  test.each([true, false])("keeps pre-assistant status counts and terminal ownership with reasoning=%s", (reasoning) => {
+    const source = [
+      { id: "msg_owner", type: "user", text: "current", time: { created: 1 } },
+      { id: "msg_pending", type: "user", text: "next", time: { created: 2 } },
+    ] satisfies CurrentSessionMessage[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const construct = (status: Parameters<typeof Timeline.constructSessionMessageRows>[4]) => Timeline.constructSessionMessageRows(
+      source, (id) => normalized.messages.find((message) => message.id === id), () => [], reasoning,
+      status, true, normalized.messages.filter((message) => message.role === "user"), { msg_pending: true },
+    )
+    for (const count of [undefined, 0, 7]) {
+      const result = construct({ type: "busy", activity: { userMessageID: "msg_owner", model: "waiting", streamEventCount: count } })
+      expect(result.rows.find((row) => row._tag === "Thinking")?.streamEventCount).toBe(count)
+      expect(result.activeMessageID).toBe("msg_owner")
+    }
+    const result = construct({ type: "idle", terminal: { userMessageID: "msg_owner", reason: "error", message: "failed" } })
+    expect(result.rows.find((row) => row._tag === "Thinking")).toMatchObject({ userMessageID: "msg_owner", terminal: { reason: "error" } })
+  })
+
+  test.each([
+    ["waiting", true], ["waiting", false],
+    ["receiving", true], ["receiving", false],
+    ["settling", true], ["settling", false],
+  ] as const)("keeps explicit %s activity after tools with reasoning=%s", (model, reasoning) => {
+    const source = [
+      { id: "msg_owner", type: "user", text: "current", time: { created: 1 } },
+      {
+        id: "msg_assistant", type: "assistant", agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: ["bash", "background_output"].map((name) => ({
+          type: "tool" as const, id: `tool_${name}`, name,
+          state: { status: "completed" as const, input: {}, metadata: {}, content: [{ type: "text", text: "done" }] satisfies [{ type: "text"; text: string }] },
+          time: { created: 2, completed: 3 },
+        })),
+        streamEventCount: 99, time: { created: 2, completed: 3 },
+      },
+      { id: "msg_pending", type: "user", text: "next", time: { created: 4 } },
+    ] satisfies CurrentSessionMessage[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+    const result = Timeline.constructSessionMessageRows(
+      source, (id) => messages.get(id), (id) => normalized.parts.get(id) ?? [], reasoning,
+      { type: "busy", activity: { userMessageID: "msg_owner", model, streamEventCount: 0, lastStreamEventAt: 10 } },
+      true, normalized.messages.filter((message) => message.role === "user"), { msg_pending: true },
+    )
+    expect(result.activeMessageID).toBe("msg_owner")
+    expect(result.latestMessageID).toBe("msg_pending")
+    expect(result.rows.find((row) => row._tag === "Thinking")).toMatchObject({
+      userMessageID: "msg_owner", streamEventCount: 0, activity: { model, lastStreamEventAt: 10 }, tools: undefined,
+    })
+    expect(result.rows.find((row) => row._tag === "UserMessage" && row.userMessageID === "msg_pending")).toMatchObject({ pending: true })
+  })
+
   test("blocks older unfinished stream counts when the latest assistant is completed", () => {
     const source = [
       { id: "msg_user", type: "user", text: "current", time: { created: 1 } },
@@ -47,7 +100,7 @@ describe("current session timeline rows", () => {
       (id) => messages.get(id),
       (id) => normalized.parts.get(id) ?? [],
       true,
-      "busy",
+      { type: "busy" },
       true,
       normalized.messages.filter((message) => message.role === "user"),
     )
@@ -80,7 +133,7 @@ describe("current session timeline rows", () => {
         (id) => messages.get(id),
         (id) => normalized.parts.get(id) ?? [],
         true,
-        "busy",
+        { type: "busy" },
         true,
         normalized.messages.filter((message) => message.role === "user"),
       )
@@ -184,7 +237,7 @@ describe("current session timeline rows", () => {
       (messageID) => messages.get(messageID),
       (messageID) => normalized.parts.get(messageID) ?? [],
       true,
-      "busy",
+      { type: "busy" },
       true,
       normalized.messages.filter((message) => message.role === "user"),
     )
@@ -220,7 +273,7 @@ describe("current session timeline rows", () => {
       (messageID) => messages.get(messageID),
       (messageID) => normalized.parts.get(messageID) ?? [],
       true,
-      "idle",
+      { type: "idle" },
       true,
       normalized.messages.filter((message) => message.role === "user"),
     )
@@ -261,7 +314,7 @@ describe("current session timeline rows", () => {
       (messageID) => messages.get(messageID),
       (messageID) => normalized.parts.get(messageID) ?? [],
       true,
-      "idle",
+      { type: "idle" },
       true,
       normalized.messages.filter((message) => message.role === "user"),
     )
@@ -294,7 +347,7 @@ describe("current session timeline rows", () => {
         messageID === optimistic.id ? optimistic : normalized.messages.find((message) => message.id === messageID),
       () => [],
       true,
-      "busy",
+      { type: "busy" },
       true,
       [...normalized.messages.filter((message) => message.role === "user"), optimistic],
     )
@@ -337,7 +390,7 @@ describe("current session timeline rows", () => {
       (messageID) => messages.get(messageID),
       (messageID) => normalized.parts.get(messageID) ?? [],
       true,
-      "busy",
+      { type: "busy" },
       true,
       normalized.messages.filter((message) => message.role === "user"),
     )
