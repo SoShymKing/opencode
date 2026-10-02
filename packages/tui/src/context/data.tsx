@@ -92,7 +92,7 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
         messages.unshift(item)
       },
       activeAssistant(messages: SessionMessage[]) {
-        const item = messages.find((item) => item.type === "assistant" && !item.time.completed)
+        const item = messages.find((item) => item.type === "assistant" && item.time.completed === undefined)
         return item?.type === "assistant" ? item : undefined
       },
       assistant(messages: SessionMessage[], messageID: string) {
@@ -216,9 +216,17 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
               agent: event.data.agent,
               model: event.data.model,
               content: [],
+              streamEventCount: event.data.streamEventCount,
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
               time: { created: event.data.timestamp },
             })
+          })
+          break
+        case "session.next.step.stream.updated":
+          message.update(event.data.sessionID, (draft) => {
+            const currentAssistant = message.assistant(draft, event.data.assistantMessageID)
+            if (!currentAssistant || currentAssistant.time.completed !== undefined) return
+            currentAssistant.streamEventCount = event.data.streamEventCount
           })
           break
         case "session.next.step.ended":
