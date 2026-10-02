@@ -1052,7 +1052,7 @@ export function ContextToolGroup(props: {
   const open = () => props.open ?? localOpen()
   const pending = createMemo(
     () =>
-      !!props.busy || props.parts.some((part) => part.state.status === "pending" || part.state.status === "running"),
+      props.parts.some((part) => part.state.status === "pending" || part.state.status === "running"),
   )
   const summary = createMemo(() => contextToolSummary(props.parts))
   const handleOpenChange = (value: boolean) => {
