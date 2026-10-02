@@ -387,6 +387,7 @@ function currentMessage(value: unknown) {
     model: { id: item.info.modelID ?? "model", providerID: item.info.providerID ?? "provider" },
     cost: item.info.cost,
     tokens: item.info.tokens,
+    streamEventCount: item.info.streamEventCount,
     error: item.info.error,
     content: item.parts.flatMap<unknown>((part) => {
       if (part.type === "text" || part.type === "reasoning") return [{ type: part.type, text: part.text ?? "" }]

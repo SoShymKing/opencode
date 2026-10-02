@@ -1,4 +1,5 @@
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
+import type { SessionEvent } from "@opencode-ai/schema/session-event"
 import type { Event } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
@@ -18,14 +19,35 @@ const isAbortError = (error: unknown) =>
   error !== null && typeof error === "object" && "name" in error && error.name === "AbortError"
 
 const isStreamClosed = (error: unknown, signal?: AbortSignal) => isAbortError(error) || signal?.aborted === true
-export type ServerEvent = Event & { current?: OpenCodeEvent }
+export type CurrentStepEvent =
+  | typeof SessionEvent.Step.Started.Encoded
+  | typeof SessionEvent.Step.StreamUpdated.Encoded
+  | typeof SessionEvent.Step.Ended.Encoded
+  | typeof SessionEvent.Step.Failed.Encoded
+export type ServerSessionEvent = OpenCodeEvent | CurrentStepEvent
+export type ServerEvent = Event & { current?: ServerSessionEvent }
 type QueuedServerEvent = { directory: string; payload: ServerEvent }
 type CurrentDelta = Extract<
   OpenCodeEvent,
   { type: "session.text.delta" | "session.reasoning.delta" | "session.tool.input.delta" | "session.compaction.delta" }
 >
 
-export function adaptServerEvent(event: OpenCodeEvent): ServerEvent {
+export function adaptServerEvent(event: ServerSessionEvent): ServerEvent {
+  switch (event.type) {
+    case "session.next.step.started":
+      return { id: event.id, type: event.type, properties: event.data, current: event }
+    case "session.next.step.stream.updated":
+      return { id: event.id, type: event.type, properties: event.data, current: event }
+    case "session.next.step.ended":
+      return {
+        id: event.id,
+        type: event.type,
+        properties: { ...event.data, files: event.data.files && [...event.data.files] },
+        current: event,
+      }
+    case "session.next.step.failed":
+      return { id: event.id, type: event.type, properties: event.data, current: event }
+  }
   if (event.type === "permission.v2.asked") {
     return {
       id: event.id,
@@ -138,7 +160,7 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
   return output
 }
 
-function currentDelta(event: OpenCodeEvent | undefined): CurrentDelta | undefined {
+function currentDelta(event: ServerSessionEvent | undefined): CurrentDelta | undefined {
   if (
     event?.type === "session.text.delta" ||
     event?.type === "session.reasoning.delta" ||
@@ -406,7 +428,7 @@ export function useServerProtocol() {
 }
 
 type SDKEventMap = {
-  [key in Event["type"]]: Extract<ServerEvent, { type: key }>
+  [key in ServerEvent["type"]]: Extract<ServerEvent, { type: key }>
 }
 
 function createDirSdkContext(directory: string, serverSDK: ServerSDKBase) {

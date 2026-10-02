@@ -8,6 +8,10 @@ import type {
 import type { AssistantMessage, FilePart, Message, Part, ToolPart, UserMessage } from "@opencode-ai/sdk/v2"
 import { Option, Schema } from "effect"
 
+export type CurrentSessionMessage =
+  | Exclude<SessionMessageInfo, { type: "assistant" }>
+  | (SessionMessageAssistant & { readonly streamEventCount?: number })
+
 const emptyTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
 const emptyModel: { id: string; providerID: string; variant?: string } = { id: "", providerID: "" }
 const decodeToolInput = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
@@ -45,7 +49,7 @@ function normalizeToolMetadata(name: string, metadata: Record<string, unknown>) 
   }
 }
 
-export function normalizeSessionMessages(sessionID: string, source: readonly SessionMessageInfo[]) {
+export function normalizeSessionMessages(sessionID: string, source: readonly CurrentSessionMessage[]) {
   const messages: Message[] = []
   const parts = new Map<string, Part[]>()
   let agent = ""
@@ -238,7 +242,11 @@ function userParts(sessionID: string, message: SessionMessageUser): Part[] {
   ]
 }
 
-function assistantMessage(sessionID: string, parentID: string, message: SessionMessageAssistant): AssistantMessage {
+function assistantMessage(
+  sessionID: string,
+  parentID: string,
+  message: Extract<CurrentSessionMessage, { type: "assistant" }>,
+): AssistantMessage {
   const error = message.error
     ? message.error.type.toLowerCase().includes("abort") || message.error.type.toLowerCase().includes("interrupt")
       ? { name: "MessageAbortedError" as const, data: { message: message.error.message } }
@@ -260,6 +268,7 @@ function assistantMessage(sessionID: string, parentID: string, message: SessionM
     cost: message.cost ?? 0,
     tokens: message.tokens ?? emptyTokens,
     finish: message.finish,
+    streamEventCount: message.streamEventCount,
   }
 }
 

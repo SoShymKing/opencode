@@ -1,6 +1,6 @@
 import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { SessionApi } from "@opencode-ai/client/promise"
 import type {
   Message,
   OpencodeClient,
@@ -18,7 +18,13 @@ import { message as cleanMessage } from "@/utils/diffs"
 import { sessionNotFoundError } from "@/utils/server-errors"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
-import { compareMessages, messageKey, normalizeSessionMessages } from "@/utils/session-message"
+import {
+  compareMessages,
+  messageKey,
+  normalizeSessionMessages,
+  type CurrentSessionMessage,
+} from "@/utils/session-message"
+import type { ServerSessionEvent } from "./server-sdk"
 import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
@@ -32,7 +38,7 @@ const historyMessagePageSize = 200
 const sessionInfoLimit = 2_048
 const emptyIDs: ReadonlySet<string> = new Set()
 
-function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
+function needsOlderTurnRoot(source: readonly CurrentSessionMessage[]) {
   const boundary = source.find(
     (message) =>
       message.type === "user" ||
@@ -53,14 +59,14 @@ type OptimisticItem = {
 type MessagePage = {
   session: Message[]
   part: { id: string; part: Part[] }[]
-  source?: SessionMessageInfo[]
+  source?: CurrentSessionMessage[]
   sourceMode?: "latest" | "older"
   projectSource?: boolean
   cursor?: string
   complete: boolean
 }
 
-function legacyMessageSource(items: { info: Message; parts: Part[] }[]): SessionMessageInfo[] {
+function legacyMessageSource(items: { info: Message; parts: Part[] }[]): CurrentSessionMessage[] {
   return items
     .slice()
     .sort((a, b) => compareMessages(a.info, b.info))
@@ -80,6 +86,7 @@ function legacyMessageSource(items: { info: Message; parts: Part[] }[]): Session
         model: { id: item.info.modelID, providerID: item.info.providerID, variant: item.info.variant },
         content: [],
         time: item.info.time,
+        streamEventCount: item.info.streamEventCount,
       }
     })
 }
@@ -201,7 +208,7 @@ export function createServerSession(
     permission: {} as Record<string, PermissionRequest[]>,
     question: {} as Record<string, QuestionRequest[]>,
     message: {} as Record<string, Message[]>,
-    session_message: {} as Record<string, SessionMessageInfo[]>,
+    session_message: {} as Record<string, CurrentSessionMessage[]>,
     part: {} as Record<string, Part[]>,
     part_text_accum_delta: {} as Record<string, string>,
     session_working(id: string) {
@@ -933,7 +940,7 @@ export function createServerSession(
       .catch(() => {})
   }
 
-  const applyV2 = (event: OpenCodeEvent) => {
+  const applyV2 = (event: ServerSessionEvent) => {
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
     const sessionID = event.data.sessionID
     const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
