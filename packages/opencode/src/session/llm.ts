@@ -50,6 +50,7 @@ export type StreamInput = {
     postToolContinuation?: boolean
     postToolFirstEventTimeoutMs?: number
   }
+  onStreamEventCount?: (count: number | undefined) => Effect.Effect<void>
 }
 
 export type StreamRequest = StreamInput & {
@@ -244,6 +245,7 @@ const live: Layer.Layer<
           providerOptions: prepared.params.options,
           headers: prepared.headers,
           abort: input.abort,
+          onStreamEventCount: input.onStreamEventCount,
         })
         if (native.type === "supported") {
           yield* Effect.logInfo("llm runtime selected", {
@@ -280,8 +282,20 @@ const live: Layer.Layer<
       })
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
+      const streamEventCount = { value: 0 }
+      const rawCapable =
+        !isWorkflow &&
+        [
+          "@ai-sdk/openai",
+          "@ai-sdk/openai-compatible",
+          "@ai-sdk/anthropic",
+          "@ai-sdk/google",
+          "@ai-sdk/mistral",
+          "@ai-sdk/amazon-bedrock",
+        ].includes(input.model.api.npm)
       return {
         type: "ai-sdk" as const,
+        streamEventCount,
         result: streamText({
           onError(error) {
             const parsed = APICallError.isInstance(error.error)
@@ -305,8 +319,7 @@ const live: Layer.Layer<
               }),
             )
           },
-          // Copilot returns the authoritative billed amount only in provider-specific response fields.
-          includeRawChunks: input.model.providerID.includes("github-copilot"),
+          includeRawChunks: true,
           async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase()
             if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
@@ -341,6 +354,12 @@ const live: Layer.Layer<
             middleware: [
               {
                 specificationVersion: "v3" as const,
+                async wrapStream({ doStream }) {
+                  streamEventCount.value = 0
+                  if (input.onStreamEventCount)
+                    await bridge.promise(input.onStreamEventCount(rawCapable ? 0 : undefined))
+                  return doStream()
+                },
                 async transformParams(args) {
                   if (args.type === "stream") {
                     // @ts-expect-error
@@ -387,6 +406,11 @@ const live: Layer.Layer<
             return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
               e instanceof Error ? e : new Error(String(e)),
             ).pipe(
+              Stream.tap((event) =>
+                event.type === "raw" && input.onStreamEventCount
+                  ? input.onStreamEventCount(++result.streamEventCount.value)
+                  : Effect.void,
+              ),
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
             )

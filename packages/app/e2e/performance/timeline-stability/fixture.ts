@@ -2,6 +2,7 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import { Event } from "@opencode-ai/schema/event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
+import { SessionEvent } from "@opencode-ai/schema/session-event"
 import type {
   AssistantMessage,
   GlobalEvent,
@@ -47,7 +48,12 @@ type DeepReadonly<Value> = Value extends readonly unknown[]
     : Value
 
 export type TimelineEvent = DeepReadonly<Omit<GlobalEvent, "payload"> & { payload: TimelinePayload }>
-export type EventPayload = TimelineEvent
+type CurrentStepEvent =
+  | typeof SessionEvent.Step.Started.Encoded
+  | typeof SessionEvent.Step.StreamUpdated.Encoded
+  | typeof SessionEvent.Step.Ended.Encoded
+  | typeof SessionEvent.Step.Failed.Encoded
+export type EventPayload = TimelineEvent | CurrentStepEvent
 export type ToolStatus = ToolState["status"]
 export type TimelineMessage = { info: UserMessage; parts: Part[] } | { info: AssistantMessage; parts: Part[] }
 
@@ -144,6 +150,7 @@ export async function setupTimeline(
   }, input.settings ?? {})
   if (input.locale) {
     await page.addInitScript((locale) => {
+      if (localStorage.getItem("opencode.global.dat:language")) return
       localStorage.setItem("opencode.global.dat:language", JSON.stringify({ locale }))
     }, input.locale)
   }
@@ -204,7 +211,7 @@ export async function setupTimeline(
   }
 }
 
-function describeEvent(event: EventPayload) {
+function describeEvent(event: TimelineEvent) {
   if (event.payload.type === "message.part.updated") {
     const part = event.payload.properties.part
     return [
@@ -238,6 +245,16 @@ export function event(type: TimelinePayload["type"], properties: TimelinePayload
 
 export function validateTimelineEvent(input: unknown): TimelineEvent {
   return decodeEvent(input, decodeOptions)
+}
+
+export function currentStepEvent(input: CurrentStepEvent): CurrentStepEvent {
+  const schema = Schema.Union([
+    SessionEvent.Step.Started,
+    SessionEvent.Step.StreamUpdated,
+    SessionEvent.Step.Ended,
+    SessionEvent.Step.Failed,
+  ])
+  return Schema.encodeSync(schema)(Schema.decodeUnknownSync(schema)(input, decodeOptions))
 }
 
 export function validateTimelineMessages(input: readonly TimelineMessage[]): TimelineMessage[] {
@@ -383,6 +400,7 @@ export function assistantMessage(
     completed?: boolean
     error?: AssistantMessage["error"]
     created?: number
+    streamEventCount?: number
   } = {},
 ): Extract<TimelineMessage, { info: { role: "assistant" } }> {
   const id = input.id ?? assistantID
@@ -404,6 +422,7 @@ export function assistantMessage(
       cost: 0.01,
       tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
       variant: "max",
+      ...(input.streamEventCount === undefined ? {} : { streamEventCount: input.streamEventCount }),
       ...(input.error ? { error: input.error } : {}),
     },
     parts: parts.map((part) => ({ ...part, sessionID, messageID: id })),

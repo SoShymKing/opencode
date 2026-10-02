@@ -1,12 +1,18 @@
-import type { OpenCodeEvent, SessionMessageInfo, SessionPendingMessage } from "@opencode-ai/client/promise"
+import type { SessionPendingMessage } from "@opencode-ai/client/promise"
+import type { CurrentSessionMessage } from "@/utils/session-message"
+import type { ServerSessionEvent } from "./server-sdk"
+import { Option, Schema } from "effect"
 
-type Assistant = Extract<SessionMessageInfo, { type: "assistant" }>
-type Compaction = Extract<SessionMessageInfo, { type: "compaction" }>
-type Shell = Extract<SessionMessageInfo, { type: "shell" }>
+type Assistant = Extract<CurrentSessionMessage, { type: "assistant" }>
+type Compaction = Extract<CurrentSessionMessage, { type: "compaction" }>
+type Shell = Extract<CurrentSessionMessage, { type: "shell" }>
+const decodeFinish = Schema.decodeUnknownOption(
+  Schema.Literals(["stop", "tool-calls", "length", "content-filter", "error", "unknown"]),
+)
 
 export type V2SessionReduction = {
   sessionID: string
-  messages: SessionMessageInfo[]
+  messages: CurrentSessionMessage[]
   touched: string[]
   missing?: string
 }
@@ -14,15 +20,18 @@ export type V2SessionReduction = {
 export function createV2SessionReducer() {
   const pending = new Map<string, SessionPendingMessage>()
 
-  const reduce = (source: readonly SessionMessageInfo[], event: OpenCodeEvent): V2SessionReduction | undefined => {
-    if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
+  const reduce = (
+    source: readonly CurrentSessionMessage[],
+    event: ServerSessionEvent,
+  ): V2SessionReduction | undefined => {
+    if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return undefined
     const sessionID = event.data.sessionID
-    const result = (messages: SessionMessageInfo[], touched: string[] = []): V2SessionReduction => ({
+    const result = (messages: CurrentSessionMessage[], touched: string[] = []): V2SessionReduction => ({
       sessionID,
       messages,
       touched,
     })
-    const append = (message: SessionMessageInfo) =>
+    const append = (message: CurrentSessionMessage) =>
       result(source.some((item) => item.id === message.id) ? [...source] : [...source, message], [message.id])
 
     switch (event.type) {
@@ -67,7 +76,7 @@ export function createV2SessionReducer() {
           metadata: event.metadata,
           model: event.data.model,
           previous: source.findLast(
-            (item): item is Extract<SessionMessageInfo, { type: "model-switched" | "assistant" }> =>
+            (item): item is Extract<CurrentSessionMessage, { type: "model-switched" | "assistant" }> =>
               item.type === "model-switched" || item.type === "assistant",
           )?.model,
           time: { created: event.created },
@@ -115,13 +124,20 @@ export function createV2SessionReducer() {
           }),
           sessionID,
         )
+      case "session.next.step.started":
       case "session.step.started": {
+        const timestamp = event.type === "session.next.step.started" ? event.data.timestamp : event.created
+        if (
+          event.type === "session.next.step.started" &&
+          source.some((item) => item.id === event.data.assistantMessageID)
+        )
+          return result([...source])
         const current = source.findLast((item): item is Assistant => item.type === "assistant" && !item.time.completed)
         const completed =
           current && current.id !== event.data.assistantMessageID
             ? update(source, current.id, (item) =>
                 item.type === "assistant"
-                  ? { ...item, retry: undefined, time: { ...item.time, completed: event.created } }
+                  ? { ...item, retry: undefined, time: { ...item.time, completed: timestamp } }
                   : item,
               )
             : [...source]
@@ -150,28 +166,45 @@ export function createV2SessionReducer() {
             {
               id: event.data.assistantMessageID,
               type: "assistant",
-              metadata: event.metadata,
+              metadata: event.type === "session.next.step.started" ? undefined : event.metadata,
               agent: event.data.agent,
               model: event.data.model,
               content: [],
+              streamEventCount: event.type === "session.next.step.started" ? event.data.streamEventCount : undefined,
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
-              time: { created: event.created },
+              time: { created: timestamp },
             },
           ],
           current ? [current.id, event.data.assistantMessageID] : [event.data.assistantMessageID],
         )
       }
+      case "session.next.step.stream.updated":
+        return updateAssistant(source, event.data.assistantMessageID, sessionID, (item) =>
+          item.time.completed === undefined ? { ...item, streamEventCount: event.data.streamEventCount } : item,
+        )
+      case "session.next.step.ended":
       case "session.step.ended":
         return updateAssistant(source, event.data.assistantMessageID, sessionID, (item) => ({
           ...item,
-          finish: event.data.finish,
+          finish: Option.getOrElse(decodeFinish(event.data.finish), () => "unknown" as const),
           cost: event.data.cost,
           tokens: event.data.tokens,
           snapshot:
             event.data.snapshot || event.data.files
-              ? { ...item.snapshot, end: event.data.snapshot, files: event.data.files }
+              ? { ...item.snapshot, end: event.data.snapshot, files: event.data.files && [...event.data.files] }
               : item.snapshot,
-          time: { ...item.time, completed: event.created },
+          time: {
+            ...item.time,
+            completed: event.type === "session.next.step.ended" ? event.data.timestamp : event.created,
+          },
+        }))
+      case "session.next.step.failed":
+        return updateAssistant(source, event.data.assistantMessageID, sessionID, (item) => ({
+          ...item,
+          finish: "error",
+          error: event.data.error,
+          retry: undefined,
+          time: { ...item.time, completed: event.data.timestamp },
         }))
       case "session.step.failed":
         return updateAssistant(source, event.data.assistantMessageID, sessionID, (item) => ({
@@ -402,7 +435,7 @@ export function createV2SessionReducer() {
         )
       }
       default:
-        return
+        return undefined
     }
   }
 
@@ -425,16 +458,16 @@ function messageID(eventID: string) {
 }
 
 function update(
-  source: readonly SessionMessageInfo[],
+  source: readonly CurrentSessionMessage[],
   id: string,
-  apply: (item: SessionMessageInfo) => SessionMessageInfo,
+  apply: (item: CurrentSessionMessage) => CurrentSessionMessage,
 ) {
   return source.map((item) => (item.id === id ? apply(item) : item))
 }
 
-function updateMessage<T extends SessionMessageInfo>(
-  source: readonly SessionMessageInfo[],
-  matches: (item: SessionMessageInfo) => item is T,
+function updateMessage<T extends CurrentSessionMessage>(
+  source: readonly CurrentSessionMessage[],
+  matches: (item: CurrentSessionMessage) => item is T,
   apply: (item: T) => T,
   sessionID: string,
 ): V2SessionReduction {
@@ -448,7 +481,7 @@ function updateMessage<T extends SessionMessageInfo>(
 }
 
 function updateAssistant(
-  source: readonly SessionMessageInfo[],
+  source: readonly CurrentSessionMessage[],
   id: string,
   sessionID: string,
   apply: (item: Assistant) => Assistant,
@@ -461,7 +494,7 @@ function updateAssistant(
 }
 
 function updateContent<T extends "text" | "reasoning">(
-  source: readonly SessionMessageInfo[],
+  source: readonly CurrentSessionMessage[],
   messageID: string,
   sessionID: string,
   type: T,
@@ -483,7 +516,7 @@ function updateContent<T extends "text" | "reasoning">(
 }
 
 function updateTool(
-  source: readonly SessionMessageInfo[],
+  source: readonly CurrentSessionMessage[],
   messageID: string,
   callID: string,
   sessionID: string,

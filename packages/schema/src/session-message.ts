@@ -5,7 +5,7 @@ import { optional } from "./schema"
 import { ProviderMetadata, ToolContent } from "./llm"
 import { Model } from "./model"
 import { FileAttachment, Prompt } from "./prompt"
-import { DateTimeUtcFromMillis, RelativePath, statics } from "./schema"
+import { DateTimeUtcFromMillis, NonNegativeInt, RelativePath, statics } from "./schema"
 import { SessionID } from "./session-id"
 import { ascending } from "./identifier"
 
@@ -175,6 +175,7 @@ export const Assistant = Schema.Struct({
   }).pipe(optional),
   finish: Schema.String.pipe(optional),
   cost: Schema.Finite.pipe(optional),
+  streamEventCount: NonNegativeInt.pipe(optional),
   tokens: Schema.Struct({
     input: Schema.Finite,
     output: Schema.Finite,

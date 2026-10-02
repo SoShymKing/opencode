@@ -121,6 +121,16 @@ describe("i18n parity", () => {
     }
   })
 
+  test("unmeasured stream count labels preserve the existing localized phrase without placeholders", async () => {
+    for (const locale of ["en", ...appLocales]) {
+      const target = await dictionary(`../../../ui/src/i18n/${locale}.ts`)
+      expect(target["ui.sessionTurn.status.thinkingStreamsUnknown"]).toBe(
+        target["ui.sessionTurn.status.thinkingStreams.other"].replace("{{count}}", "?"),
+      )
+      expect(placeholders(target["ui.sessionTurn.status.thinkingStreamsUnknown"])).toEqual([])
+    }
+  })
+
   test("non-English locales have every English key and required plural variants", async () => {
     for (const domain of domains) {
       const source = await dictionary(domain.source)

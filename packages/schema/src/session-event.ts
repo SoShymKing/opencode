@@ -155,9 +155,21 @@ export namespace Step {
       agent: Schema.String,
       model: Model.Ref,
       snapshot: Schema.String.pipe(optional),
+      streamEventCount: NonNegativeInt.pipe(optional),
     },
   })
   export type Started = typeof Started.Type
+
+  export const StreamUpdated = Event.define({
+    type: "session.next.step.stream.updated",
+    ...options,
+    schema: {
+      ...Base,
+      assistantMessageID: SessionMessage.ID,
+      streamEventCount: NonNegativeInt,
+    },
+  })
+  export type StreamUpdated = typeof StreamUpdated.Type
 
   export const Ended = Event.define({
     type: "session.next.step.ended",
@@ -456,6 +468,7 @@ export const DurableDefinitions = Event.inventory(
   Shell.Started,
   Shell.Ended,
   Step.Started,
+  Step.StreamUpdated,
   Step.Ended,
   Step.Failed,
   Text.Started,
@@ -487,6 +500,7 @@ export const Definitions = Event.inventory(
   Shell.Started,
   Shell.Ended,
   Step.Started,
+  Step.StreamUpdated,
   Step.Ended,
   Step.Failed,
   Text.Started,

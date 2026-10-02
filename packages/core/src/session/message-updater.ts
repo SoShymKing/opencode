@@ -202,10 +202,15 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
               time: { created: event.data.timestamp },
               content: [],
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
+              streamEventCount: event.data.streamEventCount,
             }),
           )
         })
       },
+      "session.next.step.stream.updated": (event) =>
+        updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.streamEventCount = event.data.streamEventCount
+        }),
       "session.next.step.ended": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
           draft.time.completed = event.data.timestamp

@@ -19,6 +19,7 @@ import { mkdir, writeFile } from "node:fs/promises"
 import { useRoute, useRouteData } from "../../context/route"
 import { useProject } from "../../context/project"
 import { useSync } from "../../context/sync"
+import { useData } from "../../context/data"
 import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
@@ -35,6 +36,7 @@ import type {
   TextPart,
   ReasoningPart,
   SessionStatus,
+  SessionMessageAssistant,
 } from "@opencode-ai/sdk/v2"
 import { useLocal } from "../../context/local"
 import { Locale } from "../../util/locale"
@@ -156,6 +158,7 @@ const sessionGlobalUnfocusedBindingCommands = ["session.first", "session.last"] 
 const context = createContext<{
   width: number
   sessionID: string
+  readonly currentResponse: ReturnType<typeof useCurrentResponse>
   conceal: () => boolean
   thinkingMode: () => ThinkingMode
   showThinking: () => boolean
@@ -210,6 +213,7 @@ export function Session() {
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
+  const currentResponse = useCurrentResponse(() => route.sessionID)
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
     if (!messageID) return messages()
@@ -241,9 +245,11 @@ export function Session() {
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
 
   const pending = createMemo(() => {
-    const completed = messages().findLastIndex((message) => message.role === "assistant" && message.time.completed)
+    const completed = messages().findLastIndex(
+      (message) => message.role === "assistant" && message.time.completed !== undefined,
+    )
     const pending = messages().findLastIndex(
-      (message, index) => index > completed && message.role === "assistant" && !message.time.completed,
+      (message, index) => index > completed && message.role === "assistant" && message.time.completed === undefined,
     )
     return pending === -1 ? undefined : pending
   })
@@ -1162,6 +1168,7 @@ export function Session() {
             return contentWidth()
           },
           sessionID: route.sessionID,
+          currentResponse,
           conceal,
           thinkingMode,
           showThinking,
@@ -1292,6 +1299,7 @@ export function Session() {
                     </Switch>
                   )}
                 </For>
+                <CurrentResponseThinking sessionID={route.sessionID} response={currentResponse} />
               </scrollbox>
               <box flexShrink={0}>
                 <Show when={permissions().length > 0}>
@@ -1583,9 +1591,84 @@ const PART_MAPPING = {
 
 const INLINE_TOOL_ICON_WIDTH = 2
 
+function useCurrentResponse(sessionID: () => string) {
+  const sync = useSync()
+  const data = useData()
+  const assistant = createMemo(() => {
+    const messages = sync.data.message[sessionID()] ?? []
+    const user = messages.findLastIndex((message) => message.role === "user")
+    const completed = messages.findLastIndex(
+      (message) => message.role === "assistant" && message.time.completed !== undefined,
+    )
+    const current = messages.findLast(
+      (message, index): message is AssistantMessage =>
+        index > Math.max(user, completed) &&
+        message.role === "assistant" &&
+        message.parentID === messages[user]?.id &&
+        message.time.completed === undefined,
+    )
+    const nativeMessages = data.session.message.list(sessionID()) ?? []
+    const native = current && nativeMessages.find((message) => message.id === current.id)
+    if (current && (native?.type !== "assistant" || native.time.completed === undefined)) return current
+    const boundary = nativeMessages.findIndex(
+      (message) => message.type === "user" || (message.type === "assistant" && message.time.completed !== undefined),
+    )
+    return nativeMessages.find(
+      (message, index): message is SessionMessageAssistant =>
+        (boundary === -1 || index < boundary) &&
+        message.type === "assistant" &&
+        message.time.completed === undefined &&
+        message.time.created >= (messages[user]?.time.created ?? 0),
+    )
+  })
+  const count = () => {
+    const current = assistant()
+    if (!current) return 0
+    const native = data.session.message.list(sessionID())?.find((message) => message.id === current.id)
+    return native?.type === "assistant" ? (native.streamEventCount ?? current.streamEventCount) : current.streamEventCount
+  }
+  return { assistant, count }
+}
+
+export function CurrentResponseThinking(props: {
+  readonly sessionID: string
+  readonly response?: ReturnType<typeof useCurrentResponse>
+}) {
+  const sync = useSync()
+  const current = props.response ?? useCurrentResponse(() => props.sessionID)
+  const thinking = useThinkingMode()
+  const reasoningVisible = () => {
+    const assistant = current.assistant()
+    return (
+      assistant &&
+      sync.data.part[assistant.id]?.some(
+        (part) =>
+          part.type === "reasoning" &&
+          part.time.end === undefined &&
+          (part.text.replace("[REDACTED]", "").trim() || Boolean(part.metadata)),
+      )
+    )
+  }
+  return (
+    <Show when={sync.data.session_status[props.sessionID]?.type === "busy" && !reasoningVisible()}>
+      <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
+        <ReasoningHeader
+          toggleable={false}
+          open={thinking.mode() === "show"}
+          done={false}
+          title={null}
+          current={true}
+          streamEventCount={current.count()}
+        />
+      </box>
+    </Show>
+  )
+}
+
 function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
   const { theme } = useTheme()
   const ctx = use()
+  const current = ctx.currentResponse
   // Collapsed by default in hide mode: a single line throughout, so the
   // layout never shifts. Click to open the full markdown block, click to close.
   const [expanded, setExpanded] = createSignal(false)
@@ -1628,6 +1711,8 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
             title={summary().title}
             duration={isDone() ? Locale.duration(duration()) : undefined}
             encrypted={opaque()}
+            current={current.assistant()?.id === props.message.id}
+            streamEventCount={current.count()}
           />
         </box>
         <Show when={!opaque() && (!inMinimal() || expanded()) && summary().body}>
@@ -1648,13 +1733,15 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   )
 }
 
-function ReasoningHeader(props: {
+export function ReasoningHeader(props: {
   toggleable: boolean
   open: boolean
   done: boolean
   title: string | null
   duration?: string
   encrypted?: boolean
+  readonly current?: boolean
+  readonly streamEventCount?: number
 }) {
   const { theme } = useTheme()
   const fg = () =>
@@ -1666,12 +1753,17 @@ function ReasoningHeader(props: {
     const detail = [props.title, props.duration].filter(Boolean).join(" · ")
     return `${props.toggleable ? (props.open ? "- " : "+ ") : ""}Thought${detail ? `: ${detail}` : ""}`
   }
+  const thinking = () => {
+    if (!props.current) return "Thinking"
+    if (props.streamEventCount === undefined) return "Thinking (streams unavailable)"
+    return `Thinking (${props.streamEventCount} ${props.streamEventCount === 1 ? "stream" : "streams"})`
+  }
 
   return (
     <Switch>
       <Match when={!props.done}>
         <box flexDirection="row">
-          <Spinner color={fg()}>{props.title ? "Thinking: " + props.title : "Thinking"}</Spinner>
+          <Spinner color={fg()}>{props.title ? thinking() + ": " + props.title : thinking()}</Spinner>
         </box>
       </Match>
       <Match when={true}>

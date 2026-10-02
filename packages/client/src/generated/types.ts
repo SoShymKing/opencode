@@ -656,6 +656,7 @@ export type SessionsContextOutput = {
         readonly snapshot?: { readonly start?: string; readonly end?: string; readonly files?: ReadonlyArray<string> }
         readonly finish?: string
         readonly cost?: number
+        readonly streamEventCount?: number
         readonly tokens?: {
           readonly input: number
           readonly output: number
@@ -843,6 +844,20 @@ export type SessionsHistoryOutput = {
           readonly agent: string
           readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
           readonly snapshot?: string
+          readonly streamEventCount?: number
+        }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.step.stream.updated"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: {
+          readonly timestamp: number
+          readonly sessionID: string
+          readonly assistantMessageID: string
+          readonly streamEventCount: number
         }
       }
     | {
@@ -1301,6 +1316,20 @@ export type SessionsEventsOutput =
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly snapshot?: string
+        readonly streamEventCount?: number
+      }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.step.stream.updated"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: {
+        readonly timestamp: number
+        readonly sessionID: string
+        readonly assistantMessageID: string
+        readonly streamEventCount: number
       }
     }
   | {
@@ -1734,6 +1763,7 @@ export type SessionsMessageOutput = {
         readonly snapshot?: { readonly start?: string; readonly end?: string; readonly files?: ReadonlyArray<string> }
         readonly finish?: string
         readonly cost?: number
+        readonly streamEventCount?: number
         readonly tokens?: {
           readonly input: number
           readonly output: number
@@ -1906,6 +1936,7 @@ export type MessagesListOutput = {
         readonly snapshot?: { readonly start?: string; readonly end?: string; readonly files?: ReadonlyArray<string> }
         readonly finish?: string
         readonly cost?: number
+        readonly streamEventCount?: number
         readonly tokens?: {
           readonly input: number
           readonly output: number

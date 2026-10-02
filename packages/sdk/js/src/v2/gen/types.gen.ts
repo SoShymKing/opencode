@@ -26,6 +26,7 @@ export type Event =
   | EventSessionNextShellStarted
   | EventSessionNextShellEnded
   | EventSessionNextStepStarted
+  | EventSessionNextStepStreamUpdated
   | EventSessionNextStepEnded
   | EventSessionNextStepFailed
   | EventSessionNextTextStarted
@@ -518,6 +519,7 @@ export type AssistantMessage = {
   }
   summary?: boolean
   cost: number
+  streamEventCount?: number
   tokens: {
     total?: number
     input: number
@@ -1081,6 +1083,17 @@ export type GlobalEvent = {
           agent: string
           model: ModelRef
           snapshot?: string
+          streamEventCount?: number
+        }
+      }
+    | {
+        id: string
+        type: "session.next.step.stream.updated"
+        properties: {
+          timestamp: number
+          sessionID: string
+          assistantMessageID: string
+          streamEventCount: number
         }
       }
     | {
@@ -1782,6 +1795,7 @@ export type GlobalEvent = {
     | SyncEventSessionNextShellStarted
     | SyncEventSessionNextShellEnded
     | SyncEventSessionNextStepStarted
+    | SyncEventSessionNextStepStreamUpdated
     | SyncEventSessionNextStepEnded
     | SyncEventSessionNextStepFailed
     | SyncEventSessionNextTextStarted
@@ -2914,6 +2928,7 @@ export type SessionDurableEvent =
   | SessionNextShellStarted
   | SessionNextShellEnded
   | SessionNextStepStarted
+  | SessionNextStepStreamUpdated
   | SessionNextStepEnded
   | SessionNextStepFailed
   | SessionNextTextStarted
@@ -3041,6 +3056,7 @@ export type V2Event =
   | SessionNextShellStarted
   | SessionNextShellEnded
   | SessionNextStepStarted
+  | SessionNextStepStreamUpdated
   | SessionNextStepEnded
   | SessionNextStepFailed
   | SessionNextTextStarted
@@ -3636,6 +3652,24 @@ export type SyncEventSessionNextStepStarted = {
       agent: string
       model: ModelRef
       snapshot?: string
+      streamEventCount?: number
+    }
+  }
+}
+
+export type SyncEventSessionNextStepStreamUpdated = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.step.stream.updated.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      assistantMessageID: string
+      streamEventCount: number
     }
   }
 }
@@ -4293,6 +4327,7 @@ export type SessionMessageAssistant = {
   }
   finish?: string
   cost?: number
+  streamEventCount?: number
   tokens?: {
     input: number
     output: number
@@ -4531,6 +4566,27 @@ export type SessionNextStepStarted = {
     agent: string
     model: ModelRef
     snapshot?: string
+    streamEventCount?: number
+  }
+}
+
+export type SessionNextStepStreamUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.step.stream.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    assistantMessageID: string
+    streamEventCount: number
   }
 }
 
@@ -6527,6 +6583,18 @@ export type EventSessionNextStepStarted = {
     agent: string
     model: ModelRef
     snapshot?: string
+    streamEventCount?: number
+  }
+}
+
+export type EventSessionNextStepStreamUpdated = {
+  id: string
+  type: "session.next.step.stream.updated"
+  properties: {
+    timestamp: number
+    sessionID: string
+    assistantMessageID: string
+    streamEventCount: number
   }
 }
 

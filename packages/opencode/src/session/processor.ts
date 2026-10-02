@@ -1179,9 +1179,19 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.currentTextID = undefined
             ctx.reasoningMap = {}
+            delete ctx.assistantMessage.streamEventCount
+            yield* session.updateMessage(ctx.assistantMessage)
             yield* status.set(ctx.sessionID, { type: "busy" })
             assistantOutputIsEmpty = yield* readAssistantOutputIsEmpty()
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream({
+              ...streamInput,
+              onStreamEventCount: (count) =>
+                Effect.gen(function* () {
+                  if (count === undefined) delete ctx.assistantMessage.streamEventCount
+                  if (count !== undefined) ctx.assistantMessage.streamEventCount = count
+                  yield* session.updateMessage(ctx.assistantMessage)
+                }),
+            })
             const firstStreamEvent = yield* Deferred.make<void>()
             const firstEventTimeoutMs =
               streamInput.internal?.postToolFirstEventTimeoutMs ?? POST_TOOL_FIRST_EVENT_TIMEOUT_MS

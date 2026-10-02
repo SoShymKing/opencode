@@ -40,6 +40,49 @@ const expectToolOutput = (body: OpenAIResponses.OpenAIResponsesBody): OpenAITool
 }
 
 describe("OpenAI Responses route", () => {
+  it.effect("counts all eleven provider records without reasoning summaries and resets subscriptions", () =>
+    Effect.gen(function* () {
+      const body =
+        ": keep-alive\n\ndata:\n\n" +
+        sseEvents(
+          { type: "response.created", response: { id: "resp_count" } },
+          { type: "response.in_progress", response: { id: "resp_count" } },
+          { type: "response.output_item.added", item: { type: "reasoning", id: "rs_count" } },
+          { type: "response.output_item.done", item: { type: "reasoning", id: "rs_count" } },
+          { type: "response.output_item.added", item: { type: "message", id: "msg_count" } },
+          { type: "response.content_part.added", item_id: "msg_count" },
+          { type: "response.output_text.delta", item_id: "msg_count", delta: "Hello" },
+          { type: "response.output_text.done", item_id: "msg_count", text: "Hello" },
+          { type: "response.content_part.done", item_id: "msg_count" },
+          { type: "response.output_item.done", item: { type: "message", id: "msg_count" } },
+          { type: "response.completed", response: { id: "resp_count" } },
+        )
+      const counts: number[] = []
+      const stream = LLMClient.stream(request, {
+        onStreamEventCount: (count) => Effect.sync(() => { counts.push(count) }),
+      })
+      const events = yield* stream.pipe(Stream.runCollect, Effect.provide(fixedResponse(body)))
+      expect(counts).toEqual(Array.from({ length: 12 }, (_, count) => count))
+      expect(Array.from(events).filter((event) => event.type === "reasoning-delta")).toEqual([])
+      yield* stream.pipe(Stream.runDrain, Effect.provide(fixedResponse(body)))
+      expect(counts).toEqual([
+        ...Array.from({ length: 12 }, (_, count) => count),
+        ...Array.from({ length: 12 }, (_, count) => count),
+      ])
+      const independent: number[] = []
+      yield* Effect.all([
+        stream.pipe(Stream.runDrain, Effect.provide(fixedResponse(body))),
+        LLMClient.stream(request, {
+          onStreamEventCount: (count) => Effect.sync(() => { independent.push(count) }),
+        }).pipe(Stream.runDrain, Effect.provide(fixedResponse(body))),
+      ], { concurrency: "unbounded" })
+      expect(counts.slice(24)).toEqual(Array.from({ length: 12 }, (_, count) => count))
+      expect(independent).toEqual(Array.from({ length: 12 }, (_, count) => count))
+      const unobserved = yield* LLMClient.stream(request).pipe(Stream.runCollect, Effect.provide(fixedResponse(body)))
+      expect(unobserved).toEqual(events)
+    }),
+  )
+
   it.effect("prepares OpenAI Responses target", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare(request)
@@ -227,6 +270,16 @@ describe("OpenAI Responses route", () => {
         input: [{ role: "user", content: [{ type: "input_text", text: "Say hello." }] }],
         store: false,
       })
+      const counts: number[] = []
+      yield* LLMClient.stream(
+        LLM.updateRequest(request, {
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).responsesWebSocket(
+            "gpt-4.1-mini",
+          ),
+        }),
+        { onStreamEventCount: (count) => Effect.sync(() => { counts.push(count) }) },
+      ).pipe(Stream.runDrain, Effect.provide(LLMClient.layer.pipe(Layer.provide(deps))))
+      expect(counts).toEqual([0, 1, 2])
     }),
   )
 

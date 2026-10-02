@@ -405,6 +405,7 @@ const layer = Layer.effectDiscard(
     yield* events.project(SessionEvent.Shell.Started, (event) => run(db, event))
     yield* events.project(SessionEvent.Shell.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Started, (event) => run(db, event))
+    yield* events.project(SessionEvent.Step.StreamUpdated, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Failed, (event) => run(db, event))
     yield* events.project(SessionEvent.Text.Started, (event) => projectContentEvent(db, event))

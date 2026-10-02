@@ -1,6 +1,9 @@
 import { describe, expect, mock, test } from "bun:test"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import { normalizeSessionMessages } from "@/utils/session-message"
+import type { CurrentSessionMessage } from "@/utils/session-message"
+import type { ServerSessionEvent } from "@/context/server-sdk"
+import { createV2SessionReducer } from "@/context/server-session-v2-reducer"
 
 mock.module("@opencode-ai/session-ui/message-part", () => ({
   renderable: () => true,
@@ -15,6 +18,143 @@ mock.module("@opencode-ai/session-ui/message-part", () => ({
 const { Timeline, TimelineRow } = await import("./rows")
 
 describe("current session timeline rows", () => {
+  test("blocks older unfinished stream counts when the latest assistant is completed", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "current", time: { created: 1 } },
+      {
+        id: "msg_old",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [],
+        streamEventCount: 99,
+        time: { created: 2 },
+      },
+      {
+        id: "msg_latest",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [],
+        streamEventCount: 7,
+        time: { created: 3, completed: 4 },
+      },
+    ] satisfies CurrentSessionMessage[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+    const result = Timeline.constructSessionMessageRows(
+      source,
+      (id) => messages.get(id),
+      (id) => normalized.parts.get(id) ?? [],
+      true,
+      "busy",
+      true,
+      normalized.messages.filter((message) => message.role === "user"),
+    )
+    const thinking = result.rows.filter((row) => row._tag === "Thinking")
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0]?.streamEventCount).toBe(0)
+    expect(thinking[0] && TimelineRow.key(thinking[0])).toBe("thinking:msg_user")
+  })
+
+  test("projects only the current response's absolute stream count without reasoning content", () => {
+    const reducer = createV2SessionReducer()
+    let source: CurrentSessionMessage[] = [
+      { id: "msg_old_user", type: "user", text: "previous", time: { created: 1 } },
+      {
+        id: "msg_old_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [],
+        streamEventCount: 99,
+        time: { created: 2, completed: 3 },
+      },
+      { id: "msg_user", type: "user", text: "current", time: { created: 4 } },
+    ]
+    const thinking = () => {
+      const normalized = normalizeSessionMessages("ses_1", source)
+      const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+      const result = Timeline.constructSessionMessageRows(
+        source,
+        (id) => messages.get(id),
+        (id) => normalized.parts.get(id) ?? [],
+        true,
+        "busy",
+        true,
+        normalized.messages.filter((message) => message.role === "user"),
+      )
+      expect(result.rows.filter((row) => row._tag === "Thinking")).toHaveLength(1)
+      return result.rows.find((row) => row._tag === "Thinking")
+    }
+    const apply = (event: ServerSessionEvent) => {
+      source = reducer.reduce(source, event)?.messages ?? source
+    }
+    const started = {
+      id: "evt_start",
+      type: "session.next.step.started",
+      data: {
+        sessionID: "ses_1",
+        timestamp: 5,
+        assistantMessageID: "msg_assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+      },
+    } satisfies ServerSessionEvent
+    const counted = {
+      id: "evt_count",
+      type: "session.next.step.stream.updated",
+      data: { sessionID: "ses_1", timestamp: 6, assistantMessageID: "msg_assistant", streamEventCount: 11 },
+    } satisfies ServerSessionEvent
+
+    expect(thinking()?.streamEventCount).toBe(0)
+    apply(started)
+    expect(thinking()?.streamEventCount).toBeUndefined()
+    apply(counted)
+    apply(counted)
+    apply({ ...started, data: { ...started.data, streamEventCount: 0 } })
+    const row = thinking()
+    expect(row?.streamEventCount).toBe(11)
+    expect(row && TimelineRow.key(row)).toBe("thinking:msg_user")
+    expect(normalizeSessionMessages("ses_1", source).messages.at(-1)).toMatchObject({ streamEventCount: 11 })
+    expect(normalizeSessionMessages("ses_1", source).parts.get("msg_assistant")).toEqual([])
+    apply({
+      id: "evt_end",
+      type: "session.next.step.ended",
+      data: {
+        sessionID: "ses_1",
+        timestamp: 7,
+        assistantMessageID: "msg_assistant",
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    })
+    expect(thinking()?.streamEventCount).toBe(0)
+    apply(counted)
+    expect(source.at(-1)).toMatchObject({ streamEventCount: 11, time: { created: 5, completed: 7 } })
+    apply({
+      ...started,
+      id: "evt_next",
+      data: { ...started.data, timestamp: 8, assistantMessageID: "msg_next", streamEventCount: 0 },
+    })
+    apply(started)
+    apply(counted)
+    expect(thinking()?.streamEventCount).toBe(0)
+    expect(source.at(-1)).toMatchObject({ id: "msg_next", streamEventCount: 0, time: { created: 8 } })
+    apply({
+      id: "evt_failed",
+      type: "session.next.step.failed",
+      data: {
+        sessionID: "ses_1",
+        timestamp: 9,
+        assistantMessageID: "msg_next",
+        error: { type: "unknown", message: "Synthetic failure" },
+      },
+    })
+    expect(source.at(-1)).toMatchObject({ finish: "error", time: { completed: 9 } })
+  })
+
   test("derives turns and tagged rows from chronological current messages", () => {
     const source = [
       { id: "msg_1", type: "user", text: "first", time: { created: 1 } },
