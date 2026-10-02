@@ -40,12 +40,14 @@ export const make = <A, E = never>(
   scope: Scope.Scope,
   opts?: {
     onIdle?: Effect.Effect<void>
+    onFinish?: (exit: Exit.Exit<A, E> | "cancelled") => Effect.Effect<void>
     onBusy?: Effect.Effect<void>
     onInterrupt?: Effect.Effect<A, E>
   },
 ): Runner<A, E> => {
   const ref = SynchronizedRef.makeUnsafe<State<A, E>>({ _tag: "Idle" })
-  const idle = opts?.onIdle ?? Effect.void
+  const idle = (exit: Exit.Exit<A, E> | "cancelled") =>
+    (opts?.onFinish?.(exit) ?? Effect.void).pipe(Effect.andThen(opts?.onIdle ?? Effect.void))
   const onBusy = opts?.onBusy ?? Effect.void
   const onInterrupt = opts?.onInterrupt
   let ids = 0
@@ -65,7 +67,7 @@ export const make = <A, E = never>(
     Deferred.await(done).pipe(Effect.catchTag("RunnerCancelled", (e) => onInterrupt ?? Effect.die(e)))
 
   const idleIfCurrent = () =>
-    SynchronizedRef.modify(ref, (st) => [st._tag === "Idle" ? idle : Effect.void, st] as const).pipe(Effect.flatten)
+    SynchronizedRef.modify(ref, (st) => [st._tag === "Idle" ? idle("cancelled") : Effect.void, st] as const).pipe(Effect.flatten)
 
   const finishRun = (id: number, done: Deferred.Deferred<A, E | Cancelled>, exit: Exit.Exit<A, E>) =>
     SynchronizedRef.modify(
@@ -73,7 +75,7 @@ export const make = <A, E = never>(
       (st) =>
         [
           Effect.gen(function* () {
-            if (st._tag === "Running" && st.run.id === id) yield* idle
+            if (st._tag === "Running" && st.run.id === id) yield* idle(exit)
             yield* complete(done, exit)
           }),
           st._tag === "Running" && st.run.id === id ? ({ _tag: "Idle" } as const) : st,
@@ -90,12 +92,12 @@ export const make = <A, E = never>(
       return { id, done, fiber } satisfies RunHandle<A, E>
     })
 
-  const finishShell = (id: number) =>
+  const finishShell = (id: number, exit: Exit.Exit<A, E>) =>
     SynchronizedRef.modifyEffect(
       ref,
       Effect.fnUntraced(function* (st) {
         if (st._tag === "Shell" && st.shell.id === id) {
-          return [idle, { _tag: "Idle" }] as const
+          return [idle(exit), { _tag: "Idle" }] as const
         }
         if (st._tag === "ShellThenRun" && st.shell.id === id) {
           const run = yield* startRun(st.run.work, st.run.done)
@@ -148,7 +150,7 @@ export const make = <A, E = never>(
         yield* onBusy
         const id = next()
         const cancelled = yield* Deferred.make<void>()
-        const fiber = yield* work.pipe(Effect.ensuring(finishShell(id)), Effect.forkChild)
+        const fiber = yield* work.pipe(Effect.onExit((exit) => finishShell(id, exit)), Effect.forkChild)
         const shell = { id, cancelled, ready, fiber } satisfies ShellHandle<A, E>
         return [
           Effect.gen(function* () {
