@@ -6,7 +6,6 @@ import {
   Model,
   TransportReason,
   InvalidRequestReason,
-  type LLMClientShape,
   type LLMRequest,
 } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
@@ -63,6 +62,7 @@ const requests: LLMRequest[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
+let streamCounts: Array<{ readonly before: number; readonly after: number }> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
 let streamFailure: LLMError | undefined
@@ -75,16 +75,23 @@ const client = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
-    stream: ((request: LLMRequest) => {
+    stream: (request, observer) => {
       requests.push(request)
       if (responseStream) {
         const stream = responseStream
         responseStream = undefined
         return stream
       }
-      const events = streamFailure
+      const source = streamFailure
         ? Stream.fail(streamFailure)
         : Stream.fromIterable(responses === undefined ? response : (responses.shift() ?? []))
+      const count = streamCounts?.shift()
+      const events = count && observer?.onStreamEventCount
+        ? Stream.fromEffectDrain(observer.onStreamEventCount(count.before)).pipe(
+            Stream.concat(source),
+            Stream.concat(Stream.fromEffectDrain(observer.onStreamEventCount(count.after))),
+          )
+        : source
       if (!streamGate) return events
       return Stream.unwrap(
         (streamStarted ? Deferred.succeed(streamStarted, undefined) : Effect.void).pipe(
@@ -92,7 +99,7 @@ const client = Layer.succeed(
           Effect.as(events),
         ),
       )
-    }) as unknown as LLMClientShape["stream"],
+    },
     generate: () => Effect.die("unused"),
   }),
 )
@@ -322,6 +329,7 @@ const setup = Effect.gen(function* () {
   responses = undefined
   streamFailure = undefined
   responseStream = undefined
+  streamCounts = undefined
   streamGate = undefined
   streamStarted = undefined
   toolExecutionGate = undefined
@@ -1212,6 +1220,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("forces one compaction and retries after provider context overflow", () =>
     Effect.gen(function* () {
       const session = yield* setupOverflowRecovery
+      streamCounts = [{ before: 11, after: 11 }, { before: 0, after: 4 }, { before: 0, after: 3 }]
       responses = [
         [
           LLMEvent.stepStart({ index: 0 }),
@@ -1228,12 +1237,12 @@ describe("SessionRunnerLLM", () => {
       expect(userTexts(requests[2])[0]).toContain("<summary>\n## Objective\n- Recover overflow\n</summary>")
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "compaction", summary: "## Objective\n- Recover overflow" },
-        { type: "assistant", finish: "stop" },
+        { type: "assistant", finish: "stop", streamEventCount: 3 },
       ])
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "compaction" },
-        { type: "assistant", finish: "stop" },
+        { type: "assistant", finish: "stop", streamEventCount: 3 },
       ])
     }),
   )

@@ -280,6 +280,9 @@ it.live("session.processor effect tests capture llm input cleanly", () =>
         expect(value).toBe("continue")
         expect(calls).toBe(1)
         expect(parts.some((part) => part.type === "text" && part.text === "hello")).toBe(true)
+        expect(handle.message.streamEventCount).toBe(3)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        expect(stored.info).toMatchObject({ streamEventCount: 3 })
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -599,6 +602,8 @@ it.live("session.processor effect tests retry recognized structured json errors"
         expect(yield* llm.calls).toBe(2)
         expect(parts.some((part) => part.type === "text" && part.text === "after")).toBe(true)
         expect(handle.message.error).toBeUndefined()
+        expect(handle.message.streamEventCount).toBe(3)
+        expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).toMatchObject({ streamEventCount: 3 })
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -1127,6 +1132,7 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "provider failure")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        msg.streamEventCount = 11
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
         const seen: string[] = []
         const off = yield* events.listen((event) => {
@@ -1165,6 +1171,8 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+        expect(handle.message.streamEventCount).toBeUndefined()
+        expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).not.toHaveProperty("streamEventCount")
       }),
     { config: cfg },
   ),

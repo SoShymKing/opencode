@@ -1303,6 +1303,9 @@ describe("session.llm.stream", () => {
             output_index: 0,
             item: { type: "message", id: "item-1", status: "in_progress", role: "assistant", content: [] },
           },
+          { type: "response.in_progress", response: { id: "resp-1" } },
+          { type: "response.output_item.added", output_index: 1, item: { type: "reasoning", id: "rs-1", summary: [] } },
+          { type: "response.output_item.done", output_index: 1, item: { type: "reasoning", id: "rs-1", summary: [] } },
           {
             type: "response.content_part.added",
             item_id: "item-1",
@@ -1316,6 +1319,9 @@ describe("session.llm.stream", () => {
             delta: "Hello",
             logprobs: null,
           },
+          { type: "response.output_text.done", item_id: "item-1", output_index: 0, content_index: 0, text: "Hello" },
+          { type: "response.content_part.done", item_id: "item-1", output_index: 0, content_index: 0, part: { type: "output_text", text: "Hello", annotations: [] } },
+          { type: "response.output_item.done", output_index: 0, item: { type: "message", id: "item-1" } },
           {
             type: "response.completed",
             response: {
@@ -1330,6 +1336,7 @@ describe("session.llm.stream", () => {
             },
           },
         ]
+        const failed = waitRequest("/responses", new Response("unavailable", { status: 503 }))
         const request = waitRequest("/responses", createEventResponse(responseChunks, true))
 
         const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
@@ -1351,7 +1358,8 @@ describe("session.llm.stream", () => {
           model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id, variant: "high" },
         } satisfies SessionV1.User
 
-        yield* drain({
+        const counts: Array<number | undefined> = []
+        const input = {
           user,
           sessionID,
           model: resolved,
@@ -1359,7 +1367,16 @@ describe("session.llm.stream", () => {
           system: ["You are a helpful assistant."],
           messages: [{ role: "user", content: "Hello" }],
           tools: {},
-        })
+          retries: 1,
+          onStreamEventCount: (count) => Effect.sync(() => { counts.push(count) }),
+        } satisfies LLM.StreamInput
+        yield* drain(input)
+        yield* Effect.promise(() => failed)
+        expect(counts).toEqual([0, ...Array.from({ length: 12 }, (_, count) => count)])
+        const next = waitRequest("/responses", createEventResponse(responseChunks, true))
+        yield* drain(input)
+        yield* Effect.promise(() => next)
+        expect(counts).toEqual([0, ...Array.from({ length: 12 }, (_, count) => count), ...Array.from({ length: 12 }, (_, count) => count)])
 
         const capture = yield* Effect.promise(() => request)
         const body = capture.body
@@ -1597,6 +1614,7 @@ describe("session.llm.stream", () => {
           permission: [{ permission: "*", pattern: "*", action: "allow" }],
         } satisfies Agent.Info
 
+        const counts: Array<number | undefined> = []
         yield* drainWith(llmLayerWithExecutor({ executor, flags: { experimentalNativeLlm: true } }), {
           user: {
             id: MessageID.make("msg_user-native-injected-tool"),
@@ -1611,6 +1629,7 @@ describe("session.llm.stream", () => {
           agent,
           system: [],
           messages: [{ role: "user", content: "Use lookup" }],
+          onStreamEventCount: (count) => Effect.sync(() => { counts.push(count) }),
           tools: {
             lookup: tool({
               description: "Lookup data",
@@ -1640,6 +1659,7 @@ describe("session.llm.stream", () => {
           },
         ])
         expect(executed).toEqual({ args: { query: "weather" }, toolCallId: "call-injected-tool" })
+        expect(counts).toEqual([0, 1, 2, 3, 4])
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, "https://injected-openai.test/v1") },
   )

@@ -69,6 +69,28 @@ const result = LLMEvent.toolResult({
   },
 })
 
+test("stream counts stay pending, reset absolutely, and exclude local tool settlements", async () => {
+  const current = capture()
+  await Effect.runPromise(current.publisher.observeStreamEventCount(11))
+  expect(current.publisher.hasAssistantStarted()).toBe(false)
+  expect(current.published).toEqual([])
+  await Effect.runPromise(current.publisher.observeStreamEventCount(0))
+  await Effect.runPromise(current.publisher.observeStreamEventCount(3))
+  await Effect.runPromise(current.publisher.publish(call))
+  expect(current.published[0]).toMatchObject({
+    type: "session.next.step.started.1",
+    data: { streamEventCount: 3 },
+  })
+  await Effect.runPromise(current.publisher.observeStreamEventCount(11))
+  await Effect.runPromise(current.publisher.publish(result))
+  expect(current.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toMatchObject([
+    { data: { streamEventCount: 11 } },
+  ])
+  const next = capture()
+  await Effect.runPromise(next.publisher.publish(call))
+  expect(next.published[0]?.data).toHaveProperty("streamEventCount", undefined)
+})
+
 test("local tool success serializes media base64 once and reconstructs from structured content", async () => {
   const { published, publisher } = capture()
   await Effect.runPromise(publisher.publish(call))

@@ -45,6 +45,44 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.effect("hydrates and replays absolute stream counts without changing another assistant", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const db = database.db
+      const events = yield* EventV2.Service
+      yield* db.insert(ProjectTable).values({
+        id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [],
+      }).run()
+      yield* db.insert(SessionTable).values({
+        id: sessionID, project_id: Project.ID.global, slug: "test", directory: "/project", title: "test", version: "test",
+      }).run()
+      const first = SessionMessage.ID.create()
+      const second = SessionMessage.ID.create()
+      yield* events.publish(SessionEvent.Step.Started, {
+        sessionID, timestamp: created, assistantMessageID: first, agent: "build", model, streamEventCount: 3,
+      })
+      yield* events.publish(SessionEvent.Step.Started, {
+        sessionID, timestamp: created, assistantMessageID: second, agent: "build", model,
+      })
+      const update = { sessionID, timestamp: created, assistantMessageID: first, streamEventCount: 11 }
+      yield* events.publish(SessionEvent.Step.StreamUpdated, update)
+      yield* events.publish(SessionEvent.Step.StreamUpdated, update)
+      const sessions = yield* SessionV2.Service
+      const before = yield* sessions.messages({ sessionID, order: "asc" })
+      expect(before).toMatchObject([{ id: first, streamEventCount: 11 }, { id: second }])
+      expect(before[1]).not.toHaveProperty("streamEventCount")
+      const recorded = yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID))
+        .orderBy(asc(EventTable.seq)).all()
+      expect(recorded.filter((event) => event.type === "session.next.step.stream.updated.1")).toHaveLength(2)
+      yield* events.remove(sessionID)
+      yield* db.delete(SessionMessageTable).where(eq(SessionMessageTable.session_id, sessionID)).run()
+      yield* events.replayAll(recorded.map((event) => ({
+        id: event.id, aggregateID: event.aggregate_id, seq: event.seq, type: event.type, data: event.data,
+      })))
+      expect(yield* sessions.messages({ sessionID, order: "asc" })).toEqual(before)
+    }).pipe(Effect.provide(sessionsLayer)),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

@@ -41,6 +41,7 @@ type StreamInput = {
   readonly providerOptions?: Record<string, any>
   readonly headers: Record<string, string>
   readonly abort: AbortSignal
+  readonly onStreamEventCount?: (count: number) => Effect.Effect<void>
 }
 
 export function status(input: Pick<StreamInput, "model" | "provider" | "auth">): RuntimeStatus {
@@ -110,6 +111,7 @@ export function stream(input: StreamInput): StreamResult {
             LLMRequest.update(request, {
               tools: [...request.tools, ...toDefinitions(tools)],
             }),
+            { onStreamEventCount: input.onStreamEventCount },
           )
           .pipe(
             Stream.flatMap((event) =>

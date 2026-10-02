@@ -69,6 +69,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   let assistantActive = false
   let assistantFailed = false
   let providerFailed = false
+  let streamEventCount: number | undefined
   let stepSettlement: { readonly finish: string; readonly tokens: ReturnType<typeof tokens> } | undefined
 
   const startAssistant = Effect.fnUntraced(function* () {
@@ -80,6 +81,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       assistantMessageID,
       timestamp: yield* timestamp,
       snapshot: input.snapshot,
+      streamEventCount,
     })
     return assistantMessageID
   })
@@ -87,6 +89,18 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     assistantMessageID === undefined
       ? Effect.die("Tool event before assistant step start")
       : Effect.succeed(assistantMessageID)
+
+  const observeStreamEventCount = Effect.fnUntraced(function* (count: number) {
+    streamEventCount = count
+    // Protocol control records must not start an assistant or prevent overflow recovery.
+    if (assistantMessageID === undefined) return
+    yield* events.publish(SessionEvent.Step.StreamUpdated, {
+      sessionID: input.sessionID,
+      timestamp: yield* timestamp,
+      assistantMessageID,
+      streamEventCount: count,
+    })
+  })
 
   const fragments = (
     name: string,
@@ -409,6 +423,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   })
 
   return {
+    observeStreamEventCount,
     publish,
     flush,
     failAssistant,

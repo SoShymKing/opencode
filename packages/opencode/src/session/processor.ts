@@ -650,8 +650,18 @@ const layer = Layer.effect(
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
+            delete ctx.assistantMessage.streamEventCount
+            yield* session.updateMessage(ctx.assistantMessage)
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream({
+              ...streamInput,
+              onStreamEventCount: (count) =>
+                Effect.gen(function* () {
+                  if (count === undefined) delete ctx.assistantMessage.streamEventCount
+                  if (count !== undefined) ctx.assistantMessage.streamEventCount = count
+                  yield* session.updateMessage(ctx.assistantMessage)
+                }),
+            })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),

@@ -469,6 +469,7 @@ export const Assistant = Schema.Struct({
   }),
   summary: Schema.optional(Schema.Boolean),
   cost: Schema.Finite,
+  streamEventCount: NonNegativeInt.pipe(optional),
   tokens: Schema.Struct({
     total: Schema.optional(Schema.Finite),
     input: Schema.Finite,
