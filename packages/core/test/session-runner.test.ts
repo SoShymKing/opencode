@@ -30,7 +30,10 @@ import { SessionMessage } from "@opencode-ai/core/session/message"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
-import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator"
+import { SessionExecutionLocal } from "@opencode-ai/core/session/execution/local"
+import { LocationServiceMap } from "@opencode-ai/core/location-service-map"
+import type { LocationServices } from "@opencode-ai/core/location-services"
+import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { SessionRunner } from "@opencode-ai/core/session/runner"
 import * as SessionRunnerLLM from "@opencode-ai/core/session/runner/llm"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
@@ -54,7 +57,7 @@ import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { Location } from "@opencode-ai/core/location"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -243,21 +246,10 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [PermissionV2.node, permission],
   [Config.node, config],
 ])
-const execution = Layer.effect(
-  SessionExecution.Service,
-  Effect.gen(function* () {
-    const sessionRunner = yield* SessionRunner.Service
-    const coordinator = yield* SessionRunCoordinator.make<SessionV2.ID, SessionRunner.RunError>({
-      drain: (sessionID, force) => sessionRunner.run({ sessionID, force }),
-    })
-    return SessionExecution.Service.of({
-      active: coordinator.active,
-      resume: coordinator.run,
-      wake: coordinator.wake,
-      interrupt: coordinator.interrupt,
-    })
-  }),
-).pipe(Layer.provide(runnerLayer))
+const execution = AppNodeBuilder.build(SessionExecutionLocal.node, [
+  [LocationServiceMap.node, Layer.effect(LocationServiceMap.Service,
+    LayerMap.make((_location: Location.Ref) => runnerLayer as Layer.Layer<LocationServices>))],
+])
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
@@ -563,6 +555,123 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
+  const statusLog = Effect.gen(function* () {
+    const events = yield* EventV2.Service
+    const statuses: SessionStatusEvent.Info[] = []
+    yield* events.listen((event) => Effect.sync(() => {
+      if (event.type !== SessionStatusEvent.Status.type) return
+      const data = Schema.decodeUnknownSync(Schema.toType(SessionStatusEvent.Status.data))(event.data)
+      if (data.sessionID === sessionID) statuses.push(data.status)
+      expect(event.location?.directory).toBe(AbsolutePath.make("/project"))
+    }))
+    return statuses
+  })
+
+  it.effect("publishes execution activity before assistant creation and retains raw receipt time", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const statuses = yield* statusLog
+      const owner = SessionMessage.ID.make("msg_status_owner")
+      yield* session.prompt({ sessionID, id: owner, prompt: Prompt.make({ text: "Status" }), resume: false })
+      modelResolveHook = Effect.sync(() => {
+        expect(statuses.at(-1)).toEqual({ type: "busy", activity: { model: "preparing", userMessageID: owner } })
+      })
+      streamCounts = [{ before: 0, after: 7 }]
+      response = []
+      yield* events.listen((event) => Effect.gen(function* () {
+        if (event.type !== SessionStatusEvent.Status.type) return
+        const data = Schema.decodeUnknownSync(Schema.toType(SessionStatusEvent.Status.data))(event.data)
+        if (data.status.type !== "busy" || data.status.activity?.model !== "receiving") return
+        expect((yield* session.context(sessionID).pipe(Effect.orDie)).filter((message) => message.type === "assistant")).toEqual([])
+      }))
+      yield* session.resume(sessionID)
+      expect(statuses).toMatchObject([
+        { type: "busy", activity: { model: "preparing" } },
+        { type: "busy", activity: { model: "preparing", userMessageID: owner } },
+        { type: "busy", activity: { model: "waiting" } },
+        { type: "busy", activity: { model: "waiting", streamEventCount: 0 } },
+        { type: "busy", activity: { model: "receiving", streamEventCount: 7 } },
+        { type: "busy", activity: { model: "settling", streamEventCount: 7 } },
+        { type: "idle", terminal: { reason: "completed", userMessageID: owner } },
+      ])
+      expect(statuses[0]).not.toHaveProperty("activity.userMessageID", owner)
+      const receiving = statuses[4]
+      const settling = statuses[5]
+      expect(receiving.type === "busy" && receiving.activity?.lastStreamEventAt).toBeNumber()
+      expect(settling.type === "busy" && settling.activity?.lastStreamEventAt)
+        .toBe(receiving.type === "busy" && receiving.activity?.lastStreamEventAt)
+      expect(statuses[3]).not.toHaveProperty("activity.lastStreamEventAt")
+    }),
+  )
+
+  it.effect("publishes execution error for handled provider errors with unknown raw count", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const statuses = yield* statusLog
+      response = [LLMEvent.providerError({ message: "Provider unavailable" })]
+      yield* session.resume(sessionID)
+      expect(statuses.at(-1)).toMatchObject({ type: "idle", terminal: { reason: "error", message: "Provider unavailable" } })
+      expect(statuses.filter((status) => status.type === "busy").every((status) => status.activity?.streamEventCount === undefined)).toBeTrue()
+    }),
+  )
+
+  it.effect("publishes no execution terminal for no-op wakes or idle interrupts", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const execution = yield* SessionExecution.Service
+      const statuses = yield* statusLog
+      yield* execution.wake(sessionID)
+      while ((yield* execution.active).has(sessionID)) yield* Effect.yieldNow
+      yield* execution.interrupt(sessionID)
+      expect(statuses).toEqual([])
+    }),
+  )
+
+  for (const kind of ["text", "reasoning", "tool input"] as const) {
+    it.effect(`publishes execution receiving for semantic ${kind} without raw counts`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        const statuses = yield* statusLog
+        const fixture = fragmentFixture(kind, fragmentID(kind, "status"), ["Output"])
+        responseStream = Stream.fromIterable([LLMEvent.stepStart({ index: 0 })]).pipe(
+          Stream.concat(Stream.fromEffectDrain(Effect.sync(() => {
+            expect(statuses.at(-1)).toMatchObject({ type: "busy", activity: { model: "waiting" } })
+          }))),
+          Stream.concat(Stream.fromIterable(fixture.completeEvents.slice(1))),
+        )
+        yield* session.resume(sessionID)
+        expect(statuses).toContainEqual({ type: "busy", activity: { model: "receiving" } })
+        expect(statuses.filter((status) => status.type === "busy").every((status) =>
+          status.activity?.streamEventCount === undefined && status.activity?.lastStreamEventAt === undefined,
+        )).toBeTrue()
+      }),
+    )
+  }
+
+  for (const delivery of ["steer", "queue"] as const) {
+    it.effect(`publishes execution completed for ${delivery} after a handled provider failure`, () =>
+      Effect.gen(function* () {
+        yield* setup
+        const session = yield* SessionV2.Service
+        const statuses = yield* statusLog
+        const owner = SessionMessage.ID.make(`msg_status_${delivery}`)
+        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fail first" }), resume: false })
+        responseStream = Stream.fromEffectDrain(session.prompt({
+          sessionID, id: owner, prompt: Prompt.make({ text: "Then succeed" }), delivery, resume: false,
+        }).pipe(Effect.orDie)).pipe(Stream.concat(Stream.make(LLMEvent.providerError({ message: "First failed" }))))
+        response = fragmentFixture("text", "text-success", ["Success"]).completeEvents
+        yield* session.resume(sessionID)
+        expect(statuses.filter((status) => status.type === "idle")).toEqual([
+          { type: "idle", terminal: { reason: "completed", userMessageID: owner } },
+        ])
+      }),
+    )
+  }
+
   it.effect("advertises and executes a globally attached application tool", () =>
     Effect.gen(function* () {
       yield* setup
@@ -667,6 +776,10 @@ describe("SessionRunnerLLM", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
+      const statuses = yield* statusLog
+      systemLoadHook = Effect.sync(() => {
+        expect(statuses.at(-1)).toMatchObject({ type: "busy", activity: { model: "preparing" } })
+      })
       const { db } = yield* Database.Service
       const messageID = SessionMessage.ID.create()
       systemUnavailable = true
@@ -678,6 +791,11 @@ describe("SessionRunnerLLM", () => {
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SystemContext.InitializationBlocked)
       expect(requests).toHaveLength(0)
+      expect(statuses).toMatchObject([
+        { type: "busy", activity: { model: "preparing" } },
+        { type: "idle", terminal: { reason: "error" } },
+      ])
+      expect(statuses[0]).not.toHaveProperty("activity.userMessageID", messageID)
       expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
       expect(
         yield* db
@@ -689,6 +807,7 @@ describe("SessionRunnerLLM", () => {
 
       systemUnavailable = false
       yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }) })
+      yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user"])
@@ -1220,6 +1339,7 @@ describe("SessionRunnerLLM", () => {
   it.effect("forces one compaction and retries after provider context overflow", () =>
     Effect.gen(function* () {
       const session = yield* setupOverflowRecovery
+      const statuses = yield* statusLog
       streamCounts = [{ before: 11, after: 11 }, { before: 0, after: 4 }, { before: 0, after: 3 }]
       responses = [
         [
@@ -1233,6 +1353,18 @@ describe("SessionRunnerLLM", () => {
       yield* session.resume(sessionID)
 
       expect(requests).toHaveLength(3)
+      const retry = statuses.findIndex((status, index) => {
+        const previous = statuses[index - 1]
+        return status.type === "busy" && status.activity?.model === "preparing" &&
+          previous?.type === "busy" && previous.activity?.model === "settling"
+      })
+      expect(retry).toBeGreaterThan(0)
+      expect(statuses[retry]).not.toHaveProperty("activity.streamEventCount")
+      expect(statuses[retry]).not.toHaveProperty("activity.lastStreamEventAt")
+      expect(statuses[retry + 1]).toMatchObject({ type: "busy", activity: { model: "waiting" } })
+      expect(statuses[retry + 1]).not.toHaveProperty("activity.streamEventCount")
+      expect(statuses[retry + 2]).toMatchObject({ type: "busy", activity: { model: "waiting", streamEventCount: 0 } })
+      expect(statuses.at(-1)).toMatchObject({ type: "idle", terminal: { reason: "completed" } })
       expect(userTexts(requests[1])[0]).toContain("## Objective")
       expect(userTexts(requests[2])[0]).toContain("<summary>\n## Objective\n- Recover overflow\n</summary>")
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -1697,6 +1829,7 @@ describe("SessionRunnerLLM", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
+      const statuses = yield* statusLog
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Echo five times" }), resume: false })
 
       requests.length = 0
@@ -1727,6 +1860,7 @@ describe("SessionRunnerLLM", () => {
 
       expect(executions).toHaveLength(5)
       expect(maxActiveToolExecutions).toBe(5)
+      expect(statuses.at(-1)).toMatchObject({ type: "busy", activity: { model: "receiving" } })
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Echo five times" },
         {
@@ -1742,6 +1876,8 @@ describe("SessionRunnerLLM", () => {
       yield* Deferred.succeed(providerGate, undefined)
       yield* Effect.yieldNow
       expect(requests).toHaveLength(1)
+      expect(statuses.at(-1)).toMatchObject({ type: "busy", activity: { model: "settling" } })
+      expect(statuses.some((status) => status.type === "idle")).toBeFalse()
 
       yield* Deferred.succeed(toolExecutionGate, undefined)
       yield* Fiber.join(run)
@@ -1751,6 +1887,7 @@ describe("SessionRunnerLLM", () => {
       expect(executions).toHaveLength(5)
       expect(maxActiveToolExecutions).toBe(5)
       expect(requests).toHaveLength(2)
+      expect(statuses.at(-1)).toMatchObject({ type: "idle", terminal: { reason: "completed" } })
     }),
   )
 
@@ -2955,6 +3092,16 @@ describe("SessionRunnerLLM", () => {
     Effect.gen(function* () {
       yield* setup
       const session = yield* SessionV2.Service
+      const statuses = yield* statusLog
+      const events = yield* EventV2.Service
+      yield* events.listen((event) => Effect.gen(function* () {
+        if (event.type !== SessionStatusEvent.Status.type) return
+        const data = Schema.decodeUnknownSync(Schema.toType(SessionStatusEvent.Status.data))(event.data)
+        if (data.status.type !== "idle") return
+        const context = yield* session.context(sessionID).pipe(Effect.orDie)
+        expect(context.flatMap((message) => message.type === "assistant" ? message.content : [])
+          .filter((part) => part.type === "tool").every((tool) => tool.state.status === "error")).toBeTrue()
+      }))
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Interrupt blocked tool" }), resume: false })
       executions.length = 0
       toolExecutionGate = yield* Deferred.make<void>()
@@ -2972,6 +3119,7 @@ describe("SessionRunnerLLM", () => {
       toolExecutionGate = undefined
 
       expect(yield* Fiber.await(run)).toMatchObject({ _tag: "Failure" })
+      expect(statuses.at(-1)).toMatchObject({ type: "idle", terminal: { reason: "cancelled" } })
       yield* session.interrupt(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Interrupt blocked tool" },
