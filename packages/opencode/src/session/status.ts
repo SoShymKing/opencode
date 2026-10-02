@@ -33,18 +33,20 @@ const layer = Layer.effect(
     })
 
     const list = Effect.fn("SessionStatus.list")(function* () {
-      return new Map(yield* InstanceState.get(state))
+      return new Map([...(yield* InstanceState.get(state))].filter(([, value]) => value.type !== "idle"))
     })
 
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info) {
       const data = yield* InstanceState.get(state)
+      const previous = data.get(sessionID)
+      if (status.type === "idle" && !status.terminal && previous?.type === "idle" && previous.terminal) return
+      data.set(sessionID, status)
       yield* events.publish(Event.Status, { sessionID, status })
       if (status.type === "idle") {
         yield* events.publish(Event.Idle, { sessionID })
-        data.delete(sessionID)
+        if (!status.terminal) data.delete(sessionID)
         return
       }
-      data.set(sessionID, status)
     })
 
     return Service.of({ get, list, set })
