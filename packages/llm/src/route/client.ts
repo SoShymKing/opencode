@@ -49,6 +49,7 @@ export interface Route<Body, Prepared = unknown> {
     prepared: Prepared,
     request: LLMRequest,
     runtime: TransportRuntime,
+    observer?: StreamObserver,
   ) => Stream.Stream<LLMEvent, LLMError>
 }
 
@@ -154,8 +155,12 @@ export interface Interface {
   readonly generate: GenerateMethod
 }
 
+export interface StreamObserver {
+  readonly onStreamEventCount?: (count: number) => Effect.Effect<void>
+}
+
 export interface StreamMethod {
-  (request: LLMRequest): Stream.Stream<LLMEvent, LLMError>
+  (request: LLMRequest, observer?: StreamObserver): Stream.Stream<LLMEvent, LLMError>
 }
 
 export interface GenerateMethod {
@@ -276,23 +281,38 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
           encodeBody,
           headers: routeInput.headers,
         }),
-      streamPrepared: (prepared: Prepared, request: LLMRequest, runtime: TransportRuntime) => {
-        const route = `${request.model.provider}/${request.model.route.id}`
-        const events = routeInput.transport
-          .frames(prepared, request, runtime)
-          .pipe(
+      streamPrepared: (prepared: Prepared, request: LLMRequest, runtime: TransportRuntime, observer?: StreamObserver) =>
+        Stream.suspend(() => {
+          const route = `${request.model.provider}/${request.model.route.id}`
+          let count = 0
+          const frames = routeInput.transport.frames(prepared, request, runtime)
+          const observe = observer?.onStreamEventCount
+          const observed = observe
+            ? Stream.fromEffectDrain(observe(0)).pipe(
+                Stream.concat(
+                  frames.pipe(
+                    Stream.tap((frame) =>
+                      typeof frame === "string" && (frame.length === 0 || frame === "[DONE]")
+                        ? Effect.void
+                        : observe(++count),
+                    ),
+                  ),
+                ),
+              )
+            : frames
+          const events = observed.pipe(
             Stream.mapEffect(decodeEvent(route)),
             protocol.stream.terminal ? Stream.takeUntil(protocol.stream.terminal) : (stream) => stream,
           )
-        return events.pipe(
-          Stream.mapAccumEffect(
-            () => protocol.stream.initial(request),
-            protocol.stream.step,
-            protocol.stream.onHalt ? { onHalt: protocol.stream.onHalt } : undefined,
-          ),
-          Stream.catchCause((cause) => Stream.fail(streamError(route, `Failed to read ${route} stream`, cause))),
-        )
-      },
+          return events.pipe(
+            Stream.mapAccumEffect(
+              () => protocol.stream.initial(request),
+              protocol.stream.step,
+              protocol.stream.onHalt ? { onHalt: protocol.stream.onHalt } : undefined,
+            ),
+            Stream.catchCause((cause) => Stream.fail(streamError(route, `Failed to read ${route} stream`, cause))),
+          )
+        }),
     } satisfies Route<Body, Prepared>
     return route
   }
@@ -371,11 +391,11 @@ const prepareWith = Effect.fn("LLMClient.prepare")(function* (request: LLMReques
   })
 })
 
-const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest) =>
+const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest, observer?: StreamObserver) =>
   Stream.unwrap(
     Effect.gen(function* () {
       const compiled = yield* compile(request)
-      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime)
+      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime, observer)
     }),
   )
 
@@ -393,10 +413,11 @@ const generateWith = (stream: Interface["stream"]) =>
 export const prepare = <Body = unknown>(request: LLMRequest) =>
   prepareWith(request) as Effect.Effect<PreparedRequestOf<Body>, LLMError>
 
-export function stream(request: LLMRequest): Stream.Stream<LLMEvent, LLMError> {
+export function stream(request: LLMRequest, observer?: StreamObserver): Stream.Stream<LLMEvent, LLMError> {
   return Stream.unwrap(
     Effect.gen(function* () {
-      return (yield* Service).stream(request)
+      const client = yield* Service
+      return client.stream(request, observer)
     }),
   ) as Stream.Stream<LLMEvent, LLMError>
 }
@@ -407,10 +428,11 @@ export function generate(request: LLMRequest): Effect.Effect<LLMResponse, LLMErr
   }) as Effect.Effect<LLMResponse, LLMError>
 }
 
-export const streamRequest = (request: LLMRequest) =>
+export const streamRequest = (request: LLMRequest, observer?: StreamObserver) =>
   Stream.unwrap(
     Effect.gen(function* () {
-      return (yield* Service).stream(request)
+      const client = yield* Service
+      return client.stream(request, observer)
     }),
   )
 
