@@ -58,13 +58,16 @@ const draftImages = (prompt: Prompt) => prompt.filter((part): part is ImageAttac
 export async function sendFollowupDraft(input: FollowupSendInput) {
   const text = draftText(input.draft.prompt)
   const images = draftImages(input.draft.prompt)
+  const wasWorking = input.serverSync.session.data.session_working(input.draft.sessionID)
   const setBusy = () => {
-    if (!input.optimisticBusy) return
+    if (!input.optimisticBusy || wasWorking) return
     input.serverSync.session.set("session_status", input.draft.sessionID, { type: "busy" })
   }
 
   const setIdle = () => {
-    if (!input.optimisticBusy) return
+    if (!input.optimisticBusy || wasWorking) return
+    const status = input.serverSync.session.data.session_status[input.draft.sessionID]
+    if (status?.type !== "busy" || status.activity) return
     input.serverSync.session.set("session_status", input.draft.sessionID, { type: "idle" })
   }
 
@@ -516,7 +519,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       if (customCommand) {
         clearInput()
         const messageID = Identifier.ascending("message")
-        serverSync().session.set("session_status", session.id, { type: "busy" })
+        const wasWorking = serverSync().session.data.session_working(session.id)
+        if (!wasWorking) serverSync().session.set("session_status", session.id, { type: "busy" })
         sdk()
           .api.session.command({
             sessionID: session.id,
@@ -533,7 +537,9 @@ export function createPromptSubmit(input: PromptSubmitInput) {
             ),
           })
           .catch((err) => {
-            serverSync().session.set("session_status", session.id, { type: "idle" })
+            const status = serverSync().session.data.session_status[session.id]
+            if (!wasWorking && status?.type === "busy" && !status.activity)
+              serverSync().session.set("session_status", session.id, { type: "idle" })
             showToast({
               title: language.t("prompt.toast.commandSendFailed.title"),
               description: formatServerError(err, language.t, language.t("common.requestFailed")),
@@ -562,15 +568,8 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       const worktree = WorktreeState.get(sdk().scope, sessionDirectory)
       if (!worktree || worktree.status !== "pending") return true
 
-      if (sessionDirectory === projectDirectory) {
-        sync().set("session_status", session.id, { type: "busy" })
-      }
-
       const controller = new AbortController()
       const cleanup = () => {
-        if (sessionDirectory === projectDirectory) {
-          sync().set("session_status", session.id, { type: "idle" })
-        }
         removeOptimisticMessage()
         if (restoreInput()) restoreCommentItems(submission.target(), commentItems)
       }
@@ -626,9 +625,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       before: waitForWorktree,
     }).catch((err) => {
       pending.delete(pendingKey(session.id))
-      if (sessionDirectory === projectDirectory) {
-        sync().set("session_status", session.id, { type: "idle" })
-      }
       showToast({
         title: language.t("prompt.toast.promptSendFailed.title"),
         description: errorMessage(err),

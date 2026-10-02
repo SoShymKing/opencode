@@ -2,8 +2,16 @@ import { beforeAll, beforeEach, describe, expect, mock, test } from "bun:test"
 import { createStore } from "solid-js/store"
 import type { Prompt, PromptStore } from "@/context/prompt"
 import type { ModelSelection } from "@/context/local"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 let createPromptSubmit: typeof import("./submit").createPromptSubmit
+let sendFollowupDraft: typeof import("./submit").sendFollowupDraft
+const [sessionState, setSessionState] = createStore({
+  session_status: {} as Record<string, typeof SessionStatusEvent.Info.Encoded>,
+  session_working(id: string) { return (this.session_status[id]?.type ?? "idle") !== "idle" },
+})
+let promptFailure: Error | undefined
+const removedOptimistic: string[] = []
 
 const createdClients: string[] = []
 const createdSessions: string[] = []
@@ -95,6 +103,7 @@ const clientFor = (directory: string) => {
         prompt: async (input: unknown) => {
           sentPrompts.push(directory)
           promptInputs.push(input)
+          if (promptFailure) throw promptFailure
           return { data: undefined }
         },
         command: async (input: unknown) => {
@@ -135,6 +144,7 @@ beforeAll(async () => {
   mock.module("@opencode-ai/ui/toast", () => ({
     Toast: { Region: () => null },
     showToast: () => 0,
+    toaster: { dismiss: () => undefined },
   }))
 
   mock.module("@opencode-ai/core/util/encode", () => ({
@@ -225,7 +235,7 @@ beforeAll(async () => {
                 !!storedSessions[value.directory]?.find((item) => item.id === value.sessionID)?.title,
             )
           },
-          remove: () => undefined,
+          remove: (input: { messageID: string }) => removedOptimistic.push(input.messageID),
         },
       },
       set: () => undefined,
@@ -236,7 +246,8 @@ beforeAll(async () => {
     useServerSync: () => () => ({
       session: {
         remember: () => undefined,
-        set: () => undefined,
+        data: sessionState,
+        set: setSessionState,
         sync: async () => {
           serverSessionSyncs++
         },
@@ -276,6 +287,7 @@ beforeAll(async () => {
 
   const mod = await import("./submit")
   createPromptSubmit = mod.createPromptSubmit
+  sendFollowupDraft = mod.sendFollowupDraft
 })
 
 beforeEach(() => {
@@ -301,10 +313,34 @@ beforeEach(() => {
   permissionServer = "server-a"
   createSessionGate = undefined
   serverSessionSyncs = 0
+  promptFailure = undefined
+  removedOptimistic.length = 0
+  setSessionState("session_status", {})
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
 describe("prompt submit worktree selection", () => {
+  test.each(["busy", "retry"] as const)("preserves %s owner activity after a failed followup", async (type) => {
+    const status = type === "busy"
+      ? { type, activity: { userMessageID: "msg_owner", model: "receiving" as const, streamEventCount: 7 } }
+      : { type, attempt: 2, next: 100, message: "retry", activity: { userMessageID: "msg_owner", model: "waiting" as const } }
+    setSessionState("session_status", "session-1", status)
+    promptFailure = new Error("followup failed")
+    const { useSDK } = await import("@/context/sdk")
+    const { useSync } = await import("@/context/sync")
+    const { useServerSync } = await import("@/context/server-sync")
+    await expect(sendFollowupDraft({
+      api: useSDK()().api.session,
+      sync: useSync()(),
+      serverSync: useServerSync()(),
+      draft: { sessionID: "session-1", sessionDirectory: "/repo/main", prompt: promptValue, context: [], agent: "build", model: { providerID: "provider", modelID: "model" } },
+      messageID: "msg_followup",
+      optimisticBusy: true,
+    })).rejects.toThrow("followup failed")
+    expect(sessionState.session_status["session-1"]).toEqual(status)
+    expect(removedOptimistic).toEqual(["msg_followup"])
+  })
+
   test("reads the latest worktree accessor value per submit", async () => {
     const submit = createPromptSubmit({
       prompt,
