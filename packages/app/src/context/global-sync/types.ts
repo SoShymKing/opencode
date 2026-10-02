@@ -9,7 +9,6 @@ import type {
   QuestionRequest,
   ReferenceInfo,
   Session,
-  SessionStatus,
   Todo,
   VcsInfo,
 } from "@opencode-ai/sdk/v2/client"
@@ -18,6 +17,7 @@ import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { CommandInfo, McpResource, McpServer, SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { Accessor } from "solid-js"
 import type { SetStoreFunction, Store } from "solid-js/store"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 export type ProjectMeta = {
   name?: string
@@ -45,7 +45,7 @@ export type State = {
   session: Session[]
   sessionTotal: number
   session_status: {
-    [sessionID: string]: SessionStatus
+    [sessionID: string]: typeof SessionStatusEvent.Info.Encoded
   }
   session_working(id: string): boolean
   session_diff: {

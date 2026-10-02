@@ -8,7 +8,6 @@ import type {
   PermissionRequest,
   QuestionRequest,
   Session,
-  SessionStatus,
   Todo,
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
@@ -28,6 +27,7 @@ import type { ServerSessionEvent } from "./server-sdk"
 import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 type MessageApi = ServerApi["message"]
 
@@ -200,9 +200,12 @@ export function createServerSession(
 ) {
   const sessionApi = messageApi ? (sessionApiOrOptions as SessionApi) : undefined
   const options = messageApi ? currentOptions : (sessionApiOrOptions as ServerSessionOptions | undefined)
+  const protocol = { kind: sessionApi ? "v2" as const : "v1" as const }
+  void options?.protocol?.then((kind) => { protocol.kind = kind })
   const [data, setData] = createStore({
     info: {} as Record<string, Session | undefined>,
-    session_status: {} as Record<string, SessionStatus>,
+    session_status: {} as Record<string, typeof SessionStatusEvent.Info.Encoded>,
+    pending_input: {} as Record<string, Record<string, boolean>>,
     session_diff: {} as Record<string, FileDiffInfo[]>,
     todo: {} as Record<string, Todo[]>,
     permission: {} as Record<string, PermissionRequest[]>,
@@ -276,6 +279,7 @@ export function createServerSession(
         ...inflightTodo.keys(),
         ...messageLoads.keys(),
         ...optimistic.keys(),
+        ...Object.keys(data.pending_input).filter((id) => Object.keys(data.pending_input[id]).length > 0),
         ...Object.entries(data.permission)
           .filter(([, items]) => items.length > 0)
           .map(([sessionID]) => sessionID),
@@ -502,6 +506,7 @@ export function createServerSession(
     setData(
       produce((draft) => {
         dropSessionCaches(draft, sessionIDs)
+        sessionIDs.forEach((id) => delete draft.pending_input[id])
       }),
     )
     setMeta(
@@ -525,6 +530,7 @@ export function createServerSession(
       ...inflightTodo.keys(),
       ...messageLoads.keys(),
       ...optimistic.keys(),
+      ...Object.keys(data.pending_input).filter((id) => Object.keys(data.pending_input[id]).length > 0),
       ...Object.entries(data.permission)
         .filter(([, items]) => items.length > 0)
         .map(([sessionID]) => sessionID),
@@ -716,7 +722,8 @@ export function createServerSession(
       touched: touchedMessages,
       retained: load?.retainedMessages,
       removed: load?.removedMessages,
-      preserveUnfetched,
+      preserveUnfetched: (message) => data.pending_input[sessionID]?.[message.id] === true ||
+        (typeof preserveUnfetched === "function" ? preserveUnfetched(message) : preserveUnfetched),
       compare: compareMessages,
     })
     batch(() => {
@@ -945,7 +952,19 @@ export function createServerSession(
     const sessionID = event.data.sessionID
     const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
     if (reduction) {
+      const admitted = reduction.admitted
+      if (admitted) setData("pending_input", sessionID, (current = {}) => ({ ...current, [admitted]: true }))
+      if (reduction.promoted)
+        setData("pending_input", sessionID, produce((draft = {}) => {
+          reduction.promoted?.forEach((id) => delete draft[id])
+        }))
       projectV2(reduction)
+      if (reduction.pendingMessage && !data.message[sessionID]?.some((message) => message.id === reduction.pendingMessage?.id)) {
+        const normalized = normalizeSessionMessages(sessionID, [reduction.pendingMessage])
+        setData("message", sessionID, (messages = []) => merge(messages, normalized.messages).sort(compareMessages))
+        normalized.parts.forEach((parts, id) => setData("part", id, parts))
+        messageLoads.get(sessionID)?.retainedMessages.add(reduction.pendingMessage.id)
+      }
       if (reduction.missing) hydrateV2Message(sessionID, reduction.missing)
     }
 
@@ -967,7 +986,9 @@ export function createServerSession(
     //   if (info) remember({ ...info, time: { ...info.time, archived: event.created, updated: event.created } })
     //   evict([sessionID])
     // }
-    if (event.type === "session.execution.started") setData("session_status", sessionID, { type: "busy" })
+    const status = data.session_status[sessionID]
+    if (event.type === "session.execution.started" && (status?.type === "idle" || !status?.activity))
+      setData("session_status", sessionID, { type: "busy" })
     if (
       event.type === "session.execution.succeeded" ||
       event.type === "session.execution.failed" ||
@@ -1030,12 +1051,31 @@ export function createServerSession(
         return
       }
       case "session.status": {
-        const props = event.properties as { sessionID: string; status: SessionStatus }
+        const props = event.properties as { sessionID: string; status: typeof SessionStatusEvent.Info.Encoded }
         setData("session_status", props.sessionID, reconcile(props.status))
+        const owner = props.status.type !== "idle" ? props.status.activity?.userMessageID : undefined
+        if (owner && protocol.kind === "v1") {
+          const boundary = data.message[props.sessionID]?.find((message) => message.id === owner)
+          if (boundary)
+            setData("pending_input", props.sessionID, produce((draft = {}) => {
+              data.message[props.sessionID]?.forEach((message) => {
+                if (message.role === "user" && compareMessages(message, boundary) <= 0) delete draft[message.id]
+              })
+            }))
+        }
         return
       }
       case "message.updated": {
         const info = cleanMessage((event.properties as { info: Message }).info)
+        if (protocol.kind === "v1" && info.role === "assistant" && info.time.completed === undefined) {
+          const boundary = data.message[info.sessionID]?.find((message) => message.id === info.parentID)
+          if (boundary)
+            setData("pending_input", info.sessionID, produce((draft = {}) => {
+              data.message[info.sessionID]?.forEach((message) => {
+                if (message.role === "user" && compareMessages(message, boundary) <= 0) delete draft[message.id]
+              })
+            }))
+        }
         indexLegacyMessage(info)
         const load = messageLoads.get(info.sessionID)
         load?.touchedMessages.add(info.id)
@@ -1327,6 +1367,7 @@ export function createServerSession(
     },
     optimistic: {
       add(input: { sessionID: string; message: Message; parts: Part[] }) {
+        setData("pending_input", input.sessionID, (current = {}) => ({ ...current, [input.message.id]: true }))
         const parts = input.parts
           .filter((part) => !!part?.id && !SKIP_PARTS.has(part.type))
           .sort((a, b) => cmp(a.id, b.id))
@@ -1360,6 +1401,7 @@ export function createServerSession(
         setData("part", input.message.id, parts)
       },
       remove(input: { sessionID: string; messageID: string }) {
+        setData("pending_input", input.sessionID, produce((draft = {}) => { delete draft[input.messageID] }))
         const item = optimistic.get(input.sessionID)?.get(input.messageID)
         if (!item) return
         messageLoads.get(input.sessionID)?.optimisticParts.delete(input.messageID)

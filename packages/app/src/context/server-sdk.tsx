@@ -1,5 +1,6 @@
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { SessionEvent } from "@opencode-ai/schema/session-event"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import type { Event } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
@@ -24,7 +25,12 @@ export type CurrentStepEvent =
   | typeof SessionEvent.Step.StreamUpdated.Encoded
   | typeof SessionEvent.Step.Ended.Encoded
   | typeof SessionEvent.Step.Failed.Encoded
-export type ServerSessionEvent = OpenCodeEvent | CurrentStepEvent
+export type ServerSessionEvent =
+  | OpenCodeEvent
+  | CurrentStepEvent
+  | typeof SessionEvent.PromptAdmitted.Encoded
+  | typeof SessionEvent.Prompted.Encoded
+  | typeof SessionStatusEvent.Status.Encoded
 export type ServerEvent = Event & { current?: ServerSessionEvent }
 type QueuedServerEvent = { directory: string; payload: ServerEvent }
 type CurrentDelta = Extract<
@@ -34,6 +40,10 @@ type CurrentDelta = Extract<
 
 export function adaptServerEvent(event: ServerSessionEvent): ServerEvent {
   switch (event.type) {
+    case "session.next.prompt.admitted":
+    case "session.next.prompted":
+    case "session.status":
+      return { id: event.id, type: event.type, properties: event.data, current: event } as ServerEvent
     case "session.next.step.started":
       return { id: event.id, type: event.type, properties: event.data, current: event }
     case "session.next.step.stream.updated":
