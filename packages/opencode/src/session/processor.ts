@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Context, Option, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -17,6 +17,8 @@ import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
+import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
 import { Question } from "@/question"
@@ -623,7 +625,6 @@ const layer = Layer.effect(
             ctx.assistantMessage.error = error
             ctx.assistantMessage.finish = "error"
             yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
-            yield* status.set(ctx.sessionID, { type: "idle" })
             return
           }
           ctx.needsCompaction = true
@@ -635,7 +636,6 @@ const layer = Layer.effect(
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
         })
-        yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
@@ -645,26 +645,54 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const current = yield* status.get(ctx.sessionID)
+        let activity: SessionStatusEvent.Activity = {
+          model: "preparing",
+          userMessageID: (ctx.assistantMessage.summary && current.type !== "idle" ? current.activity?.userMessageID : undefined)
+            ?? Option.getOrUndefined(Schema.decodeUnknownOption(SessionMessage.ID)(ctx.assistantMessage.parentID)),
+        }
+        const publish = () => status.set(ctx.sessionID, { type: "busy", activity })
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             delete ctx.assistantMessage.streamEventCount
+            activity = { model: "preparing", userMessageID: activity.userMessageID }
+            yield* publish()
             yield* session.updateMessage(ctx.assistantMessage)
-            yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream({
               ...streamInput,
-              onStreamEventCount: (count) =>
-                Effect.gen(function* () {
+              onStreamEventCount: (count) => {
+                const observedAt = count !== undefined && count > 0 ? Date.now() : undefined
+                return Effect.gen(function* () {
+                  activity = {
+                    userMessageID: activity.userMessageID,
+                    model: count !== undefined && count > 0 ? "receiving" : "waiting",
+                    streamEventCount: count,
+                    lastStreamEventAt: observedAt,
+                  }
+                  yield* publish()
                   if (count === undefined) delete ctx.assistantMessage.streamEventCount
                   if (count !== undefined) ctx.assistantMessage.streamEventCount = count
                   yield* session.updateMessage(ctx.assistantMessage)
-                }),
+                })
+              },
+              onStreamEnd: Effect.gen(function* () {
+                activity = { ...activity, model: "settling" }
+                yield* publish()
+              }),
             })
 
             yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
+              Stream.tap((event) => Effect.gen(function* () {
+                if (activity.model === "waiting" && activity.streamEventCount === undefined &&
+                  ["text-delta", "reasoning-delta", "tool-input-delta", "tool-call"].includes(event.type)) {
+                  activity = { ...activity, model: "receiving" }
+                  yield* publish()
+                }
+                yield* handleEvent(event)
+              })),
               Stream.takeUntil(() => ctx.needsCompaction),
               Stream.runDrain,
             )
@@ -692,6 +720,7 @@ const layer = Layer.effect(
                     message: info.message,
                     action: info.action,
                     next: info.next,
+                    activity,
                   })
                 },
               }),

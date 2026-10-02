@@ -34,6 +34,7 @@ import { SessionProcessor } from "./processor"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { LLM } from "./llm"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "@/tool/shell/id"
@@ -476,6 +477,10 @@ const layer = Layer.effect(
               model: { providerID: model.providerID, modelID: model.modelID },
             }
             yield* sessions.updateMessage(userMsg)
+            yield* status.set(input.sessionID, {
+              type: "busy",
+              activity: { model: "none", userMessageID: Option.getOrUndefined(Schema.decodeUnknownOption(SessionMessage.ID)(userMsg.id)) },
+            })
             const userPart: SessionV1.Part = {
               type: "text",
               id: PartID.ascending(),
@@ -1086,7 +1091,6 @@ const layer = Layer.effect(
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
-          yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
@@ -1130,6 +1134,13 @@ const layer = Layer.effect(
           }
 
           step++
+          yield* status.set(sessionID, {
+            type: "busy",
+            activity: {
+              model: "preparing",
+              userMessageID: Option.getOrUndefined(Schema.decodeUnknownOption(SessionMessage.ID)(lastUser.id)),
+            },
+          })
           if (step === 1)
             yield* title({
               session,
