@@ -1594,8 +1594,33 @@ const INLINE_TOOL_ICON_WIDTH = 2
 function useCurrentResponse(sessionID: () => string) {
   const sync = useSync()
   const data = useData()
+  const activity = () => {
+    const status = sync.data.session_status[sessionID()]
+    return status?.type === "busy" || status?.type === "retry" ? status.activity : undefined
+  }
   const assistant = createMemo(() => {
     const messages = sync.data.message[sessionID()] ?? []
+    const live = activity()
+    if (live) {
+      if (!live.userMessageID) return undefined
+      const current = messages.findLast(
+        (message): message is AssistantMessage =>
+          message.role === "assistant" &&
+          message.parentID === live.userMessageID &&
+          message.time.completed === undefined,
+      )
+      const nativeMessages = data.session.message.list(sessionID()) ?? []
+      const native = current && nativeMessages.find((message) => message.id === current.id)
+      if (current && (native?.type !== "assistant" || native.time.completed === undefined)) return current
+      const owner = messages.find((message) => message.id === live.userMessageID)
+      const boundary = nativeMessages.findIndex((message) => message.id === live.userMessageID)
+      return nativeMessages.find(
+        (message, index): message is SessionMessageAssistant =>
+          message.type === "assistant" &&
+          message.time.completed === undefined &&
+          (boundary !== -1 ? index < boundary : owner !== undefined && message.time.created >= owner.time.created),
+      )
+    }
     const user = messages.findLastIndex((message) => message.role === "user")
     const completed = messages.findLastIndex(
       (message) => message.role === "assistant" && message.time.completed !== undefined,
@@ -1622,6 +1647,8 @@ function useCurrentResponse(sessionID: () => string) {
     )
   })
   const count = () => {
+    const live = activity()
+    if (live) return live.streamEventCount
     const current = assistant()
     if (!current) return 0
     const native = data.session.message.list(sessionID())?.find((message) => message.id === current.id)

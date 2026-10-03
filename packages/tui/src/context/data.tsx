@@ -73,6 +73,10 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
 
     const sdk = useSDK()
     const events = useEvent()
+    let connectionEpoch = 0
+    const messageRevision = new Map<string, number>()
+    const contentRevision = new Map<string, number>()
+    const refreshingMessages = new Map<string, Promise<void>>()
     const [defaultLocation, setDefaultLocation] = createSignal<LocationRef>({
       directory: sdk.directory ?? process.cwd(),
     })
@@ -122,6 +126,14 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     }
 
     function handleEvent(event: V2Event) {
+      const messageID = "assistantMessageID" in event.data
+        ? event.data.assistantMessageID
+        : "messageID" in event.data ? event.data.messageID : undefined
+      if (typeof messageID === "string") messageRevision.set(messageID, (messageRevision.get(messageID) ?? 0) + 1)
+      const contentID = "textID" in event.data
+        ? event.data.textID
+        : "reasoningID" in event.data ? event.data.reasoningID : "callID" in event.data ? event.data.callID : undefined
+      if (typeof contentID === "string") contentRevision.set(contentID, (contentRevision.get(contentID) ?? 0) + 1)
       switch (event.type) {
         case "catalog.updated":
           void Promise.all([
@@ -412,6 +424,27 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
 
     onMount(() => {
       const unsub = events.subscribe((event, metadata) => {
+        if (event.type === "server.connected") {
+          connectionEpoch += 1
+          const retained = new Set([
+            ...Object.keys(store.session.info),
+            ...Object.keys(store.session.message),
+            ...Object.keys(store.session.permission),
+            ...Object.keys(store.session.question),
+          ])
+          void Promise.allSettled(
+            Array.from(retained).flatMap((sessionID) => [
+              result.session.message.refresh(sessionID),
+              result.session.permission.refresh(sessionID),
+              result.session.question.refresh(sessionID),
+              ...(store.session.info[sessionID] ? [result.session.refresh(sessionID)] : []),
+            ]),
+          ).then((settled) => {
+            for (const failure of settled.filter((item) => item.status === "rejected"))
+              console.error("tui native reconnect hydration failed", failure.reason)
+          })
+          return
+        }
         handleEvent({
           ...event,
           data: event.properties,
@@ -427,16 +460,51 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
           return store.session.info[sessionID]
         },
         async refresh(sessionID: string) {
+          const epoch = connectionEpoch
           const result = await sdk.client.v2.session.get({ sessionID }, { throwOnError: true })
+          if (epoch !== connectionEpoch) return
           setStore("session", "info", sessionID, result.data.data)
         },
         message: {
           list(sessionID: string) {
             return store.session.message[sessionID]
           },
-          async refresh(sessionID: string) {
-            const result = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
-            setStore("session", "message", sessionID, result.data.data)
+          async refresh(sessionID: string): Promise<void> {
+            const refreshing = refreshingMessages.get(sessionID)
+            if (refreshing) {
+              await Promise.allSettled([refreshing])
+              return result.session.message.refresh(sessionID)
+            }
+            const epoch = connectionEpoch
+            const revisions = new Map(messageRevision)
+            const contents = new Map(contentRevision)
+            const task = (async () => {
+              const response = await sdk.client.v2.session.messages({ sessionID }, { throwOnError: true })
+              if (epoch !== connectionEpoch) return
+              message.update(sessionID, (draft) => {
+                const merged = response.data.data.map((item) => {
+                  const current = draft.find((message) => message.id === item.id)
+                  if (!current || revisions.get(item.id) === messageRevision.get(item.id)) return item
+                  if (item.type !== "assistant" || current.type !== "assistant") return current
+                  const content = item.content.map((part) => {
+                    const live = current.content.find((item) => item.id === part.id)
+                    return live && contents.get(part.id) !== contentRevision.get(part.id) ? live : part
+                  })
+                  content.push(...current.content.filter((part) =>
+                    !content.some((item) => item.id === part.id) && contents.get(part.id) !== contentRevision.get(part.id),
+                  ))
+                  return { ...current, content }
+                })
+                merged.push(...draft.filter((item) =>
+                  !merged.some((message) => message.id === item.id) &&
+                  (item.type === "user" || revisions.get(item.id) !== messageRevision.get(item.id)),
+                ))
+                merged.sort((first, second) => second.time.created - first.time.created || second.id.localeCompare(first.id))
+                draft.splice(0, draft.length, ...merged)
+              })
+            })().finally(() => refreshingMessages.delete(sessionID))
+            refreshingMessages.set(sessionID, task)
+            return task
           },
         },
         permission: {
@@ -444,7 +512,9 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
             return store.session.permission[sessionID]
           },
           async refresh(sessionID: string) {
+            const epoch = connectionEpoch
             const result = await sdk.client.v2.session.permission.list({ sessionID }, { throwOnError: true })
+            if (epoch !== connectionEpoch) return
             setStore("session", "permission", sessionID, result.data.data)
           },
         },
@@ -453,7 +523,9 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
             return store.session.question[sessionID]
           },
           async refresh(sessionID: string) {
+            const epoch = connectionEpoch
             const result = await sdk.client.v2.session.question.list({ sessionID }, { throwOnError: true })
+            if (epoch !== connectionEpoch) return
             setStore("session", "question", sessionID, result.data.data)
           },
         },
