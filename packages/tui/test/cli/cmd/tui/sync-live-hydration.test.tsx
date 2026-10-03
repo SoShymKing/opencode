@@ -2,7 +2,10 @@
 import { expect, test } from "bun:test"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../../fixture/fixture"
-import { json, mount, wait } from "./sync-fixture"
+import { createFetch, json, mount, wait } from "./sync-fixture"
+import { testRender } from "@opentui/solid"
+import { SDKProvider, useSDK } from "../../../../src/context/sdk"
+import { onMount } from "solid-js"
 
 const sessionID = "ses_hydration_race"
 const messageID = "msg_hydration_race"
@@ -32,6 +35,44 @@ const assistant = {
 function global(payload: GlobalEvent["payload"]): GlobalEvent {
   return { directory: "/tmp/other", project: "proj_test", payload }
 }
+
+test.each(["error", "EOF"])("SSE %s reconnects and cleanup cancels the final stream once", async (failure) => {
+  let requests = 0
+  let connected = 0
+  let cancelled = 0
+  const calls = createFetch(() => {
+    requests += 1
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (requests === 1) {
+          if (failure === "error") controller.error(new Error("SSE overflow"))
+          if (failure === "EOF") controller.close()
+          return
+        }
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(global({
+          id: "evt_connected", type: "server.connected", properties: {},
+        }))}\n\n`))
+      },
+      cancel() { cancelled += 1 },
+    }), { headers: { "content-type": "text/event-stream" } })
+  })
+  function Probe() {
+    const sdk = useSDK()
+    onMount(() => sdk.event.on("event", (event) => {
+      if (event.payload.type === "server.connected") connected += 1
+    }))
+    return <box />
+  }
+  const app = await testRender(() => <SDKProvider url="http://test" fetch={calls.fetch}><Probe /></SDKProvider>)
+  try {
+    await wait(() => connected === 1, 4000)
+    expect(requests).toBe(2)
+  } finally {
+    app.renderer.destroy()
+  }
+  await wait(() => cancelled === 1)
+  expect(cancelled).toBe(1)
+})
 
 test("live messages use creation time with an ID tie-break", async () => {
   await using tmp = await tmpdir()
