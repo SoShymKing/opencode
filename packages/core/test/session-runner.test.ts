@@ -66,6 +66,7 @@ let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
 let streamCounts: Array<{ readonly before: number; readonly after: number }> | undefined
+let streamCountHook: Effect.Effect<void> = Effect.void
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
 let streamFailure: LLMError | undefined
@@ -93,6 +94,7 @@ const client = Layer.succeed(
         ? Stream.fromEffectDrain(observer.onStreamEventCount(count.before)).pipe(
             Stream.concat(source),
             Stream.concat(Stream.fromEffectDrain(observer.onStreamEventCount(count.after))),
+            Stream.concat(Stream.fromEffectDrain(streamCountHook)),
           )
         : source
       if (!streamGate) return events
@@ -322,6 +324,7 @@ const setup = Effect.gen(function* () {
   streamFailure = undefined
   responseStream = undefined
   streamCounts = undefined
+  streamCountHook = Effect.void
   streamGate = undefined
   streamStarted = undefined
   toolExecutionGate = undefined
@@ -555,6 +558,38 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
+  for (const outcome of ["normal", "late", "error", "cancel"] as const) {
+    it.effect(`persists final raw count once for ${outcome} provider completion`, () => Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const runner = yield* SessionRunner.Service
+      const counts: number[] = []
+      yield* events.listen((event) => Effect.sync(() => {
+        if (event.type !== SessionEvent.Step.StreamUpdated.type) return
+        counts.push(Schema.decodeUnknownSync(Schema.toType(SessionEvent.Step.StreamUpdated.data))(event.data).streamEventCount)
+      }))
+      streamCounts = [{ before: 1, after: 200 }]
+      response = outcome === "error"
+        ? [LLMEvent.providerError({ message: "failed" })]
+        : outcome === "late"
+          ? [LLMEvent.stepFinish({ index: 0, reason: "stop" })]
+          : fragmentFixture("text", "text-count", ["hello"]).completeEvents
+      streamCountHook = Effect.gen(function* () {
+        expect(counts).toEqual([])
+        if (outcome === "cancel") yield* Effect.interrupt
+      })
+      const result = yield* runner.run({ sessionID, force: true }).pipe(Effect.exit)
+      expect(result._tag).toBe(outcome === "cancel" ? "Failure" : "Success")
+      expect(counts).toEqual([200])
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "assistant", streamEventCount: 200, finish: outcome === "cancel" || outcome === "error" ? "error" : "stop" },
+      ])
+      yield* replaySessionProjection(sessionID)
+      expect(yield* session.context(sessionID)).toMatchObject([{ type: "assistant", streamEventCount: 200 }])
+    }))
+  }
+
   const statusLog = Effect.gen(function* () {
     const events = yield* EventV2.Service
     const statuses: SessionStatusEvent.Info[] = []
