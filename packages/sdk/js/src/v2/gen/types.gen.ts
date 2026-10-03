@@ -2717,6 +2717,7 @@ export type InvalidCursorError = {
 
 export type SessionActive = {
   type: "running"
+  status?: SessionStatus
 }
 
 export type SessionNotFoundError = {
