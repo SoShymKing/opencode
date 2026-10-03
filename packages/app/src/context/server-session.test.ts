@@ -162,6 +162,75 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("reconnect force waits for older inflight history then fetches fresh history", async () => {
+    const older = deferredResponse()
+    const client = messageClient(older.promise, response([{ info: userMessage("fresh"), parts: [] }]))
+    const store = createServerSession(client)
+    const loading = store.sync("child")
+    await client.requested(1)
+    const refreshing = store.sync("child", { force: true })
+    older.resolve(response([{ info: userMessage("old"), parts: [] }]))
+    await Promise.all([loading, refreshing])
+    expect(client.requests.length).toBe(2)
+    expect(store.data.message.child?.map((message) => message.id)).toEqual(["fresh"])
+  })
+
+  test("reconnect snapshot restores quiet activity and clears inactive stale busy", () => {
+    const ctx = setup({ child: session("child"), ended: session("ended") })
+    ctx.store.set("session_status", "child", { type: "busy" })
+    ctx.store.set("session_status", "ended", { type: "busy" })
+    const snapshot = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.status({ child: { type: "busy", activity: {
+      model: "receiving", streamEventCount: 200, userMessageID: "msg_owner",
+    } } }, snapshot)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: {
+      model: "receiving", streamEventCount: 200, userMessageID: "msg_owner",
+    } })
+    expect(ctx.store.data.session_status.ended).toBeUndefined()
+  })
+
+  test("reconnect snapshot yields to live status and local pending status", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    const snapshot = ctx.store.snapshot.capture("session_status")
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: {
+      type: "busy", activity: { model: "receiving", streamEventCount: 201 },
+    } } })
+    ctx.store.set("session_status", "pending", { type: "busy" })
+    ctx.store.snapshot.status({ child: { type: "busy", activity: {
+      model: "waiting", streamEventCount: 200,
+    } } }, snapshot)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: {
+      model: "receiving", streamEventCount: 201,
+    } })
+    expect(ctx.store.data.session_status.pending).toEqual({ type: "busy" })
+  })
+
+  test("reconnect snapshot rejects an older connection and permits count reset", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.set("session_status", "child", { type: "busy", activity: { model: "receiving", streamEventCount: 200 } })
+    const old = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.connect()
+    const fresh = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.status({ child: { type: "busy", activity: { model: "waiting", streamEventCount: 2 } } }, fresh)
+    ctx.store.snapshot.status({ child: { type: "busy", activity: { model: "receiving", streamEventCount: 200 } } }, old)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: { model: "waiting", streamEventCount: 2 } })
+  })
+
+  test("reconnect force preserves failed optimistic and unpromoted pending arrays", async () => {
+    const client = messageClient(response())
+    const store = createServerSession(client)
+    store.remember(session("child"))
+    store.optimistic.add({ sessionID: "child", message: userMessage("failed"), parts: [textPart("failed")] })
+    store.applyV2({ id: "evt_pending", type: "session.next.prompt.admitted", data: {
+      sessionID: "child", messageID: "msg_pending", timestamp: 2, prompt: { text: "queued" }, delivery: "queue",
+    } })
+    await store.sync("child", { force: true })
+    expect(store.data.message.child?.map((message) => message.id)).toEqual(["failed", "msg_pending"])
+    expect(store.data.part.failed).toEqual([textPart("failed")])
+    expect(store.data.pending_input.child).toEqual({ failed: true, msg_pending: true })
+  })
+
   test("retains an admitted pending user outside canonical history during a refresh", async () => {
     const ctx = setup({ child: session("child") })
     ctx.store.remember(session("child"))

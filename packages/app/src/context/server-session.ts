@@ -37,6 +37,12 @@ const initialMessagePageSize = 20
 const historyMessagePageSize = 200
 const sessionInfoLimit = 2_048
 const emptyIDs: ReadonlySet<string> = new Set()
+type SnapshotDomain = "session_status" | "permission" | "question"
+type SessionSnapshot = {
+  readonly epoch: number
+  readonly domain: SnapshotDomain
+  readonly revisions: ReadonlyMap<string, number>
+}
 
 function needsOlderTurnRoot(source: readonly CurrentSessionMessage[]) {
   const boundary = source.find(
@@ -202,7 +208,7 @@ export function createServerSession(
   const options = messageApi ? currentOptions : (sessionApiOrOptions as ServerSessionOptions | undefined)
   const protocol = { kind: sessionApi ? "v2" as const : "v1" as const }
   void options?.protocol?.then((kind) => { protocol.kind = kind })
-  const [data, setData] = createStore({
+  const [data, setStore] = createStore({
     info: {} as Record<string, Session | undefined>,
     session_status: {} as Record<string, typeof SessionStatusEvent.Info.Encoded>,
     pending_input: {} as Record<string, Record<string, boolean>>,
@@ -218,8 +224,59 @@ export function createServerSession(
       return (this.session_status[id]?.type ?? "idle") !== "idle"
     },
   })
+  const snapshotState = { epoch: 0 }
+  const revisions = {
+    session_status: new Map<string, number>(),
+    permission: new Map<string, number>(),
+    question: new Map<string, number>(),
+  }
+  const setData = new Proxy(setStore, {
+    apply(target, receiver, args: unknown[]) {
+      const result = Reflect.apply(target, receiver, args)
+      const domain = args[0]
+      if (domain === "session_status" || domain === "permission" || domain === "question") {
+        const ids =
+          typeof args[1] === "string" ? [args[1]] : [...new Set([...Object.keys(data[domain]), ...revisions[domain].keys()])]
+        ids.forEach((id) => revisions[domain].set(id, (revisions[domain].get(id) ?? 0) + 1))
+      }
+      return result
+    },
+  })
+  const snapshotCurrent = (snapshot: SessionSnapshot, id: string) =>
+    snapshot.epoch === snapshotState.epoch &&
+    (snapshot.revisions.get(id) ?? 0) === (revisions[snapshot.domain].get(id) ?? 0)
+  const snapshot = {
+    connect: () => ++snapshotState.epoch,
+    epoch: () => snapshotState.epoch,
+    capture: (domain: SnapshotDomain): SessionSnapshot => ({
+      epoch: snapshotState.epoch,
+      domain,
+      revisions: new Map(revisions[domain]),
+    }),
+    current: snapshotCurrent,
+    status(
+      statuses: Record<string, typeof SessionStatusEvent.Info.Encoded>,
+      captured: SessionSnapshot,
+      directory?: string,
+    ) {
+      setStore(
+        "session_status",
+        produce((draft) => {
+          for (const id of new Set([...Object.keys(draft), ...Object.keys(statuses)])) {
+            if (!snapshotCurrent(captured, id)) continue
+            if (!statuses[id] && Object.values(data.pending_input[id] ?? {}).some(Boolean)) continue
+            if (directory && data.info[id]?.directory !== directory && !statuses[id]) continue
+            if (statuses[id]) draft[id] = statuses[id]
+            if (!statuses[id]) delete draft[id]
+            revisions.session_status.set(id, (revisions.session_status.get(id) ?? 0) + 1)
+          }
+        }),
+      )
+    },
+  }
   const requests = new Map<string, Promise<Session>>()
   const inflight = new Map<string, Promise<void>>()
+  const messageRequests = new Map<string, Promise<void>>()
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const v2 = createV2SessionReducer()
@@ -312,7 +369,8 @@ export function createServerSession(
     return session
   }
 
-  const resolve = (sessionID: string, options?: { force?: boolean }) => {
+  const resolve = async (sessionID: string, options?: { force?: boolean }): Promise<Session> => {
+    if (options?.force && requests.has(sessionID)) await Promise.allSettled([requests.get(sessionID)])
     const cached = data.info[sessionID]
     if (cached && !options?.force) return Promise.resolve(cached)
     const pending = requests.get(sessionID)
@@ -496,6 +554,7 @@ export function createServerSession(
       clearOptimistic(sessionID)
       requests.delete(sessionID)
       inflight.delete(sessionID)
+      messageRequests.delete(sessionID)
       inflightTodo.delete(sessionID)
       messageLoads.delete(sessionID)
       v2.clear(sessionID)
@@ -744,7 +803,7 @@ export function createServerSession(
     })
   }
 
-  const loadMessages = async (sessionID: string, limit: number, before?: string, mode?: "replace" | "prepend") => {
+  const loadMessagePage = async (sessionID: string, limit: number, before?: string, mode?: "replace" | "prepend") => {
     if (meta.loading[sessionID]) return
     const active = generation(sessionID)
     const load: MessageLoadState = {
@@ -847,8 +906,13 @@ export function createServerSession(
     }
   }
 
-  const sync = (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
+  const loadMessages = (sessionID: string, limit: number, before?: string, mode?: "replace" | "prepend") =>
+    runInflight(messageRequests, sessionID, () => loadMessagePage(sessionID, limit, before, mode))
+
+  const sync = async (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
     touch(sessionID)
+    if (options?.force && (inflight.has(sessionID) || messageRequests.has(sessionID)))
+      await Promise.allSettled([inflight.get(sessionID), messageRequests.get(sessionID)])
     return runInflight(inflight, sessionID, async () => {
       const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
       if (cached && data.info[sessionID] && !options?.force) return
@@ -1343,6 +1407,9 @@ export function createServerSession(
   return {
     data,
     set: setData,
+    snapshot,
+    retained: () =>
+      [...new Set([...seen, ...Object.keys(data.message), ...Object.keys(data.session_message), ...protectedSessions()])],
     get: (sessionID: string) => data.info[sessionID],
     peek: (sessionID: string) => data.info[sessionID],
     remember,
