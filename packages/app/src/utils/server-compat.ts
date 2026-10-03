@@ -1,5 +1,6 @@
 import type { ServerApi } from "./server"
 import type { ServerProtocol } from "./server-protocol"
+import type { SessionActive } from "@opencode-ai/protocol/groups/session"
 import type { AgentPartInput, FilePartInput, OpencodeClient, Session, TextPartInput } from "@opencode-ai/sdk/v2/client"
 import type {
   Project,
@@ -18,10 +19,12 @@ import type {
 
 type LegacyClient = OpencodeClient
 type LegacyFor = (directory?: string) => LegacyClient
+export type SessionActiveSnapshot = Record<string, typeof SessionActive.Encoded>
 type CompatibleSessionApi = Omit<
   SessionApi,
-  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
+  "active" | "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
 > & {
+  active: () => Promise<SessionActiveSnapshot>
   prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
   command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
@@ -176,7 +179,7 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         const result = await legacy().session.status()
         return Object.fromEntries(
           Object.entries(result.data ?? {}).flatMap(([sessionID, status]) =>
-            status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
+            status.type === "idle" ? [] : [[sessionID, { type: "running" as const, status }]],
           ),
         )
       },

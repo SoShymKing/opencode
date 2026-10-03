@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2/client"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import type {
   McpListInput,
   McpResourceCatalogInput,
@@ -8,12 +9,16 @@ import type {
   SessionListInput,
 } from "@opencode-ai/client/promise"
 import { QueryClient } from "@tanstack/solid-query"
+import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses, resyncServerSessions } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
+import { createApiForServer } from "@/utils/server"
+import { createCompatibleApi } from "@/utils/server-compat"
+import type { ServerEvent } from "./server-sdk"
 
 type McpApi = ServerApi["mcp"]
 
@@ -66,6 +71,133 @@ describe("MCP queries", () => {
 })
 
 describe("active session query", () => {
+  test("reconnect native wire snapshot keeps full status through the installed client bridge", async () => {
+    const fetch = Object.assign(async () => Response.json({ data: {
+      ses_running: { type: "running", status: { type: "busy", activity: {
+        userMessageID: "msg_owner", model: "receiving", streamEventCount: 200,
+      } } },
+      ses_unknown: { type: "running" },
+    } }), { preconnect() {} })
+    const current = createApiForServer({ server: { url: "http://fixture" }, fetch })
+    const legacy = createOpencodeClient({ baseUrl: "http://fixture", fetch })
+    const api = createCompatibleApi({ protocol: Promise.resolve("v2"), current, legacy: () => legacy })
+    const session = createServerSession(legacy)
+    await resyncServerSessions({ event: { name: "global", details: { type: "server.connected" } }, session, api: api.session, refreshDirectories: async () => undefined })
+    expect(session.data.session_status.ses_running).toEqual({ type: "busy", activity: {
+      userMessageID: "msg_owner", model: "receiving", streamEventCount: 200,
+    } })
+    expect(session.data.session_status.ses_unknown).toEqual({ type: "busy" })
+  })
+
+  test("reconnect legacy active adapter keeps full status instead of bare running", async () => {
+    const fetch = Object.assign(async () => Response.json({
+      ses_running: { type: "busy", activity: { userMessageID: "msg_owner", model: "receiving", streamEventCount: 200 } },
+      ses_ended: { type: "idle" },
+    }), { preconnect() {} })
+    const current = createApiForServer({ server: { url: "http://fixture" }, fetch })
+    const legacy = createOpencodeClient({ baseUrl: "http://fixture", fetch })
+    const api = createCompatibleApi({ protocol: Promise.resolve("v1"), current, legacy: () => legacy })
+    expect(await api.session.active()).toEqual({
+      ses_running: { type: "running", status: { type: "busy", activity: { userMessageID: "msg_owner", model: "receiving", streamEventCount: 200 } } },
+    })
+  })
+
+  test("reconnect global event restores retained history before the recent bootstrap guard", async () => {
+    let reads = 0
+    const refreshed = Promise.withResolvers<void>()
+    const fetch = Object.assign(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.pathname === "/session/ses_ended/message") {
+        reads++
+        if (reads === 2) refreshed.resolve()
+        return Response.json([])
+      }
+      if (url.pathname === "/session/ses_ended")
+        return Response.json({ id: "ses_ended", directory: "/repo", title: "ended", slug: "ended", projectID: "project", version: "1", time: { created: 1, updated: 1 } })
+      if (url.pathname === "/session/status" || url.pathname === "/global/config") return Response.json({})
+      if (url.pathname === "/provider") return Response.json({ all: [], connected: [], default: {} })
+      if (url.pathname === "/path") return Response.json({ state: "", config: "", worktree: "", directory: "", home: "" })
+      return Response.json({ data: [] })
+    }, { preconnect() {} })
+    const client = createOpencodeClient({ baseUrl: "http://fixture", fetch })
+    const events = createGlobalEmitter<{ [key: string]: ServerEvent }>()
+    const session = createServerSession(client)
+    const completed = Promise.withResolvers<void>()
+    const unsubscribe = events.listen((event) => {
+      void resyncServerSessions({ event, session, api: { active: async () => ({}) },
+        refreshDirectories: async () => undefined,
+      }).then(() => completed.resolve())
+    })
+    try {
+      await session.sync("ses_ended")
+      events.emit("global", { id: "evt_connected", type: "server.connected", properties: {} })
+      await refreshed.promise
+      await completed.promise
+      expect(reads).toBe(2)
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  test("reconnect fetches a fresh quiet active snapshot despite an existing query cache", async () => {
+    const queryClient = new QueryClient()
+    const session = createServerSession({} as OpencodeClient)
+    let count = 1
+    let calls = 0
+    const api = { active: async () => {
+      calls++
+      return { ses_running: { type: "running" as const, status: { type: "busy" as const, activity: {
+        model: "receiving" as const, userMessageID: "msg_owner", streamEventCount: count,
+      } } } }
+    } }
+    await queryClient.fetchQuery(loadActiveSessionsQuery(ServerScope.local, api))
+    count = 200
+    let bootstrapCalls = 0
+    await resyncServerSessions({ event: { name: "global", details: { type: "server.connected" } }, session, api, refreshDirectories: async () => { bootstrapCalls++ } })
+    expect(calls).toBe(2)
+    expect(bootstrapCalls).toBe(1)
+    expect(session.data.session_status.ses_running).toEqual({ type: "busy", activity: {
+      model: "receiving", userMessageID: "msg_owner", streamEventCount: 200,
+    } })
+  })
+
+  test("reconnect reloads retained inactive history even with a recent bootstrap", async () => {
+    let historyCalls = 0
+    const session = createServerSession(createOpencodeClient({
+      baseUrl: "http://fixture",
+      fetch: Object.assign(async (input: RequestInfo | URL) => {
+        const url = new URL(input instanceof Request ? input.url : String(input))
+        if (url.pathname.endsWith("/message")) {
+          historyCalls++
+          return Response.json([])
+        }
+        return Response.json({ id: "ses_ended", directory: "/repo", title: "ended", slug: "ended", projectID: "project", version: "1", time: { created: 1, updated: 1 } })
+      }, { preconnect() {} }),
+    }))
+    await session.sync("ses_ended")
+    session.set("session_status", "ses_ended", { type: "busy" })
+    await resyncServerSessions({ event: { name: "global", details: { type: "server.connected" } }, session, api: { active: async () => ({}) }, refreshDirectories: async () => undefined })
+    expect(historyCalls).toBe(2)
+    expect(session.data.session_status.ses_ended).toBeUndefined()
+  })
+
+  test("reconnect starts a fresh pass while an older connection snapshot is pending", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    const old = Promise.withResolvers<{ ses_running: { type: "running"; status: { type: "busy" } } }>()
+    let calls = 0
+    const api = { active: () => {
+      calls++
+      return calls === 1 ? old.promise : Promise.resolve({})
+    } }
+    const input = { event: { name: "global", details: { type: "server.connected" } }, session, api, refreshDirectories: async () => undefined }
+    const first = resyncServerSessions(input)
+    await resyncServerSessions(input)
+    old.resolve({ ses_running: { type: "running", status: { type: "busy" } } })
+    await first
+    expect(calls).toBe(2)
+    expect(session.data.session_status.ses_running).toBeUndefined()
+  })
+
   test("loads active sessions immediately and once per server cache", async () => {
     let calls = 0
     const queryClient = new QueryClient()
@@ -85,12 +217,13 @@ describe("active session query", () => {
 
   test("does not overwrite statuses already written by events", () => {
     const session = createServerSession({} as OpencodeClient)
+    const captured = session.snapshot.capture("session_status")
     session.set("session_status", "ses_retry", { type: "retry", attempt: 2, message: "retrying", next: 10 })
 
     seedActiveSessionStatuses(session, {
       ses_running: { type: "running" },
       ses_retry: { type: "running" },
-    })
+    }, captured)
 
     expect(session.data.session_status.ses_running).toEqual({ type: "busy" })
     expect(session.data.session_status.ses_retry).toEqual({
