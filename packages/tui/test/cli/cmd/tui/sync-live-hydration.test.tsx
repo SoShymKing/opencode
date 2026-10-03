@@ -2,7 +2,10 @@
 import { expect, test } from "bun:test"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { tmpdir } from "../../../fixture/fixture"
-import { json, mount, wait } from "./sync-fixture"
+import { createFetch, json, mount, wait } from "./sync-fixture"
+import { testRender } from "@opentui/solid"
+import { SDKProvider, useSDK } from "../../../../src/context/sdk"
+import { onMount } from "solid-js"
 
 const sessionID = "ses_hydration_race"
 const messageID = "msg_hydration_race"
@@ -32,6 +35,146 @@ const assistant = {
 function global(payload: GlobalEvent["payload"]): GlobalEvent {
   return { directory: "/tmp/other", project: "proj_test", payload }
 }
+
+test.each(["error", "EOF"])("SSE %s reconnects and cleanup cancels the final stream once", async (failure) => {
+  let requests = 0
+  let connected = 0
+  let cancelled = 0
+  const calls = createFetch(() => {
+    requests += 1
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (requests === 1) {
+          if (failure === "error") controller.error(new Error("SSE overflow"))
+          if (failure === "EOF") controller.close()
+          return
+        }
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(global({
+          id: "evt_connected", type: "server.connected", properties: {},
+        }))}\n\n`))
+      },
+      cancel() { cancelled += 1 },
+    }), { headers: { "content-type": "text/event-stream" } })
+  })
+  function Probe() {
+    const sdk = useSDK()
+    onMount(() => sdk.event.on("event", (event) => {
+      if (event.payload.type === "server.connected") connected += 1
+    }))
+    return <box />
+  }
+  const app = await testRender(() => <SDKProvider url="http://test" fetch={calls.fetch}><Probe /></SDKProvider>)
+  try {
+    await wait(() => connected === 1, 4000)
+    expect(requests).toBe(2)
+  } finally {
+    app.renderer.destroy()
+  }
+  await wait(() => cancelled === 1)
+  expect(cancelled).toBe(1)
+})
+
+test.each([false, true])("late status snapshots cannot overwrite live activity with another reconnect=%s", async (reconnect) => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const snapshot = Promise.withResolvers<Response>()
+  let statusRequests = 0
+  let historyRequests = 0
+  const setup = await mount((url) => {
+    if (url.pathname === "/session/status") {
+      statusRequests += 1
+      return statusRequests === 2 ? snapshot.promise : json({})
+    }
+    if (url.pathname === `/session/${sessionID}`) return json(session)
+    if (url.pathname === `/session/${sessionID}/message`) {
+      historyRequests += 1
+      return json([{ info: assistant, parts: [] }])
+    }
+    if ([`/session/${sessionID}/todo`, `/session/${sessionID}/diff`, "/permission", "/question"].includes(url.pathname)) return json([])
+    return undefined
+  }, tmp.path)
+  try {
+    await setup.sync.session.sync(sessionID)
+    setup.emit(global({ id: "evt_pending", type: "message.updated", properties: { sessionID, info: {
+      id: "msg_pending", sessionID, role: "user", agent: "build", model: { providerID: "test", modelID: "model" }, time: { created: 3 },
+    } } }))
+    await wait(() => setup.sync.data.message[sessionID]?.length === 2)
+    const restoring = setup.sync.bootstrap({ fatal: false })
+    await wait(() => statusRequests === 2)
+    if (reconnect) setup.emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
+    if (!reconnect) await setup.sync.session.sync(sessionID, { force: true })
+    await wait(() => statusRequests === (reconnect ? 3 : 2) && historyRequests === 2)
+    setup.emit(global({ id: "evt_live_status", type: "session.status", properties: { sessionID, status: {
+      type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 211 },
+    } } }))
+    await wait(() => setup.sync.data.session_status[sessionID]?.type === "busy")
+    snapshot.resolve(json({ [sessionID]: { type: "busy", activity: { model: "receiving", streamEventCount: 200 } } }))
+    await restoring
+    await setup.app.renderOnce()
+    expect(setup.sync.data.session_status[sessionID]).toMatchObject({ activity: { streamEventCount: 211 } })
+    expect(setup.sync.data.message[sessionID].map((message) => message.id)).toContain("msg_pending")
+  } finally {
+    setup.app.renderer.destroy()
+  }
+})
+
+test("forced hydration waits for older inflight work then fetches fresh history", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const old = Promise.withResolvers<Response>()
+  let requests = 0
+  const setup = await mount((url) => {
+    if (url.pathname === `/session/${sessionID}`) return json(session)
+    if (url.pathname === `/session/${sessionID}/message`) {
+      requests += 1
+      if (requests === 1) return old.promise
+      return json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "fresh" }] }])
+    }
+    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+    return undefined
+  }, tmp.path)
+  try {
+    const initial = setup.sync.session.sync(sessionID)
+    await wait(() => requests === 1)
+    const forced = setup.sync.session.sync(sessionID, { force: true })
+    old.resolve(json([{ info: assistant, parts: [] }]))
+    await Promise.all([initial, forced])
+    expect(requests).toBe(2)
+    expect(setup.sync.data.part[messageID]?.[0]).toMatchObject({ text: "fresh" })
+  } finally {
+    setup.app.renderer.destroy()
+  }
+})
+
+test("reconnect forces cached history hydration and restores quiet activity", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  let count = 0
+  let connected = false
+  const setup = await mount((url) => {
+    if (url.pathname === `/session/${sessionID}`) return json(session)
+    if (url.pathname === `/session/${sessionID}/message`) {
+      count += 1
+      return json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: String(count) }] }])
+    }
+    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
+    if (url.pathname === "/session/status") return json(connected ? {
+      [sessionID]: { type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 200 } },
+    } : {})
+    if (url.pathname === "/permission" || url.pathname === "/question") return json([])
+    return undefined
+  }, tmp.path)
+  try {
+    await setup.sync.session.sync(sessionID)
+    connected = true
+    setup.emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
+    await wait(() => count === 2 && setup.sync.data.part[messageID]?.[0]?.type === "text" &&
+      setup.sync.data.part[messageID][0].text === "2")
+    expect(setup.sync.data.session_status[sessionID]).toMatchObject({ activity: { streamEventCount: 200 } })
+  } finally {
+    setup.app.renderer.destroy()
+  }
+})
 
 test("live messages use creation time with an ID tie-break", async () => {
   await using tmp = await tmpdir()

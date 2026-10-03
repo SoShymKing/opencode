@@ -70,6 +70,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   let assistantFailed = false
   let providerFailed = false
   let streamEventCount: number | undefined
+  let persistedStreamEventCount: number | undefined
   let stepSettlement: { readonly finish: string; readonly tokens: ReturnType<typeof tokens> } | undefined
 
   const startAssistant = Effect.fnUntraced(function* () {
@@ -81,7 +82,6 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       assistantMessageID,
       timestamp: yield* timestamp,
       snapshot: input.snapshot,
-      streamEventCount,
     })
     return assistantMessageID
   })
@@ -90,16 +90,20 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       ? Effect.die("Tool event before assistant step start")
       : Effect.succeed(assistantMessageID)
 
-  const observeStreamEventCount = Effect.fnUntraced(function* (count: number) {
+  const observeStreamEventCount = (count: number) => Effect.sync(() => {
     streamEventCount = count
-    // Protocol control records must not start an assistant or prevent overflow recovery.
-    if (assistantMessageID === undefined) return
+  })
+
+  const flushFinalCount = Effect.fnUntraced(function* () {
+    if (assistantMessageID === undefined || streamEventCount === undefined || streamEventCount === persistedStreamEventCount) return
+    const count = streamEventCount
     yield* events.publish(SessionEvent.Step.StreamUpdated, {
       sessionID: input.sessionID,
       timestamp: yield* timestamp,
       assistantMessageID,
       streamEventCount: count,
     })
+    persistedStreamEventCount = count
   })
 
   const fragments = (
@@ -211,9 +215,10 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   })
 
   const failAssistant = Effect.fnUntraced(function* (message: string) {
-    if (assistantFailed) return
-    yield* flush()
     const assistantMessageID = yield* startAssistant()
+    yield* flush()
+    yield* flushFinalCount()
+    if (assistantFailed) return
     assistantActive = false
     assistantFailed = true
     yield* events.publish(SessionEvent.Step.Failed, {
@@ -424,6 +429,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
 
   return {
     observeStreamEventCount,
+    flushFinalCount,
     publish,
     flush,
     failAssistant,

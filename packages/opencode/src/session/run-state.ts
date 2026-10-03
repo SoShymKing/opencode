@@ -3,7 +3,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
-import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Scope, Context } from "effect"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -57,11 +57,27 @@ const layer = Layer.effect(
       const existing = data.runners.get(sessionID)
       if (existing) return existing
       const next = Runner.make<SessionV1.WithParts>(data.scope, {
-        onIdle: Effect.gen(function* () {
+        onFinish: (exit) => Effect.gen(function* () {
+          const current = yield* status.get(sessionID)
+          const error = exit !== "cancelled" && Exit.isSuccess(exit) && exit.value.info.role === "assistant"
+            ? exit.value.info.error
+            : undefined
+          const reason = exit === "cancelled" || (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause))
+            ? "cancelled"
+            : Exit.isFailure(exit) || error ? "error" : "completed"
           data.runners.delete(sessionID)
-          yield* status.set(sessionID, { type: "idle" })
+          yield* status.set(sessionID, {
+            type: "idle",
+            terminal: {
+              userMessageID: current.type === "idle" ? current.terminal?.userMessageID : current.activity?.userMessageID,
+              reason,
+              message: exit !== "cancelled" && Exit.isFailure(exit)
+                ? Cause.pretty(exit.cause)
+                : error && "message" in error.data ? error.data.message : undefined,
+            },
+          })
         }),
-        onBusy: status.set(sessionID, { type: "busy" }),
+        onBusy: status.set(sessionID, { type: "busy", activity: { model: "none" } }),
         onInterrupt,
       })
       data.runners.set(sessionID, next)

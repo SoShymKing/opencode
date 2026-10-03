@@ -434,6 +434,45 @@ describe("Runner", () => {
 
   // --- lifecycle callbacks ---
 
+  it.live("onFinish reports cancellation after swallowed shell interruption and cleanup", Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const started = yield* Deferred.make<void>()
+    const cleaned = yield* Ref.make(false)
+    const outcomes: string[] = []
+    const runner = Runner.make<string>(scope, {
+      onFinish: (exit) => Effect.gen(function* () {
+        expect(yield* Ref.get(cleaned)).toBe(true)
+        outcomes.push(exit === "cancelled" ? exit : exit._tag)
+      }),
+    })
+    const fiber = yield* runner.startShell(Effect.gen(function* () {
+      yield* Deferred.succeed(started, undefined)
+      yield* Effect.never
+      return "unreachable"
+    }).pipe(
+      Effect.catchCause(() => Effect.succeed("swallowed")),
+      Effect.ensuring(Ref.set(cleaned, true)),
+    )).pipe(Effect.forkChild)
+    yield* Deferred.await(started)
+    yield* runner.cancel
+    yield* Fiber.await(fiber)
+    expect(outcomes).toEqual(["cancelled"])
+  }))
+
+  it.live("onFinish reports run failure after cleanup", Effect.gen(function* () {
+    const scope = yield* Scope.Scope
+    const cleaned = yield* Ref.make(false)
+    const outcomes: string[] = []
+    const runner = Runner.make<string, string>(scope, {
+      onFinish: (exit) => Effect.gen(function* () {
+        expect(yield* Ref.get(cleaned)).toBe(true)
+        outcomes.push(exit === "cancelled" ? exit : exit._tag)
+      }),
+    })
+    yield* runner.ensureRunning(Effect.fail("failed").pipe(Effect.ensuring(Ref.set(cleaned, true)))).pipe(Effect.exit)
+    expect(outcomes).toEqual(["Failure"])
+  }))
+
   it.live(
     "onIdle fires when returning to idle from running",
     Effect.gen(function* () {

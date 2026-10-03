@@ -88,20 +88,30 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
         while (true) {
           if (abort.signal.aborted || ctrl.signal.aborted) break
 
-          const events = await sdk.global.event({
-            signal: ctrl.signal,
-            sseMaxRetryAttempts: 0,
-          })
+          try {
+            const events = await sdk.global.event({
+              signal: ctrl.signal,
+              sseMaxRetryAttempts: 0,
+              onSseError(error) {
+                throw error
+              },
+            })
 
-          if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
-            // Start syncing workspaces, it's important to do this after
-            // we've started listening to events
-            await sdk.sync.start().catch(() => {})
-          }
+            if (Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
+              // Start syncing workspaces, it's important to do this after
+              // we've started listening to events
+              await sdk.sync.start().catch((error) => {
+                console.error("tui workspace sync failed", error instanceof Error ? error.message : String(error))
+              })
+            }
 
-          for await (const event of events.stream) {
-            if (ctrl.signal.aborted) break
-            handleEvent(event)
+            for await (const event of events.stream) {
+              if (ctrl.signal.aborted) break
+              handleEvent(event)
+            }
+          } catch (error) {
+            if (abort.signal.aborted || ctrl.signal.aborted) break
+            console.error("tui event stream disconnected", error instanceof Error ? error.message : String(error))
           }
 
           if (timer) clearTimeout(timer)
@@ -111,9 +121,20 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
 
           // Exponential backoff
           const backoff = Math.min(retryDelay * 2 ** (attempt - 1), maxRetryDelay)
-          await new Promise((resolve) => setTimeout(resolve, backoff))
+          await new Promise<void>((resolve) => {
+            const done = () => {
+              clearTimeout(timer)
+              ctrl.signal.removeEventListener("abort", done)
+              resolve()
+            }
+            const timer = setTimeout(done, backoff)
+            ctrl.signal.addEventListener("abort", done, { once: true })
+            if (ctrl.signal.aborted) done()
+          })
         }
-      })().catch(() => {})
+      })().catch((error) => {
+        console.error("tui event stream failed", error instanceof Error ? error.message : String(error))
+      })
     }
 
     onMount(async () => {

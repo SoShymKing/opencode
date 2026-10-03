@@ -14,9 +14,18 @@ export const textPartID = "prt_9999_text"
 const title = "Timeline collapse state regression"
 const model = { providerID: "opencode", modelID: "claude-opus-4-6", variant: "max" }
 
+type TimelinePart = { id: string; messageID: string; text?: string; [key: string]: unknown }
+type TimelineMessage = { info: { id: string; [key: string]: unknown }; parts: TimelinePart[] }
+
 type EventPayload = {
   directory: string
-  payload: Record<string, unknown>
+  payload:
+    | { type: "message.updated"; properties: { info: TimelineMessage["info"] } }
+    | { type: "message.part.updated"; properties: { part: TimelinePart } }
+    | {
+        type: "message.part.delta"
+        properties: { messageID: string; partID: string; field: "text"; delta: string }
+      }
 }
 
 const userMessage = {
@@ -103,25 +112,15 @@ export async function setupTimelineBenchmark(
     turnDiffs?: unknown[]
   },
 ) {
-  const events: EventPayload[] = []
-  let eventBatch = options.eventBatch
-  const currentUserMessage = options.turnDiffs
-    ? { ...userMessage, info: { ...userMessage.info, summary: { diffs: options.turnDiffs } } }
-    : userMessage
+  const backend = createTimelineBenchmarkBackend(options)
   await mockOpenCodeServer(page, {
     directory,
     project: project(),
     provider: provider(),
     sessions: [session()],
     vcsDiff: options.vcsDiff,
-    pageMessages: () => ({
-      items: [
-        ...Array.from({ length: options.historyTurns }, (_, index) => performanceTurn(index)).flat(),
-        currentUserMessage,
-        assistantMessage,
-      ],
-    }),
-    events: () => events.splice(0, eventBatch),
+    pageMessages: backend.pageMessages,
+    events: backend.events,
     eventRetry: 16,
   })
   await page.addInitScript(
@@ -149,17 +148,7 @@ export async function setupTimelineBenchmark(
   return {
     scroller,
     text,
-    transport: {
-      enqueue(payload: EventPayload | EventPayload[]) {
-        events.push(...(Array.isArray(payload) ? payload : [payload]))
-      },
-      pendingCount() {
-        return events.length
-      },
-      releaseAll() {
-        eventBatch = events.length
-      },
-    },
+    transport: backend.transport,
     async scrollToBottom() {
       await scroller.evaluate((element) => {
         element.scrollTop = element.scrollHeight
@@ -183,6 +172,68 @@ export async function setupTimelineBenchmark(
           )
         })
       }, textPartID)
+    },
+  }
+}
+
+export function createTimelineBenchmarkBackend(options: {
+  historyTurns: number
+  eventBatch: number
+  turnDiffs?: unknown[]
+}) {
+  const events: EventPayload[] = []
+  let eventBatch = options.eventBatch
+  const messages: TimelineMessage[] = structuredClone([
+    ...Array.from({ length: options.historyTurns }, (_, index) => performanceTurn(index)).flat(),
+    options.turnDiffs
+      ? { ...userMessage, info: { ...userMessage.info, summary: { diffs: options.turnDiffs } } }
+      : userMessage,
+    assistantMessage,
+  ])
+  return {
+    pageMessages: () => ({ items: messages }),
+    events: () => {
+      const delivered = events.splice(0, eventBatch)
+      delivered.forEach(({ payload }) => {
+        switch (payload.type) {
+          case "message.updated": {
+            const message = messages.find((item) => item.info.id === payload.properties.info.id)
+            if (message) message.info = structuredClone(payload.properties.info)
+            if (!message) messages.push({ info: structuredClone(payload.properties.info), parts: [] })
+            return
+          }
+          case "message.part.updated": {
+            const part = payload.properties.part
+            const message = messages.find((item) => item.info.id === part.messageID)
+            if (!message) throw new Error(`Missing benchmark message: ${part.messageID}`)
+            const index = message.parts.findIndex((item) => item.id === part.id)
+            if (index === -1) message.parts.push(structuredClone(part))
+            if (index !== -1) message.parts[index] = structuredClone(part)
+            return
+          }
+          case "message.part.delta": {
+            const properties = payload.properties
+            const part = messages
+              .find((item) => item.info.id === properties.messageID)
+              ?.parts.find((item) => item.id === properties.partID)
+            if (!part) throw new Error(`Missing benchmark part: ${properties.partID}`)
+            part[properties.field] = (part[properties.field] ?? "") + properties.delta
+            return
+          }
+        }
+      })
+      return delivered
+    },
+    transport: {
+      enqueue(payload: EventPayload | EventPayload[]) {
+        events.push(...(Array.isArray(payload) ? payload : [payload]))
+      },
+      pendingCount() {
+        return events.length
+      },
+      releaseAll() {
+        eventBatch = events.length
+      },
     },
   }
 }

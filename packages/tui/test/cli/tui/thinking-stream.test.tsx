@@ -10,6 +10,7 @@ import { CurrentResponseThinking, ReasoningHeader } from "../../../src/routes/se
 import { tmpdir } from "../../fixture/fixture"
 import { createTuiResolvedConfig } from "../../fixture/tui-runtime"
 import { directory, mount, wait } from "../cmd/tui/sync-fixture"
+import { json, type FetchHandler } from "../../fixture/tui-sdk"
 
 const sessionID = "ses_thinking_stream"
 const user = {
@@ -43,6 +44,7 @@ async function fixture(
   state: string,
   view: () => JSX.Element = () => <CurrentResponseThinking sessionID={sessionID} />,
   mode: "hide" | "show" = "hide",
+  fetch?: FetchHandler,
 ) {
   await Bun.write(`${state}/kv.json`, JSON.stringify({ animations_enabled: false, thinking_mode: mode }))
   const ready = Promise.withResolvers<ReturnType<typeof useData>>()
@@ -51,7 +53,7 @@ async function fixture(
     onMount(() => ready.resolve(data))
     return view()
   }
-  const setup = await mount(undefined, state, () => (
+  const setup = await mount(fetch, state, () => (
     <TuiConfigProvider config={createTuiResolvedConfig()}>
       <ThemeProvider mode="dark" source={{ discover: async () => ({}) }}>
         <DataProvider>
@@ -91,6 +93,99 @@ test.each([0, 1, 11, undefined])("renders current count %s with an empty public 
     count === undefined ? "Thinking (streams unavailable)" : `Thinking (${count} ${count === 1 ? "stream" : "streams"})`
   expect(await setup.frame()).toContain(label)
   expect(setup.sync.data.part.msg_assistant).toBeUndefined()
+})
+
+test("native refresh keeps live assistant updates and pending users", async () => {
+  await using tmp = await tmpdir()
+  const snapshot = Promise.withResolvers<Response>()
+  let requested = false
+  using setup = await fixture(tmp.path, undefined, "hide", (url) => {
+    if (url.pathname === `/api/session/${sessionID}/message`) {
+      requested = true
+      return snapshot.promise
+    }
+    return undefined
+  })
+  setup.emit({ id: "evt_step", type: "session.next.step.started", properties: {
+    sessionID, assistantMessageID: "msg_assistant", timestamp: 2, agent: "build",
+    model: { id: "model", providerID: "test" }, streamEventCount: 11,
+  } })
+  setup.emit({ id: "evt_prompt", type: "session.next.prompted", properties: {
+    sessionID, messageID: "msg_native_pending", timestamp: 3, delivery: "queue", prompt: { text: "pending", files: [], agents: [] },
+  } })
+  await wait(() => setup.data.session.message.list(sessionID)?.length === 2)
+  const refresh = setup.data.session.message.refresh(sessionID)
+  await wait(() => requested)
+  setup.emit({ id: "evt_stream", type: "session.next.step.stream.updated", properties: {
+    sessionID, assistantMessageID: "msg_assistant", timestamp: 4, streamEventCount: 12,
+  } })
+  await wait(() => {
+    const message = setup.data.session.message.list(sessionID)?.find((item) => item.id === "msg_assistant")
+    return message?.type === "assistant" && message.streamEventCount === 12
+  })
+  snapshot.resolve(json({ data: [{ id: "msg_assistant", type: "assistant", agent: "build",
+    model: { id: "model", providerID: "test" }, content: [{ type: "text", id: "text_restored", text: "restored" }], time: { created: 2 }, streamEventCount: 11 }] }))
+  await refresh
+  expect(setup.data.session.message.list(sessionID)?.map((message) => message.id)).toContain("msg_native_pending")
+  const current = setup.data.session.message.list(sessionID)?.find((item) => item.id === "msg_assistant")
+  expect(current?.type === "assistant" && current.streamEventCount).toBe(12)
+  expect(current?.type === "assistant" && current.content).toContainEqual({ type: "text", id: "text_restored", text: "restored" })
+})
+
+test("live activity counts before an assistant exists and keeps its owner with a pending user", async () => {
+  await using tmp = await tmpdir()
+  using setup = await fixture(tmp.path)
+  const status = (count?: number, owner = user.id) => setup.emit({
+    id: "evt_activity", type: "session.status",
+    properties: { sessionID, status: { type: "busy", activity: {
+      userMessageID: owner, model: count === undefined ? "none" : "receiving", streamEventCount: count,
+    } } },
+  })
+  status(11)
+  await wait(() => setup.sync.data.session_status[sessionID]?.type === "busy" &&
+    "activity" in setup.sync.data.session_status[sessionID])
+  expect(await setup.frame()).toContain("Thinking (11 streams)")
+  setup.message(assistant(99))
+  setup.message({ ...user, id: "msg_pending", time: { created: 3 } })
+  await wait(() => setup.sync.data.message[sessionID]?.length === 3)
+  expect(await setup.frame()).toContain("Thinking (11 streams)")
+  status(0, "msg_pending")
+  await setup.app.renderOnce()
+  await wait(() => {
+    const value = setup.sync.data.session_status[sessionID]
+    return value?.type === "busy" && value.activity?.streamEventCount === 0
+  })
+  expect(await setup.frame()).toContain("Thinking (0 streams)")
+  status(undefined, "msg_pending")
+  await wait(() => {
+    const value = setup.sync.data.session_status[sessionID]
+    return value?.type === "busy" && value.activity?.streamEventCount === undefined
+  })
+  expect(await setup.frame()).toContain("Thinking (streams unavailable)")
+})
+
+test("a pending user does not take the active owner's reasoning header", async () => {
+  await using tmp = await tmpdir()
+  using setup = await fixture(tmp.path)
+  setup.message(assistant(99))
+  setup.message({ ...user, id: "msg_pending", time: { created: 3 } })
+  setup.emit({ id: "evt_activity", type: "session.status", properties: {
+    sessionID, status: { type: "busy", activity: { userMessageID: user.id, model: "receiving", streamEventCount: 11 } },
+  } })
+  setup.emit({ id: "evt_reasoning", type: "message.part.updated", properties: {
+    sessionID, time: 4, part: { id: "prt_owner", sessionID, messageID: "msg_assistant",
+      type: "reasoning", text: "**Inspecting**", time: { start: 2 } },
+  } })
+  await wait(() => setup.sync.data.part.msg_assistant?.length === 1)
+  expect(await setup.frame()).not.toContain("Thinking")
+  setup.emit({ id: "evt_new_owner", type: "session.status", properties: {
+    sessionID, status: { type: "busy", activity: { userMessageID: "msg_pending", model: "preparing", streamEventCount: 0 } },
+  } })
+  await wait(() => {
+    const status = setup.sync.data.session_status[sessionID]
+    return status?.type === "busy" && status.activity?.userMessageID === "msg_pending"
+  })
+  expect(await setup.frame()).toContain("Thinking (0 streams)")
 })
 
 test.each(["hide", "show"] as const)("keeps the empty-summary counter visible in %s mode", async (mode) => {

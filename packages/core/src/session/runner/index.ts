@@ -1,6 +1,7 @@
 export * as SessionRunner from "./index"
 
 import type { LLMError } from "@opencode-ai/llm"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { Context, Effect } from "effect"
 import { SessionSchema } from "../schema"
 import type { ContextSnapshotDecodeError, MessageDecodeError } from "../error"
@@ -22,6 +23,8 @@ export interface Interface {
   readonly run: (input: {
     readonly sessionID: SessionSchema.ID
     readonly force: boolean
+    readonly onActivity?: (activity: SessionStatusEvent.Activity) => Effect.Effect<void>
+    readonly onError?: (message: string) => Effect.Effect<void>
   }) => Effect.Effect<void, RunError>
 }
 

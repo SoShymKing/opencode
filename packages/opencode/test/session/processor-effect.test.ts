@@ -7,6 +7,7 @@ import { tool } from "ai"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -17,6 +18,7 @@ import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
+import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
@@ -188,6 +190,7 @@ const root = LayerNode.group([
   Database.node,
   EventV2Bridge.node,
   SessionStatus.node,
+  SessionRunState.node,
   CrossSpawnSpawner.node,
 ])
 const replacements = [
@@ -330,6 +333,146 @@ const chatParamsFailureEnv = LayerNode.compile(
 )
 const itChatParamsFailure = testEffect(chatParamsFailureEnv)
 
+const activityLLM = Layer.succeed(LLM.Service, LLM.Service.of({
+  stream: (input) => Stream.fromEffectDrain(Effect.gen(function* () {
+    yield* input.onStreamEventCount?.(input.small ? undefined : 0) ?? Effect.void
+    if (!input.small) yield* input.onStreamEventCount?.(2) ?? Effect.void
+  })).pipe(
+    Stream.concat(Stream.make(
+      LLMEvent.textStart({ id: "text-activity" }),
+      LLMEvent.textDelta({ id: "text-activity", text: "hello" }),
+      LLMEvent.textEnd({ id: "text-activity" }),
+    )),
+    Stream.concat(Stream.fromEffectDrain(input.onStreamEnd ?? Effect.void)),
+  ),
+}))
+const itActivity = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, activityLLM]]))
+
+const argumentEvents: string[] = []
+const argumentLLM = Layer.succeed(LLM.Service, LLM.Service.of({
+  stream: (input) => Stream.fromEffectDrain(Effect.gen(function* () {
+    argumentEvents.length = 0
+    yield* input.onStreamEventCount?.(undefined) ?? Effect.void
+  })).pipe(
+    Stream.concat(Stream.make(
+      LLMEvent.stepStart({ index: 0 }),
+      LLMEvent.toolInputStart({ id: "call-activity", name: "lookup" }),
+      LLMEvent.toolInputDelta({ id: "call-activity", name: "lookup", text: "{}" }),
+      LLMEvent.toolInputEnd({ id: "call-activity", name: "lookup" }),
+      LLMEvent.toolCall({ id: "call-activity", name: "lookup", input: {} }),
+      LLMEvent.toolResult({ id: "call-activity", name: "lookup", result: { type: "text", value: "ok" } }),
+      LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+      LLMEvent.finish({ reason: "stop" }),
+    )),
+    Stream.tap((event) => Effect.sync(() => { argumentEvents.push(event.type) })),
+  ),
+}))
+const itArgumentActivity = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, argumentLLM]]))
+
+itArgumentActivity.live("session.processor receives tool argument deltas with unknown raw count", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const events = yield* EventV2Bridge.Service
+    const chat = yield* session.create({})
+    const parent = yield* user(chat.id, "tool activity")
+    const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+    const model = yield* provider.getModel(ref.providerID, ref.modelID)
+    const observed: unknown[] = []
+    const database = yield* Database.Service
+    const off = yield* events.listen((event) => Effect.gen(function* () {
+      if (event.type !== SessionStatus.Event.Status.type) return
+      const data = Schema.decodeUnknownSync(Schema.toType(SessionStatus.Event.Status.data))(event.data)
+      if (data.sessionID !== chat.id || data.status.type !== "busy") return
+      const activity = data.status.activity
+      if (activity?.model !== "waiting" && activity?.model !== "receiving") return
+      const call = (yield* MessageV2.parts(msg.id)).find((part) => part.type === "tool")
+      observed.push([activity.model, activity.streamEventCount, activity.lastStreamEventAt,
+        argumentEvents.at(-1), call?.state.status])
+    }).pipe(Effect.provideService(Database.Service, database)))
+    const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+    yield* handle.process({ user: parent, sessionID: chat.id, model, agent: agent(), system: [], messages: [], tools: {} })
+    yield* off
+    expect(observed).toEqual([
+      ["waiting", undefined, undefined, undefined, undefined],
+      ["receiving", undefined, undefined, "tool-input-delta", "pending"],
+    ])
+    expect(handle.message.error).toBeUndefined()
+    expect(handle.message.streamEventCount).toBeUndefined()
+  }), { config: cfg }),
+)
+
+itActivity.instance("session.status retains terminal outcome when plain idle follows", () =>
+  Effect.gen(function* () {
+    const status = yield* SessionStatus.Service
+    const sessionID = SessionID.create()
+    const terminal = { userMessageID: SessionMessage.ID.create(), reason: "cancelled" } as const
+    yield* status.set(sessionID, { type: "idle", terminal })
+    yield* status.set(sessionID, { type: "idle" })
+    expect(yield* status.get(sessionID)).toEqual({ type: "idle", terminal })
+    expect((yield* status.list()).has(sessionID)).toBe(false)
+  }),
+)
+
+itActivity.live("session.processor publishes owned activity for raw and semantic streams", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const events = yield* EventV2Bridge.Service
+    const status = yield* SessionStatus.Service
+    for (const mode of ["stale", "idle", "compaction"]) {
+      const small = mode === "idle"
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "activity")
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      msg.summary = mode === "compaction"
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      const selected = SessionMessage.ID.create()
+      const owner = msg.summary ? selected : Schema.decodeUnknownSync(SessionMessage.ID)(parent.id)
+      if (!small) yield* status.set(chat.id, {
+        type: "busy",
+        activity: { userMessageID: selected, model: "preparing" },
+      })
+      const states: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type === SessionStatus.Event.Status.type) {
+          const data = Schema.decodeUnknownSync(Schema.toType(SessionStatus.Event.Status.data))(event.data)
+          if (data.sessionID === chat.id) states.push(data.status)
+        }
+        return Effect.void
+      })
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+      yield* handle.process({
+        user: { ...parent, role: "user" },
+        sessionID: chat.id,
+        model,
+        agent: agent(),
+        system: [],
+        messages: [],
+        tools: {},
+        small,
+      })
+      yield* off
+      expect(handle.message.error).toBeUndefined()
+      expect(states.map((state) => state.type === "busy" && state.activity?.model)).toEqual([
+        "preparing", "waiting", "receiving", "settling",
+      ])
+      expect(states[1]).toEqual({ type: "busy", activity: {
+        userMessageID: owner, model: "waiting", ...(small ? {} : { streamEventCount: 0 }),
+      } })
+      expect(yield* status.get(chat.id)).toMatchObject({ type: "busy", activity: {
+        userMessageID: owner, model: "settling",
+      } })
+      const receiving = states[2]
+      const settling = states[3]
+      if (receiving.type !== "busy" || settling.type !== "busy") throw new Error("Expected busy activity")
+      expect(settling.activity?.streamEventCount).toBe(small ? undefined : 2)
+      expect(settling.activity?.lastStreamEventAt).toBe(receiving.activity?.lastStreamEventAt)
+      if (small) expect(settling.activity?.lastStreamEventAt).toBeUndefined()
+      if (!small) expect(settling.activity?.lastStreamEventAt).toBeGreaterThan(0)
+      expect(handle.message.time.completed).toBeDefined()
+    }
+  }), { config: cfg }),
+)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -463,6 +606,58 @@ const startToolCall = Effect.fn("test.startToolCall")(function* (directory: stri
   )
   return { handle, messageID: msg.id, projectID: chat.projectID, run, sessionID: chat.id }
 })
+
+let burstCheck: Effect.Effect<void> = Effect.void
+let burstOutcome: "success" | "error" | "cancel" = "success"
+const burstLLM = Layer.succeed(LLM.Service, LLM.Service.of({
+  stream: (input) => Stream.fromEffectDrain(Effect.gen(function* () {
+    for (let count = 0; count <= 200; count++) yield* input.onStreamEventCount?.(count) ?? Effect.void
+    yield* burstCheck
+    if (burstOutcome === "cancel") yield* Effect.interrupt
+  })).pipe(Stream.concat(Stream.suspend((): Stream.Stream<LLMEvent> => burstOutcome === "error"
+    ? Stream.make(LLMEvent.providerError({ message: "burst failed" }))
+    : assistantSuccessStream("burst complete")))),
+}))
+const itBurst = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, burstLLM]]))
+
+itBurst.live("session.processor raw burst writes final count only on success error and cancel", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const status = yield* SessionStatus.Service
+    for (const outcome of ["success", "error", "cancel"] as const) {
+      burstOutcome = outcome
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "burst")
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      const writes: Array<number | undefined> = []
+      const off = yield* events.listen((event) => Effect.sync(() => {
+        if (event.type !== MessageV2.Event.Updated.type) return
+        const data = Schema.decodeUnknownSync(Schema.toType(MessageV2.Event.Updated.data))(event.data)
+        if (data.info.id === msg.id && data.info.role === "assistant") writes.push(data.info.streamEventCount)
+      }))
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+      burstCheck = Effect.gen(function* () {
+        expect(writes).toEqual([])
+        expect(handle.message.streamEventCount).toBeUndefined()
+        expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).not.toHaveProperty("streamEventCount")
+        expect(yield* status.get(chat.id)).toMatchObject({ type: "busy", activity: { streamEventCount: 200 } })
+      }).pipe(Effect.provideService(Database.Service, database), Effect.orDie)
+      const result = yield* handle.process({
+        user: parent, sessionID: chat.id, model, agent: agent(), system: [], messages: [], tools: {},
+      }).pipe(Effect.exit)
+      yield* off
+      expect(result._tag).toBe(outcome === "cancel" ? "Failure" : "Success")
+      expect(writes).toEqual([undefined, 200])
+      expect(handle.message.streamEventCount).toBe(200)
+      expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).toMatchObject({ streamEventCount: 200 })
+      yield* status.set(chat.id, { type: "idle" })
+    }
+    burstCheck = Effect.void
+  }), { config: cfg }),
+)
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2445,11 +2640,11 @@ itChatParamsFailure.live("session.processor persists chat params errors before t
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
-        const seen = defer<void>()
         const database = yield* Database.Service
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2Bridge.Service
         const sts = yield* SessionStatus.Service
+        const runs = yield* SessionRunState.Service
 
         const chat = yield* session.create({})
         const parent = yield* user(chat.id, "fail params")
@@ -2476,7 +2671,6 @@ itChatParamsFailure.live("session.processor persists chat params errors before t
             Effect.tap((stored) =>
               Effect.sync(() => {
                 if (stored.info.role === "assistant") snapshots.push(stored.info)
-                if (snapshots.length === 3) seen.resolve()
               }),
             ),
             Effect.asVoid,
@@ -2488,7 +2682,7 @@ itChatParamsFailure.live("session.processor persists chat params errors before t
           model: mdl,
         })
 
-        const result = yield* handle.process({
+        yield* handle.process({
           user: {
             id: parent.id,
             sessionID: chat.id,
@@ -2503,14 +2697,16 @@ itChatParamsFailure.live("session.processor persists chat params errors before t
           system: [],
           messages: [{ role: "user", content: "fail params" }],
           tools: {},
-        })
-        yield* Effect.promise(() => seen.promise)
+        }).pipe(
+          Effect.tap((result) => Effect.sync(() => expect(result).toBe("stop"))),
+          Effect.map(() => ({ info: handle.message, parts: [] })),
+          (work) => runs.ensureRunning(chat.id, Effect.interrupt, work),
+        )
         const state = yield* sts.get(chat.id)
         yield* off
 
-        expect(result).toBe("stop")
         expect(yield* llm.calls).toBe(0)
-        expect(state).toEqual({ type: "idle" })
+        expect(state).toMatchObject({ type: "idle", terminal: { reason: "error", userMessageID: parent.id } })
         expect(terminalEvents).toEqual([
           Session.Event.Error.type,
           SessionStatus.Event.Status.type,
@@ -2541,6 +2737,8 @@ it.live("session.processor effect tests record aborted errors and idle state", (
         const { processors, session, provider } = yield* boot()
         const events = yield* EventV2Bridge.Service
         const sts = yield* SessionStatus.Service
+        const runs = yield* SessionRunState.Service
+        const order: string[] = []
 
         yield* llm.hang
 
@@ -2550,6 +2748,11 @@ it.live("session.processor effect tests record aborted errors and idle state", (
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
         const errs: string[] = []
         const off = yield* events.listen((evt) => {
+          if (evt.type === SessionStatus.Event.Status.type) {
+            const data = Schema.decodeUnknownSync(Schema.toType(SessionStatus.Event.Status.data))(evt.data)
+            if (data.sessionID === chat.id && data.status.type === "idle") order.push("idle")
+            return Effect.void
+          }
           if (evt.type !== Session.Event.Error.type) return Effect.void
           const data = evt.data as typeof Session.Event.Error.data.Type
           if (data.sessionID !== chat.id || !data.error) return Effect.void
@@ -2580,10 +2783,21 @@ it.live("session.processor effect tests record aborted errors and idle state", (
             messages: [{ role: "user", content: "abort" }],
             tools: {},
           })
-          .pipe(Effect.forkChild)
+          .pipe(
+            Effect.as({ info: msg, parts: [] }),
+            Effect.ensuring(
+              Effect.gen(function* () {
+                expect(handle.message.time.completed).toBeDefined()
+                expect(yield* sts.get(chat.id)).toMatchObject({ type: "busy" })
+                order.push("cleanup")
+              }),
+            ),
+            (work) => runs.ensureRunning(chat.id, Effect.interrupt, work),
+            Effect.forkChild,
+          )
 
         yield* llm.wait(1)
-        yield* Fiber.interrupt(run)
+        yield* runs.cancel(chat.id)
 
         const exit = yield* Fiber.await(run)
         yield* Effect.promise(() => seen.promise)
@@ -2599,8 +2813,10 @@ it.live("session.processor effect tests record aborted errors and idle state", (
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") {
           expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.time.completed).toBeDefined()
         }
-        expect(state).toMatchObject({ type: "idle" })
+        expect(order).toEqual(["cleanup", "idle"])
+        expect(state).toMatchObject({ type: "idle", terminal: { reason: "cancelled", userMessageID: parent.id } })
         expect(errs).toContain("MessageAbortedError")
       }),
     { config: (url) => providerCfg(url) },
@@ -2613,6 +2829,8 @@ it.live("session.processor effect tests mark interruptions aborted without manua
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
         const sts = yield* SessionStatus.Service
+        const runs = yield* SessionRunState.Service
+        const owned = defer<Fiber.Fiber<unknown, unknown>>()
 
         yield* llm.hang
 
@@ -2643,10 +2861,18 @@ it.live("session.processor effect tests mark interruptions aborted without manua
             messages: [{ role: "user", content: "interrupt" }],
             tools: {},
           })
-          .pipe(Effect.forkChild)
+          .pipe(
+            Effect.as({ info: msg, parts: [] }),
+            (work) => Effect.withFiber((fiber) => {
+              owned.resolve(fiber)
+              return work
+            }),
+            (work) => runs.ensureRunning(chat.id, Effect.interrupt, work),
+            Effect.forkChild,
+          )
 
         yield* llm.wait(1)
-        yield* Fiber.interrupt(run)
+        yield* Fiber.interrupt(yield* Effect.promise(() => owned.promise))
 
         const exit = yield* Fiber.await(run)
         const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
@@ -2657,8 +2883,9 @@ it.live("session.processor effect tests mark interruptions aborted without manua
         expect(stored.info.role).toBe("assistant")
         if (stored.info.role === "assistant") {
           expect(stored.info.error?.name).toBe("MessageAbortedError")
+          expect(stored.info.time.completed).toBeDefined()
         }
-        expect(state).toMatchObject({ type: "idle" })
+        expect(state).toMatchObject({ type: "idle", terminal: { reason: "cancelled", userMessageID: parent.id } })
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -2762,6 +2989,11 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
         expect(handle.message.streamEventCount).toBeUndefined()
+        const status = yield* SessionStatus.Service
+        expect(yield* status.get(chat.id)).toEqual({
+          type: "busy",
+          activity: { model: "preparing", userMessageID: Schema.decodeUnknownSync(SessionMessage.ID)(parent.id) },
+        })
         expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).not.toHaveProperty("streamEventCount")
       }),
     { config: cfg },

@@ -79,16 +79,44 @@ test("stream counts stay pending, reset absolutely, and exclude local tool settl
   await Effect.runPromise(current.publisher.publish(call))
   expect(current.published[0]).toMatchObject({
     type: "session.next.step.started.1",
-    data: { streamEventCount: 3 },
   })
+  expect(current.published[0]?.data).not.toHaveProperty("streamEventCount")
   await Effect.runPromise(current.publisher.observeStreamEventCount(11))
   await Effect.runPromise(current.publisher.publish(result))
+  expect(current.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toEqual([])
+  await Effect.runPromise(current.publisher.flushFinalCount())
+  await Effect.runPromise(current.publisher.flushFinalCount())
   expect(current.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toMatchObject([
     { data: { streamEventCount: 11 } },
   ])
   const next = capture()
   await Effect.runPromise(next.publisher.publish(call))
-  expect(next.published[0]?.data).toHaveProperty("streamEventCount", undefined)
+  expect(next.published[0]?.data).not.toHaveProperty("streamEventCount")
+})
+
+test("raw burst persists only the final count, including early failure and late assistant creation", async () => {
+  for (const early of [false, true]) {
+    const current = capture()
+    if (early) await Effect.runPromise(current.publisher.startAssistant())
+    for (let count = 0; count <= 200; count++) {
+      await Effect.runPromise(current.publisher.observeStreamEventCount(count))
+    }
+    await Effect.runPromise(current.publisher.flush())
+    expect(current.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toEqual([])
+    await Effect.runPromise(current.publisher.failAssistant("interrupted"))
+    await Effect.runPromise(current.publisher.failAssistant("interrupted"))
+    expect(current.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toMatchObject([
+      { data: { streamEventCount: 200 } },
+    ])
+    expect(current.published.at(-1)?.type).toBe("session.next.step.failed.2")
+  }
+  const unknown = capture()
+  await Effect.runPromise(unknown.publisher.failAssistant("unknown"))
+  expect(unknown.published.filter((event) => event.type === "session.next.step.stream.updated.1")).toEqual([])
+  const control = capture()
+  await Effect.runPromise(control.publisher.observeStreamEventCount(200))
+  await Effect.runPromise(control.publisher.flushFinalCount())
+  expect(control.published).toEqual([])
 })
 
 test("local tool success serializes media base64 once and reconstructs from structured content", async () => {

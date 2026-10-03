@@ -327,7 +327,54 @@ export type SessionsCreateOutput = {
   }
 }["data"]
 
-export type SessionsActiveOutput = { readonly data: { readonly [x: string]: { readonly type: "running" } } }["data"]
+export type SessionsActiveOutput = {
+  readonly data: {
+    readonly [x: string]: {
+      readonly type: "running"
+      readonly status?:
+        | (
+            | {
+                readonly type: "idle"
+                readonly terminal?: {
+                  readonly userMessageID?: string
+                  readonly reason: "completed" | "cancelled" | "error"
+                  readonly message?: string
+                }
+              }
+            | {
+                readonly type: "retry"
+                readonly attempt: number
+                readonly message: string
+                readonly action?: {
+                  readonly reason: string
+                  readonly provider: string
+                  readonly title: string
+                  readonly message: string
+                  readonly label: string
+                  readonly link?: string
+                }
+                readonly next: number
+                readonly activity?: {
+                  readonly userMessageID?: string
+                  readonly model: "none" | "preparing" | "waiting" | "receiving" | "settling"
+                  readonly streamEventCount?: number
+                  readonly lastStreamEventAt?: number
+                }
+              }
+            | {
+                readonly type: "busy"
+                readonly activity?: {
+                  readonly userMessageID?: string
+                  readonly model: "none" | "preparing" | "waiting" | "receiving" | "settling"
+                  readonly streamEventCount?: number
+                  readonly lastStreamEventAt?: number
+                }
+              }
+          )
+        | null
+    }
+  }
+}["data"]
 
 export type SessionsGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 

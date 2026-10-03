@@ -9,6 +9,7 @@ import {
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
 import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { Database } from "../../database/database"
@@ -31,7 +32,7 @@ import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
-import { type RunError, Service } from "./index"
+import { type Interface, type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
@@ -169,11 +170,18 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      input: Parameters<Interface["run"]>[0],
       recoverOverflow?: typeof compaction.compactAfterOverflow,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
+      let activity: SessionStatusEvent.Activity = {
+        userMessageID: yield* SessionHistory.latestUserID(db, session.id),
+        model: "preparing",
+      }
+      const notify = () => input.onActivity?.(activity) ?? Effect.void
+      yield* notify()
       const agent = yield* agents.select(session.agent)
       const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
@@ -188,6 +196,11 @@ const layer = Layer.effect(
           promoted += yield* SessionInput.promoteSteers(db, events, session.id, cutoff)
         }
         if (promoted > 0) currentStep = 1
+      }
+      const userMessageID = yield* SessionHistory.latestUserID(db, session.id)
+      if (activity.userMessageID !== userMessageID) {
+        activity = { userMessageID, model: "preparing" }
+        yield* notify()
       }
       const system =
         initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
@@ -230,18 +243,36 @@ const layer = Layer.effect(
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
         withPublication(publisher.publish(event, outputPaths))
-      let overflowFailure: ProviderErrorEvent | undefined
+      let providerFailure: ProviderErrorEvent | undefined
+      activity = { ...activity, model: "waiting" }
+      yield* notify()
       const providerStream = llm.stream(request, {
-        onStreamEventCount: (count) => withPublication(publisher.observeStreamEventCount(count)),
+        onStreamEventCount: (count) => Effect.gen(function* () {
+          activity = {
+            userMessageID: activity.userMessageID,
+            model: count === 0 ? "waiting" : "receiving",
+            streamEventCount: count,
+            ...(count > 0 ? { lastStreamEventAt: DateTime.toEpochMillis(yield* DateTime.now) } : {}),
+          }
+          yield* publisher.observeStreamEventCount(count)
+          yield* notify()
+        }),
       }).pipe(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
-            if (overflowFailure || publisher.hasProviderError()) return
+            if (providerFailure || publisher.hasProviderError()) return
+            if (
+              activity.streamEventCount === undefined &&
+              activity.model !== "receiving" &&
+              (event.type === "text-delta" || event.type === "reasoning-delta" ||
+                event.type === "tool-input-delta" || event.type === "tool-call" || event.type === "tool-result")
+            ) {
+              activity = { userMessageID: activity.userMessageID, model: "receiving" }
+              yield* notify()
+            }
             if (LLMEvent.is.providerError(event)) {
-              if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
-                overflowFailure = event
-                return
-              }
+              providerFailure = event
+              return
             }
             yield* publish(event)
             if (event.type !== "tool-call" || event.providerExecuted) return
@@ -275,7 +306,11 @@ const layer = Layer.effect(
             ).pipe(FiberSet.run(toolFibers))
           }),
         ),
-        Effect.ensuring(withPublication(publisher.flush())),
+        Effect.ensuring(Effect.gen(function* () {
+          activity = { ...activity, model: "settling" }
+          yield* notify()
+          yield* withPublication(publisher.flush())
+        })),
       )
 
       return yield* Effect.uninterruptibleMask((restore) =>
@@ -286,11 +321,14 @@ const layer = Layer.effect(
           if (
             recoverOverflow &&
             !publisher.hasAssistantStarted() &&
-            isContextOverflowFailure(overflowFailure ?? failure) &&
+            isContextOverflowFailure(providerFailure ?? failure) &&
             (yield* restore(recoverOverflow({ sessionID: session.id, entries, model, request })))
           )
             return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
-          if (overflowFailure) yield* publish(overflowFailure)
+          if (providerFailure) {
+            yield* input.onError?.(providerFailure.message) ?? Effect.void
+            yield* publish(providerFailure)
+          }
           const llmFailure = failure instanceof LLMError ? failure : undefined
           if (llmFailure && !publisher.hasProviderError()) {
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
@@ -301,6 +339,7 @@ const layer = Layer.effect(
           if (settled._tag === "Failure" && isUserDeclined(settled.cause)) {
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
+            yield* withPublication(publisher.failAssistant("Provider turn interrupted"))
             return yield* Effect.interrupt
           }
           if (
@@ -309,16 +348,20 @@ const layer = Layer.effect(
           ) {
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
-            if (publisher.hasActiveAssistant())
-              yield* withPublication(publisher.failAssistant("Provider turn interrupted"))
+            yield* withPublication(publisher.failAssistant("Provider turn interrupted"))
           }
           if (settled._tag === "Failure" && !Cause.hasInterrupts(settled.cause)) {
             const failure = Cause.squash(settled.cause)
             const message = failure instanceof Error ? failure.message : String(failure)
             yield* withPublication(publisher.failUnsettledTools(`Tool execution failed: ${message}`))
+            yield* withPublication(publisher.failAssistant(message))
+          }
+          if (stream._tag === "Failure" && !llmFailure && !Cause.hasInterrupts(stream.cause)) {
+            const failure = Cause.squash(stream.cause)
+            yield* withPublication(publisher.failAssistant(failure instanceof Error ? failure.message : String(failure)))
           }
           const stepSettlement = publisher.stepSettlement()
-          if (stepSettlement && !publisher.hasProviderError()) {
+          if (stepSettlement && !publisher.hasProviderError() && stream._tag === "Success" && settled._tag === "Success") {
             const endSnapshot = yield* snapshots.capture()
             const files =
               startSnapshot && endSnapshot
@@ -327,18 +370,24 @@ const layer = Layer.effect(
                     .pipe(Effect.catch(() => Effect.succeed(undefined)))
                 : undefined
             yield* withPublication(
-              events.publish(SessionEvent.Step.Ended, {
-                sessionID: session.id,
-                timestamp: yield* DateTime.now,
-                assistantMessageID: yield* publisher.startAssistant(),
-                finish: stepSettlement.finish,
-                cost: 0,
-                tokens: stepSettlement.tokens,
-                snapshot: endSnapshot,
-                files,
+              Effect.gen(function* () {
+                const assistantMessageID = yield* publisher.startAssistant()
+                yield* publisher.flush()
+                yield* publisher.flushFinalCount()
+                yield* events.publish(SessionEvent.Step.Ended, {
+                  sessionID: session.id,
+                  timestamp: yield* DateTime.now,
+                  assistantMessageID,
+                  finish: stepSettlement.finish,
+                  cost: 0,
+                  tokens: stepSettlement.tokens,
+                  snapshot: endSnapshot,
+                  files,
+                })
               }),
             )
           }
+          if (!stepSettlement) yield* withPublication(publisher.flushFinalCount())
           if (publisher.hasProviderError())
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
           if (stream._tag === "Success" && !publisher.hasProviderError())
@@ -354,40 +403,38 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
+      input: Parameters<Interface["run"]>[0],
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, input) {
+      return yield* runTurnAttempt(sessionID, promotion, step, input).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, input)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, input) {
+      return yield* runTurnAttempt(sessionID, promotion, step, input, compaction.compactAfterOverflow).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, input)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, input)
           }),
         ),
       )
     })
 
-    const run = Effect.fn("SessionRunner.run")(function* (input: {
-      readonly sessionID: SessionSchema.ID
-      readonly force: boolean
-    }) {
+    const run = Effect.fn("SessionRunner.run")(function* (input: Parameters<Interface["run"]>[0]) {
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       if (!input.force && !hasSteer && !hasQueue) return
@@ -398,7 +445,7 @@ const layer = Layer.effect(
         let needsContinuation = true
         let step = 1
         while (needsContinuation) {
-          const result = yield* runTurn(input.sessionID, promotion, step)
+          const result = yield* runTurn(input.sessionID, promotion, step, input)
           needsContinuation = result.needsContinuation
           step = result.step + 1
           promotion = "steer"

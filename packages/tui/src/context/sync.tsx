@@ -151,6 +151,9 @@ export const {
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    let connectionEpoch = 0
+    const statusRevision = new Map<string, number>()
+    const stateRevision = new Map<string, number>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -180,7 +183,19 @@ export const {
     }
 
     event.subscribe((event, { directory, workspace }) => {
+      stateRevision.set(event.type, (stateRevision.get(event.type) ?? 0) + 1)
       switch (event.type) {
+        case "server.connected":
+          connectionEpoch += 1
+          void Promise.allSettled([
+            bootstrap({ fatal: false }),
+            ...Array.from(new Set([...fullSyncedSessions, ...syncingSessions.keys(), ...Object.keys(store.message)]),
+              (sessionID) => result.session.sync(sessionID, { force: true })),
+          ]).then((settled) => {
+            for (const failure of settled.filter((item) => item.status === "rejected"))
+              console.error("tui reconnect hydration failed", failure.reason)
+          })
+          break
         case "server.instance.disposed":
           void bootstrap()
           break
@@ -320,6 +335,7 @@ export const {
         }
 
         case "session.status": {
+          statusRevision.set(event.properties.sessionID, (statusRevision.get(event.properties.sessionID) ?? 0) + 1)
           setStore("session_status", event.properties.sessionID, event.properties.status)
           break
         }
@@ -455,8 +471,22 @@ export const {
     const args = useArgs()
 
     async function bootstrap(input: { fatal?: boolean } = {}) {
+      const epoch = connectionEpoch
+      const revisions = new Map(statusRevision)
+      const states = new Map(stateRevision)
       const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
+      const statusPromise = sdk.client.session.status({ workspace }, { throwOnError: true }).then((response) => {
+        if (epoch !== connectionEpoch) return
+        setStore("session_status", produce((draft) => {
+          for (const sessionID of new Set([...Object.keys(draft), ...Object.keys(response.data ?? {})])) {
+            if (revisions.get(sessionID) !== statusRevision.get(sessionID)) continue
+            const status = response.data?.[sessionID]
+            if (status) draft[sessionID] = status
+            if (!status) delete draft[sessionID]
+          }
+        }))
+      })
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
 
@@ -480,6 +510,7 @@ export const {
         agentsPromise,
         configPromise,
         projectPromise,
+        statusPromise,
         ...(args.continue ? [sessionListPromise] : []),
       ])
         .then(async () => {
@@ -500,6 +531,7 @@ export const {
             configResponse,
             ...(sessionListResponse ? [sessionListResponse] : []),
           ]).then((responses) => {
+            if (epoch !== connectionEpoch) return
             const providers = responses[0]
             const providerList = responses[1]
             const capabilities = responses[2]
@@ -521,25 +553,57 @@ export const {
           })
         })
         .then(() => {
+          if (epoch !== connectionEpoch) return
           if (store.status !== "complete") setStore("status", "partial")
           // non-blocking
-          void Promise.all([
-            ...(args.continue ? [] : [sessionListPromise.then((sessions) => setStore("session", reconcile(sessions)))]),
-            consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))),
-            sdk.client.command.list({ workspace }).then((x) => setStore("command", reconcile(x.data ?? []))),
-            sdk.client.lsp.status({ workspace }).then((x) => setStore("lsp", reconcile(x.data ?? []))),
-            sdk.client.mcp.status({ workspace }).then((x) => setStore("mcp", reconcile(x.data ?? {}))),
+          return Promise.all([
+            ...(args.continue ? [] : [sessionListPromise.then((sessions) => {
+              if (epoch === connectionEpoch) setStore("session", reconcile(sessions))
+            })]),
+            consoleStatePromise.then((consoleState) => {
+              if (epoch === connectionEpoch) setStore("console_state", reconcile(consoleState))
+            }),
+            sdk.client.command.list({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("command", reconcile(x.data ?? []))
+            }),
+            sdk.client.lsp.status({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("lsp", reconcile(x.data ?? []))
+            }),
+            sdk.client.mcp.status({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("mcp", reconcile(x.data ?? {}))
+            }),
             sdk.client.experimental.resource
               .list({ workspace })
-              .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
-            sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            sdk.client.session.status({ workspace }).then((x) => {
-              setStore("session_status", reconcile(x.data ?? {}))
+              .then((x) => {
+                if (epoch === connectionEpoch) setStore("mcp_resource", reconcile(x.data ?? {}))
+              }),
+            sdk.client.formatter.status({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("formatter", reconcile(x.data ?? []))
             }),
-            sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
-            sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
+            ...(epoch === 0 ? [] : [sdk.client.permission.list({ workspace }, { throwOnError: true }).then((response) => {
+              if (epoch !== connectionEpoch) return
+              if (["permission.asked", "permission.replied"].some((type) => states.get(type) !== stateRevision.get(type))) return
+              setStore("permission", reconcile((response.data ?? []).reduce<Record<string, PermissionRequest[]>>((requests, item) => {
+                (requests[item.sessionID] ??= []).push(item)
+                return requests
+              }, {})))
+            }), sdk.client.question.list({ workspace }, { throwOnError: true }).then((response) => {
+              if (epoch !== connectionEpoch) return
+              if (["question.asked", "question.replied", "question.rejected"].some((type) => states.get(type) !== stateRevision.get(type))) return
+              setStore("question", reconcile((response.data ?? []).reduce<Record<string, QuestionRequest[]>>((requests, item) => {
+                (requests[item.sessionID] ??= []).push(item)
+                return requests
+              }, {})))
+            })]),
+            sdk.client.provider.auth({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("provider_auth", reconcile(x.data ?? {}))
+            }),
+            sdk.client.vcs.get({ workspace }).then((x) => {
+              if (epoch === connectionEpoch) setStore("vcs", reconcile(x.data))
+            }),
             project.workspace.sync(),
           ]).then(() => {
+            if (epoch !== connectionEpoch) return
             setStore("status", "complete")
           })
         })
@@ -597,11 +661,20 @@ export const {
           if (last.role === "user") return "working"
           return last.time.completed ? "idle" : "working"
         },
-        async sync(sessionID: string) {
-          if (fullSyncedSessions.has(sessionID)) return
+        async sync(sessionID: string, input: { force?: boolean } = {}): Promise<void> {
+          if (!input.force && fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
-          if (syncing) return syncing
+          if (syncing) {
+            if (!input.force) return syncing
+            await Promise.allSettled([syncing])
+            return result.session.sync(sessionID, input)
+          }
+          const epoch = connectionEpoch
+          const todoRevision = stateRevision.get("todo.updated")
           const tracker = { messages: new Set<string>(), parts: new Set<string>() }
+          for (const message of store.message[sessionID] ?? []) {
+            if (message.role === "user") tracker.messages.add(message.id)
+          }
           hydratingSessions.set(sessionID, tracker)
           const task = (async () => {
             const [session, messages, todo, diff] = await Promise.all([
@@ -610,12 +683,13 @@ export const {
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
+            if (epoch !== connectionEpoch) return
             setStore(
               produce((draft) => {
                 const match = search(draft.session, sessionID, (s) => s.id)
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
-                draft.todo[sessionID] = todo.data ?? []
+                if (todoRevision === stateRevision.get("todo.updated")) draft.todo[sessionID] = todo.data ?? []
                 const currentMessages = draft.message[sessionID] ?? []
                 const infos = (messages.data ?? []).flatMap((message) => {
                   if (!tracker.messages.has(message.info.id)) return [message.info]

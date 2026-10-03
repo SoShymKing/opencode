@@ -26,6 +26,7 @@ import type { State, VcsCache } from "./types"
 import { ServerScope } from "@/utils/server-scope"
 import type { ServerApi } from "@/utils/server"
 import { ServerConnection } from "@/context/server"
+import { createServerSession } from "../server-session"
 
 type ProjectApi = ServerApi["project"]
 type DirectoryApi = Parameters<typeof bootstrapDirectory>[0]["api"]
@@ -243,6 +244,95 @@ describe("bootstrapDirectory", () => {
 
     expect(completedBeforeLoad).toBe(false)
     await booting
+  })
+
+  test("reconnect bootstrap restores permission and question snapshots while raced live state wins", async () => {
+    const waiting = ["/session/status", "/permission", "/question"].map((path) => ({
+      path,
+      started: Promise.withResolvers<void>(),
+      response: Promise.withResolvers<Response>(),
+    }))
+    const sdk = createOpencodeClient({
+      baseUrl: "http://fixture",
+      fetch: testFetch(async (request) => {
+        const path = new URL(request.url).pathname
+        const pending = waiting.find((item) => item.path === path)
+        if (pending) {
+          pending.started.resolve()
+          return pending.response.promise
+        }
+        if (path === "/provider") return Response.json({ all: [], connected: [], default: {} })
+        if (path === "/v2/reference") return Response.json({ data: [] })
+        if (path === "/config" || path === "/vcs") return Response.json({})
+        return Response.json([])
+      }),
+    })
+    const session = createServerSession(sdk)
+    for (const id of ["live", "quiet"])
+      session.remember({
+        id,
+        slug: id,
+        projectID: "project",
+        directory: "/project",
+        title: id,
+        version: "1",
+        time: { created: 1, updated: 1 },
+      })
+    const [store, setStore] = directoryState()
+    const loading = bootstrapDirectory({
+      directory: "/project",
+      scope: ServerScope.local,
+      mcp: false,
+      sdk,
+      api,
+      store,
+      setStore,
+      global: { config: {}, path: store.path, project: [project], provider },
+      vcsCache: vcsCache(),
+      loadSessions() {},
+      translate: (key) => key,
+      queryClient: new QueryClient(),
+      session,
+      protocol: Promise.resolve("v1"),
+      awaitTasks: true,
+    })
+    await Promise.all(waiting.map((item) => item.started.promise))
+    session.apply({
+      type: "session.status",
+      properties: {
+        sessionID: "live",
+        status: { type: "busy", activity: { model: "receiving", streamEventCount: 201 } },
+      },
+    })
+    const permission = { id: "perm_live", sessionID: "live", permission: "read", patterns: [], metadata: {}, always: [] }
+    const question = { id: "question_live", sessionID: "live", questions: [] }
+    session.apply({ type: "permission.asked", properties: permission })
+    session.apply({ type: "question.asked", properties: question })
+    for (const item of waiting) {
+      const payload =
+        item.path === "/session/status"
+          ? {
+              live: { type: "busy", activity: { model: "waiting", streamEventCount: 200 } },
+              quiet: { type: "busy", activity: { model: "receiving", streamEventCount: 200 } },
+            }
+          : item.path === "/permission"
+            ? [{ ...permission, id: "perm_quiet", sessionID: "quiet" }]
+            : [{ ...question, id: "question_quiet", sessionID: "quiet" }]
+      item.response.resolve(Response.json(payload))
+    }
+    await loading
+    expect(session.data.session_status.live).toEqual({
+      type: "busy",
+      activity: { model: "receiving", streamEventCount: 201 },
+    })
+    expect(session.data.session_status.quiet).toEqual({
+      type: "busy",
+      activity: { model: "receiving", streamEventCount: 200 },
+    })
+    expect(session.data.permission.live).toEqual([permission])
+    expect(session.data.question.live).toEqual([question])
+    expect(session.data.permission.quiet?.map((item) => item.id)).toEqual(["perm_quiet"])
+    expect(session.data.question.quiet?.map((item) => item.id)).toEqual(["question_quiet"])
   })
 
   test("uses legacy MCP endpoints while refreshing a v1 directory", async () => {

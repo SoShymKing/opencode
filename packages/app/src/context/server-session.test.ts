@@ -162,6 +162,128 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("reconnect force waits for older inflight history then fetches fresh history", async () => {
+    const older = deferredResponse()
+    const client = messageClient(older.promise, response([{ info: userMessage("fresh"), parts: [] }]))
+    const store = createServerSession(client)
+    const loading = store.sync("child")
+    await client.requested(1)
+    const refreshing = store.sync("child", { force: true })
+    older.resolve(response([{ info: userMessage("old"), parts: [] }]))
+    await Promise.all([loading, refreshing])
+    expect(client.requests.length).toBe(2)
+    expect(store.data.message.child?.map((message) => message.id)).toEqual(["fresh"])
+  })
+
+  test("reconnect snapshot restores quiet activity and clears inactive stale busy", () => {
+    const ctx = setup({ child: session("child"), ended: session("ended") })
+    ctx.store.set("session_status", "child", { type: "busy" })
+    ctx.store.set("session_status", "ended", { type: "busy" })
+    const snapshot = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.status({ child: { type: "busy", activity: {
+      model: "receiving", streamEventCount: 200, userMessageID: "msg_owner",
+    } } }, snapshot)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: {
+      model: "receiving", streamEventCount: 200, userMessageID: "msg_owner",
+    } })
+    expect(ctx.store.data.session_status.ended).toBeUndefined()
+  })
+
+  test("reconnect snapshot yields to live status and local pending status", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    const snapshot = ctx.store.snapshot.capture("session_status")
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: {
+      type: "busy", activity: { model: "receiving", streamEventCount: 201 },
+    } } })
+    ctx.store.set("session_status", "pending", { type: "busy" })
+    ctx.store.snapshot.status({ child: { type: "busy", activity: {
+      model: "waiting", streamEventCount: 200,
+    } } }, snapshot)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: {
+      model: "receiving", streamEventCount: 201,
+    } })
+    expect(ctx.store.data.session_status.pending).toEqual({ type: "busy" })
+  })
+
+  test("reconnect snapshot rejects an older connection and permits count reset", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.set("session_status", "child", { type: "busy", activity: { model: "receiving", streamEventCount: 200 } })
+    const old = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.connect()
+    const fresh = ctx.store.snapshot.capture("session_status")
+    ctx.store.snapshot.status({ child: { type: "busy", activity: { model: "waiting", streamEventCount: 2 } } }, fresh)
+    ctx.store.snapshot.status({ child: { type: "busy", activity: { model: "receiving", streamEventCount: 200 } } }, old)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy", activity: { model: "waiting", streamEventCount: 2 } })
+  })
+
+  test("reconnect force preserves failed optimistic and unpromoted pending arrays", async () => {
+    const client = messageClient(response())
+    const store = createServerSession(client)
+    store.remember(session("child"))
+    store.optimistic.add({ sessionID: "child", message: userMessage("failed"), parts: [textPart("failed")] })
+    store.applyV2({ id: "evt_pending", type: "session.next.prompt.admitted", data: {
+      sessionID: "child", messageID: "msg_pending", timestamp: 2, prompt: { text: "queued" }, delivery: "queue",
+    } })
+    await store.sync("child", { force: true })
+    expect(store.data.message.child?.map((message) => message.id)).toEqual(["failed", "msg_pending"])
+    expect(store.data.part.failed).toEqual([textPart("failed")])
+    expect(store.data.pending_input.child).toEqual({ failed: true, msg_pending: true })
+  })
+
+  test("retains an admitted pending user outside canonical history during a refresh", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.applyV2({
+      id: "evt_admitted", type: "session.next.prompt.admitted",
+      data: { sessionID: "child", messageID: "msg_pending", timestamp: 2, prompt: { text: "followup" }, delivery: "queue" },
+    })
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.data.session_message.child).toEqual([])
+    expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual(["msg_pending"])
+    expect(ctx.store.data.pending_input.child).toEqual({ msg_pending: true })
+  })
+
+  test("keeps canonical admissions pending through confirmation and cancellation until each prompt is promoted", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    const admitted = {
+      id: "evt_admitted", type: "session.next.prompt.admitted" as const,
+      data: { sessionID: "child", messageID: "msg_pending", timestamp: 2, prompt: { text: "followup" }, delivery: "steer" as const },
+    }
+    ctx.store.applyV2(admitted)
+    expect(ctx.store.data.session_message.child).toEqual([])
+    expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual(["msg_pending"])
+    ctx.store.apply({ type: "message.part.updated", properties: { part: textPart("msg_pending") } })
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: { type: "idle", terminal: { userMessageID: "msg_owner", reason: "cancelled" } } } })
+    expect(ctx.store.data.pending_input.child).toEqual({ msg_pending: true })
+    ctx.store.applyV2({ ...admitted, id: "evt_promoted", type: "session.next.prompted" })
+    expect(ctx.store.data.pending_input.child).toEqual({})
+    expect(ctx.store.data.session_message.child?.find((message) => message.id === "msg_pending")).toMatchObject({ type: "user", text: "followup" })
+    ctx.store.set("pending_input", "child", "msg_missed", true)
+    ctx.store.applyV2({ ...admitted, id: "evt_missed", type: "session.next.prompted", data: { ...admitted.data, messageID: "msg_missed" } })
+    expect(ctx.store.data.pending_input.child).toEqual({})
+    expect(ctx.store.data.message.child?.map((message) => message.id)).toContain("msg_missed")
+  })
+
+  test("preserves pending optimistic confirmations and clears V1 inputs through the selected owner only", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    const users = [1, 2, 3].map((created) => userMessage(`msg_${created}`, { time: { created } }))
+    users.forEach((message) => {
+      ctx.store.optimistic.add({ sessionID: "child", message, parts: [textPart(message.id, { id: `prt_${message.id}` })] })
+      ctx.store.apply({ type: "message.updated", properties: { info: message } })
+      ctx.store.apply({ type: "message.part.updated", properties: { part: textPart(message.id, { id: `prt_${message.id}` }) } })
+    })
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: { type: "idle" } } })
+    expect(ctx.store.data.pending_input.child).toEqual({ msg_1: true, msg_2: true, msg_3: true })
+    const status = { type: "busy", activity: { userMessageID: "msg_2", model: "waiting", streamEventCount: 0 } } as const
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status } })
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status } })
+    expect(ctx.store.data.pending_input.child).toEqual({ msg_3: true })
+    expect(ctx.store.data.session_status.child).toEqual(status)
+  })
+
   test("projects a V2 event through touched-message normalization into current source and legacy parts", () => {
     const ctx = setup({ child: session("child") })
     ctx.store.remember(session("child"))
@@ -343,6 +465,13 @@ describe("server session", () => {
     const next = userMessage("message-3", { sessionID: "root" })
     store.apply({ type: "message.updated", properties: { info: next } })
     expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, assistant.id, next.id])
+
+    store.set("pending_input", "root", { [user.id]: true, [next.id]: true })
+    store.apply({ type: "session.status", properties: { sessionID: "root", status: { type: "busy", activity: { userMessageID: user.id, model: "waiting" } } } })
+    expect(store.data.pending_input.root).toEqual({ [next.id]: true })
+    store.set("pending_input", "root", { [user.id]: true, [next.id]: true })
+    store.apply({ type: "message.updated", properties: { info: { ...assistant, time: { created: 1 } } } })
+    expect(store.data.pending_input.root).toEqual({ [next.id]: true })
 
     store.apply({ type: "message.removed", properties: { sessionID: "root", messageID: next.id } })
     expect(store.data.session_message.root.map((message) => message.id)).toEqual([user.id, assistant.id])

@@ -21,6 +21,7 @@ import { Model } from "@opencode-ai/schema/model"
 import { Location } from "@opencode-ai/schema/location"
 import { Revert } from "@opencode-ai/schema/revert"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 const SessionsQueryFields = {
   workspace: Workspace.ID.pipe(Schema.optional),
@@ -80,9 +81,11 @@ export const SessionsCursor = Schema.String.pipe(
 )
 export type SessionsCursor = typeof SessionsCursor.Type
 
-const SessionActive = Schema.Struct({
+export const SessionActive = Schema.Struct({
   type: Schema.Literal("running"),
+  status: Schema.optional(SessionStatusEvent.Info),
 }).annotate({ identifier: "SessionActive" })
+export type SessionActive = typeof SessionActive.Type
 
 const SessionHistoryLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(100))
 

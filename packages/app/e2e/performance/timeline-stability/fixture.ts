@@ -53,7 +53,7 @@ type CurrentStepEvent =
   | typeof SessionEvent.Step.StreamUpdated.Encoded
   | typeof SessionEvent.Step.Ended.Encoded
   | typeof SessionEvent.Step.Failed.Encoded
-export type EventPayload = TimelineEvent | CurrentStepEvent
+export type EventPayload = TimelineEvent | CurrentStepEvent | typeof SessionEvent.PromptAdmitted.Encoded | typeof SessionEvent.Prompted.Encoded
 export type ToolStatus = ToolState["status"]
 export type TimelineMessage = { info: UserMessage; parts: Part[] } | { info: AssistantMessage; parts: Part[] }
 

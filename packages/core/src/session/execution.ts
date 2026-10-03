@@ -5,10 +5,12 @@ import { LayerNode } from "../effect/layer-node"
 import { Node } from "../effect/app-node"
 import { SessionRunner } from "./runner/index"
 import { SessionSchema } from "./schema"
+import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 export interface Interface {
   /** Snapshots active execution owned by this process. */
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
+  readonly snapshot: Effect.Effect<ReadonlyMap<SessionSchema.ID, SessionStatusEvent.Info>>
   /** Starts execution while idle or joins the active execution. */
   readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, SessionRunner.RunError>
   /** Registers newly recorded work. Repeated wakeups may coalesce. */
@@ -27,6 +29,7 @@ export const noopLayer = Layer.succeed(
   Service,
   Service.of({
     active: Effect.succeed(new Set()),
+    snapshot: Effect.succeed(new Map()),
     resume: () => Effect.void,
     wake: () => Effect.void,
     interrupt: () => Effect.void,

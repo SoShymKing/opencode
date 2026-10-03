@@ -54,8 +54,8 @@ import type {
   McpResourceCatalogInput,
   McpResourceCatalogOutput,
   McpServer,
-  SessionActiveOutput,
 } from "@opencode-ai/client/promise"
+import type { SessionActiveSnapshot } from "@/utils/server-compat"
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
 
@@ -86,7 +86,7 @@ type ApiQueryOptions<T, K extends readonly unknown[]> = SolidQueryOptions<T, Err
 }
 
 type SessionActiveApi = {
-  readonly active: () => Promise<SessionActiveOutput>
+  readonly active: () => Promise<SessionActiveSnapshot>
 }
 
 export const loadMcpQuery = (
@@ -152,8 +152,8 @@ export const loadLspQuery = (scope: ServerScope, directory: string, sdk: Opencod
 export const loadActiveSessionsQuery = (
   scope: ServerScope,
   api: SessionActiveApi,
-): ApiQueryOptions<SessionActiveOutput, readonly [ServerScope, "activeSessions"]> =>
-  queryOptions<SessionActiveOutput, Error, SessionActiveOutput, readonly [ServerScope, "activeSessions"]>({
+): ApiQueryOptions<SessionActiveSnapshot, readonly [ServerScope, "activeSessions"]> =>
+  queryOptions<SessionActiveSnapshot, Error, SessionActiveSnapshot, readonly [ServerScope, "activeSessions"]>({
     queryKey: [scope, "activeSessions"] as const,
     queryFn: () => api.active(),
     enabled: true,
@@ -165,14 +165,50 @@ export const loadActiveSessionsQuery = (
   })
 
 export function seedActiveSessionStatuses(
-  session: Pick<ServerSession, "data" | "set">,
-  active: SessionActiveOutput | Record<string, SessionStatus>,
+  session: ServerSession,
+  active: SessionActiveSnapshot | Record<string, SessionStatus>,
+  captured: ReturnType<ServerSession["snapshot"]["capture"]>,
 ) {
-  for (const sessionID of Object.keys(active)) {
-    if (session.data.session_status[sessionID] !== undefined) continue
-    const status = active[sessionID]
-    session.set("session_status", sessionID, status?.type === "running" ? { type: "busy" } : status)
-  }
+  session.snapshot.status(
+    Object.fromEntries(
+      Object.entries(active).map(([id, status]) => [
+        id,
+        status.type === "running" ? (status.status ?? { type: "busy" as const }) : status,
+      ]),
+    ),
+    captured,
+  )
+}
+
+export async function refreshActiveSessionStatuses(session: ServerSession, api: SessionActiveApi) {
+  const captured = session.snapshot.capture("session_status")
+  const active = await api.active()
+  seedActiveSessionStatuses(session, active, captured)
+  return active
+}
+
+export async function resyncServerSessions(input: {
+  event: { name: string; details: { type: string } }
+  session: ServerSession
+  api: SessionActiveApi
+  refreshDirectories: () => Promise<unknown>
+}) {
+  if (input.event.name !== "global" || input.event.details.type !== "server.connected") return
+  const session = input.session
+  const epoch = session.snapshot.connect()
+  const retained = session.retained()
+  await Promise.allSettled([
+    refreshActiveSessionStatuses(session, input.api).then((active) => {
+      if (session.snapshot.epoch() !== epoch) return
+      return Promise.allSettled(
+        Object.keys(active)
+          .filter((id) => !retained.includes(id))
+          .map((id) => session.sync(id, { force: true })),
+      )
+    }),
+    ...retained.map((id) => session.sync(id, { force: true })),
+    input.refreshDirectories(),
+  ])
 }
 
 function makeQueryOptionsApi(
@@ -237,23 +273,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
     queries: [queryOptionsApi.globalConfig(), queryOptionsApi.providers(null), queryOptionsApi.path(null)],
   }))
-  const activeSessionsQuery = useQuery(() =>
+  useQuery(() =>
     loadActiveSessionsQuery(serverSDK.scope, {
       active: async () => {
-        if ((await serverSDK.protocol) === "v1") {
-          const statuses = (await serverSDK.client.session.status()).data ?? {}
-          seedActiveSessionStatuses(session, statuses)
-          for (const sessionID of Object.keys(statuses)) {
-            void session.resolve(sessionID).catch(() => undefined)
-          }
-          return Object.fromEntries(
-            Object.entries(statuses).flatMap(([sessionID, status]) =>
-              status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
-            ),
-          )
-        }
-        const active = await serverSDK.api.session.active()
-        seedActiveSessionStatuses(session, active)
+        const active = await refreshActiveSessionStatuses(session, serverSDK.api.session)
         for (const sessionID of Object.keys(active)) {
           void session.resolve(sessionID).catch(() => undefined)
         }
@@ -452,11 +475,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     return promise
   }
 
-  async function bootstrapInstance(directory: string) {
+  async function bootstrapInstance(directory: string, options?: { force?: boolean }) {
     const key = directoryKey(directory)
     if (!key) return
     const pending = booting.get(key)
-    if (pending) return pending
+    if (pending && !options?.force) return pending
+    if (options?.force) await Promise.allSettled([pending])
 
     children.pin(key)
     const promise = Promise.resolve().then(async () => {
@@ -484,6 +508,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         queryClient,
         session,
         protocol: serverSDK.protocol,
+        awaitTasks: true,
       })
     })
 
@@ -528,8 +553,22 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (eventType === "integration.connection.updated") void refreshProviders()
 
     if (directory === "global") {
-      if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
-        void activeSessionsQuery.refetch()
+      if (eventType === "server.connected")
+        void resyncServerSessions({
+          event: e,
+          session,
+          api: serverSDK.api.session,
+          refreshDirectories: () =>
+            Promise.allSettled(
+              [...new Set([
+                ...Object.keys(children.children),
+                ...session.retained().flatMap((id) => {
+                  const info = session.get(id)
+                  return info ? [info.directory] : []
+                }),
+              ])].map((directory) => bootstrapInstance(directory, { force: true })),
+            ),
+        })
       applyGlobalEvent({
         event,
         project: globalStore.project,

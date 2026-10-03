@@ -145,7 +145,9 @@ describe("SessionRunCoordinator", () => {
         const firstGate = yield* Deferred.make<void>()
         const secondStarted = yield* Deferred.make<void>()
         let runs = 0
+        const terminals: number[] = []
         const coordinator = yield* SessionRunCoordinator.make({
+          onSettled: () => Effect.sync(() => { terminals.push(runs) }),
           drain: () =>
             Effect.sync(() => ++runs).pipe(
               Effect.flatMap((run) =>
@@ -166,6 +168,7 @@ describe("SessionRunCoordinator", () => {
         yield* Fiber.join(resumed)
 
         expect(runs).toBe(2)
+        expect(terminals).toEqual([2])
       }),
     ),
   )
@@ -213,6 +216,47 @@ describe("SessionRunCoordinator", () => {
         yield* coordinator.interrupt("session")
       }),
     ),
+  )
+
+  it.effect("awaits cleanup and terminal publication before starting a failed drain successor", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const gate = yield* Deferred.make<void>()
+      const publishing = yield* Deferred.make<void>()
+      const published = yield* Deferred.make<void>()
+      const successor = yield* Deferred.make<void>()
+      const order: string[] = []
+      let runs = 0
+      const coordinator = yield* SessionRunCoordinator.make({
+        drain: () => Effect.suspend(() => {
+          runs++
+          if (runs > 1) return Effect.sync(() => { order.push("successor") }).pipe(
+            Effect.andThen(Deferred.succeed(successor, undefined)),
+          )
+          return Deferred.await(gate).pipe(
+            Effect.andThen(Effect.fail("failed")),
+            Effect.ensuring(Effect.sync(() => { order.push("cleanup") })),
+          )
+        }),
+        onSettled: (_key, exit) => Effect.gen(function* () {
+          if (Exit.isSuccess(exit)) return
+          order.push("publishing")
+          yield* Deferred.succeed(publishing, undefined)
+          yield* Deferred.await(published)
+          order.push("terminal")
+        }),
+      })
+      const run = yield* coordinator.run("session").pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* coordinator.wake("session")
+      yield* Deferred.succeed(gate, undefined)
+      yield* Deferred.await(publishing)
+      expect(order).toEqual(["cleanup", "publishing"])
+      expect(runs).toBe(1)
+      yield* Deferred.succeed(published, undefined)
+      expect(yield* Fiber.join(run).pipe(Effect.flip)).toBe("failed")
+      yield* Deferred.await(successor)
+      expect(order).toEqual(["cleanup", "publishing", "terminal", "successor"])
+    })),
   )
 
   it.effect("interrupts active execution and clears its pending wake", () =>

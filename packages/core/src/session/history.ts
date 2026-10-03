@@ -8,6 +8,18 @@ import { SessionContextEpochTable, SessionMessagePartTable, SessionMessageTable 
 
 type DatabaseService = Database.Interface["db"]
 
+export const latestUserID = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+  const row = yield* db
+    .select({ id: SessionMessageTable.id })
+    .from(SessionMessageTable)
+    .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.type, "user")))
+    .orderBy(desc(SessionMessageTable.seq))
+    .limit(1)
+    .get()
+    .pipe(Effect.orDie)
+  return row ? SessionMessage.ID.make(row.id) : undefined
+})
+
 export const latestCompaction = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
   return yield* db
     .select({ seq: SessionMessageTable.seq })

@@ -33,6 +33,7 @@ const execution = Layer.succeed(
   SessionExecution.Service,
   SessionExecution.Service.of({
     active: Effect.sync(() => new Set(activeSessions)),
+    snapshot: Effect.sync(() => new Map(Array.from(activeSessions, (id) => [id, { type: "busy" as const }]))),
     resume: (sessionID) =>
       Effect.sync(() => {
         executionCalls.push(sessionID)
@@ -107,7 +108,9 @@ describe("SessionV2.prompt", () => {
   it.effect("exposes the execution registry", () =>
     Effect.gen(function* () {
       activeSessions.add(sessionID)
-      expect(Array.from(yield* (yield* SessionV2.Service).active)).toEqual([sessionID])
+      const session = yield* SessionV2.Service
+      expect(Array.from(yield* session.active)).toEqual([sessionID])
+      expect(yield* session.activeSnapshot).toEqual(new Map([[sessionID, { type: "busy" }]]))
     }).pipe(Effect.ensuring(Effect.sync(() => activeSessions.clear()))),
   )
 

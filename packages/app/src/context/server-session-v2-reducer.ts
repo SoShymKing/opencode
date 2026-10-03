@@ -2,6 +2,7 @@ import type { SessionPendingMessage } from "@opencode-ai/client/promise"
 import type { CurrentSessionMessage } from "@/utils/session-message"
 import type { ServerSessionEvent } from "./server-sdk"
 import { Option, Schema } from "effect"
+import type { SessionEvent } from "@opencode-ai/schema/session-event"
 
 type Assistant = Extract<CurrentSessionMessage, { type: "assistant" }>
 type Compaction = Extract<CurrentSessionMessage, { type: "compaction" }>
@@ -15,6 +16,9 @@ export type V2SessionReduction = {
   messages: CurrentSessionMessage[]
   touched: string[]
   missing?: string
+  admitted?: string
+  promoted?: string[]
+  pendingMessage?: CurrentSessionMessage
 }
 
 export function createV2SessionReducer() {
@@ -35,15 +39,22 @@ export function createV2SessionReducer() {
       result(source.some((item) => item.id === message.id) ? [...source] : [...source, message], [message.id])
 
     switch (event.type) {
+      case "session.next.prompt.admitted":
+        return { ...result([...source]), admitted: event.data.messageID, pendingMessage: promptMessage(event.data) }
+      case "session.next.prompted":
+        return {
+          ...append(promptMessage(event.data)),
+          promoted: [event.data.messageID],
+        }
       case "session.input.admitted":
         pending.set(key(sessionID, event.data.inputID), event.data.input)
-        return result([...source])
+        return { ...result([...source]), admitted: event.data.inputID }
       case "session.input.promoted": {
         const input = pending.get(key(sessionID, event.data.inputID))
         pending.delete(key(sessionID, event.data.inputID))
-        if (!input) return { ...result([...source]), missing: event.data.inputID }
+        if (!input) return { ...result([...source]), missing: event.data.inputID, promoted: [event.data.inputID] }
         if (input.type === "user")
-          return append({
+          return { ...append({
             id: event.data.inputID,
             type: "user",
             metadata: input.data.metadata,
@@ -51,15 +62,15 @@ export function createV2SessionReducer() {
             files: input.data.files,
             agents: input.data.agents,
             time: { created: event.created },
-          })
-        return append({
+          }), promoted: [event.data.inputID] }
+        return { ...append({
           id: event.data.inputID,
           type: "synthetic",
           metadata: input.data.metadata,
           text: input.data.text,
           description: input.data.description,
           time: { created: event.created },
-        })
+        }), promoted: [event.data.inputID] }
       }
       case "session.agent.selected":
         return append({
@@ -446,6 +457,19 @@ export function createV2SessionReducer() {
         if (id.startsWith(`${sessionID}:`)) pending.delete(id)
       }
     },
+  }
+}
+
+function promptMessage(data: typeof SessionEvent.Prompted.Encoded.data): CurrentSessionMessage {
+  return {
+    id: data.messageID,
+    type: "user",
+    text: data.prompt.text,
+    files: data.prompt.files?.map((file) => ({
+      mime: file.mime, name: file.name, data: "", source: { type: "uri" as const, uri: file.uri }, mention: file.source,
+    })),
+    agents: data.prompt.agents?.map((agent) => ({ name: agent.name, mention: agent.source })),
+    time: { created: data.timestamp },
   }
 }
 

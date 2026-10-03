@@ -835,6 +835,7 @@ export type Todo = {
 export type SessionStatus =
   | {
       type: "idle"
+      terminal?: SessionStatusTerminal
     }
   | {
       type: "retry"
@@ -849,9 +850,11 @@ export type SessionStatus =
         link?: string
       }
       next: number
+      activity?: SessionStatusActivity
     }
   | {
       type: "busy"
+      activity?: SessionStatusActivity
     }
 
 export type QuestionOption = {
@@ -2878,6 +2881,7 @@ export type InvalidCursorError = {
 
 export type SessionActive = {
   type: "running"
+  status?: SessionStatus
 }
 
 export type SessionNotFoundError = {
@@ -3364,6 +3368,22 @@ export type ProjectTime = {
   created: number
   updated: number
   initialized?: number
+}
+
+export type SessionStatusTerminal = {
+  userMessageID?: string
+  reason: "completed" | "cancelled" | "error"
+  message?: string
+}
+
+export type SessionStatusActivity = {
+  userMessageID?: string
+  model: "none" | "preparing" | "waiting" | "receiving" | "settling"
+  streamEventCount?: number
+  /**
+   * Unix timestamp in milliseconds
+   */
+  lastStreamEventAt?: number
 }
 
 export type EventServerInstanceDisposed = {
