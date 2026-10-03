@@ -60,6 +60,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
+import { TestClock } from "effect/testing"
 
 const requests: LLMRequest[] = []
 let response: LLMEvent[] = []
@@ -653,14 +654,70 @@ describe("SessionRunnerLLM", () => {
     }),
   )
 
+  it.effect("snapshots the latest execution count during a quiet gap before trailing publication", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const execution = yield* SessionExecution.Service
+      const statuses = yield* statusLog
+      expect(yield* session.activeSnapshot).toEqual(new Map())
+      streamCounts = [{ before: 1, after: 200 }]
+      const received = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      streamCountHook = Deferred.succeed(received, undefined).pipe(Effect.andThen(Deferred.await(finish)))
+      const running = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(received)
+      expect((yield* execution.active).has(sessionID)).toBeTrue()
+      const snapshot = (yield* session.activeSnapshot).get(sessionID)
+      expect(snapshot).toMatchObject({
+        type: "busy", activity: { model: "receiving", streamEventCount: 200 },
+      })
+      expect(statuses.at(-1)).toMatchObject({ type: "busy", activity: { streamEventCount: 1 } })
+      yield* TestClock.adjust("100 millis")
+      expect(statuses.at(-1)).toEqual(snapshot)
+      yield* Deferred.succeed(finish, undefined)
+      yield* Fiber.join(running)
+      expect(yield* session.activeSnapshot).toEqual(new Map())
+      yield* TestClock.adjust("200 millis")
+      expect(statuses.at(-1)).toMatchObject({ type: "idle", terminal: { reason: "completed" } })
+    }),
+  )
+
+  it.effect("excludes terminal execution while idle publication still owns the session", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const execution = yield* SessionExecution.Service
+      const events = yield* EventV2.Service
+      const statuses = yield* statusLog
+      yield* events.listen((event) => Effect.gen(function* () {
+        if (event.type !== SessionStatusEvent.Status.type) return
+        const data = Schema.decodeUnknownSync(Schema.toType(SessionStatusEvent.Status.data))(event.data)
+        if (data.sessionID !== sessionID || data.status.type !== "idle") return
+        expect((yield* execution.active).has(sessionID)).toBeTrue()
+        expect((yield* session.activeSnapshot).has(sessionID)).toBeFalse()
+      }))
+      streamCounts = [{ before: 1, after: 200 }]
+      yield* session.resume(sessionID)
+      yield* execution.wake(sessionID)
+      while ((yield* execution.active).has(sessionID)) yield* Effect.yieldNow
+      expect(yield* session.activeSnapshot).toEqual(new Map())
+      yield* TestClock.adjust("200 millis")
+      expect(statuses.at(-1)).toMatchObject({ type: "idle" })
+      expect(statuses.filter((status) => status.type === "idle")).toHaveLength(1)
+    }),
+  )
+
   it.effect("publishes no execution terminal for no-op wakes or idle interrupts", () =>
     Effect.gen(function* () {
       yield* setup
       const execution = yield* SessionExecution.Service
       const statuses = yield* statusLog
       yield* execution.wake(sessionID)
+      expect((yield* execution.snapshot).get(sessionID)).toEqual({ type: "busy" })
       while ((yield* execution.active).has(sessionID)) yield* Effect.yieldNow
       yield* execution.interrupt(sessionID)
+      expect(yield* execution.snapshot).toEqual(new Map())
       expect(statuses).toEqual([])
     }),
   )
