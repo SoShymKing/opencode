@@ -115,6 +115,7 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      let streamEventCount: number | undefined
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -609,6 +610,9 @@ const layer = Layer.effect(
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
+        yield* status.flush(ctx.sessionID)
+        if (streamEventCount === undefined) delete ctx.assistantMessage.streamEventCount
+        if (streamEventCount !== undefined) ctx.assistantMessage.streamEventCount = streamEventCount
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
@@ -658,14 +662,15 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             delete ctx.assistantMessage.streamEventCount
+            streamEventCount = undefined
             activity = { model: "preparing", userMessageID: activity.userMessageID }
             yield* publish()
-            yield* session.updateMessage(ctx.assistantMessage)
             const stream = llm.stream({
               ...streamInput,
               onStreamEventCount: (count) => {
                 const observedAt = count !== undefined && count > 0 ? Date.now() : undefined
                 return Effect.gen(function* () {
+                  streamEventCount = count
                   activity = {
                     userMessageID: activity.userMessageID,
                     model: count !== undefined && count > 0 ? "receiving" : "waiting",
@@ -673,9 +678,6 @@ const layer = Layer.effect(
                     lastStreamEventAt: observedAt,
                   }
                   yield* publish()
-                  if (count === undefined) delete ctx.assistantMessage.streamEventCount
-                  if (count !== undefined) ctx.assistantMessage.streamEventCount = count
-                  yield* session.updateMessage(ctx.assistantMessage)
                 })
               },
               onStreamEnd: Effect.gen(function* () {

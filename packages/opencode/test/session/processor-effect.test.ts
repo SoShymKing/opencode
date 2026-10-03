@@ -274,6 +274,7 @@ itArgumentActivity.live("session.processor receives tool argument deltas with un
     const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
     const model = yield* provider.getModel(ref.providerID, ref.modelID)
     const observed: unknown[] = []
+    const database = yield* Database.Service
     const off = yield* events.listen((event) => Effect.gen(function* () {
       if (event.type !== SessionStatus.Event.Status.type) return
       const data = Schema.decodeUnknownSync(Schema.toType(SessionStatus.Event.Status.data))(event.data)
@@ -283,7 +284,7 @@ itArgumentActivity.live("session.processor receives tool argument deltas with un
       const call = (yield* MessageV2.parts(msg.id)).find((part) => part.type === "tool")
       observed.push([activity.model, activity.streamEventCount, activity.lastStreamEventAt,
         argumentEvents.at(-1), call?.state.status])
-    }))
+    }).pipe(Effect.provideService(Database.Service, database)))
     const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
     yield* handle.process({ user: parent, sessionID: chat.id, model, agent: agent(), system: [], messages: [], tools: {} })
     yield* off
@@ -374,6 +375,58 @@ const boot = Effect.fn("test.boot")(function* () {
   const provider = yield* Provider.Service
   return { processors, session, provider }
 })
+
+let burstCheck: Effect.Effect<void> = Effect.void
+let burstOutcome: "success" | "error" | "cancel" = "success"
+const burstLLM = Layer.succeed(LLM.Service, LLM.Service.of({
+  stream: (input) => Stream.fromEffectDrain(Effect.gen(function* () {
+    for (let count = 0; count <= 200; count++) yield* input.onStreamEventCount?.(count) ?? Effect.void
+    yield* burstCheck
+    if (burstOutcome === "cancel") yield* Effect.interrupt
+  })).pipe(Stream.concat(Stream.suspend(() => Stream.make(burstOutcome === "error"
+    ? LLMEvent.providerError({ message: "burst failed" })
+    : LLMEvent.stepFinish({ index: 0, reason: "stop" }))))),
+}))
+const itBurst = testEffect(LayerNode.compile(root, [...replacements, [LLM.node, burstLLM]]))
+
+itBurst.live("session.processor raw burst writes final count only on success error and cancel", () =>
+  provideTmpdirInstance((dir) => Effect.gen(function* () {
+    const { processors, session, provider } = yield* boot()
+    const database = yield* Database.Service
+    const events = yield* EventV2Bridge.Service
+    const status = yield* SessionStatus.Service
+    for (const outcome of ["success", "error", "cancel"] as const) {
+      burstOutcome = outcome
+      const chat = yield* session.create({})
+      const parent = yield* user(chat.id, "burst")
+      const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+      const model = yield* provider.getModel(ref.providerID, ref.modelID)
+      const writes: Array<number | undefined> = []
+      const off = yield* events.listen((event) => Effect.sync(() => {
+        if (event.type !== MessageV2.Event.Updated.type) return
+        const data = Schema.decodeUnknownSync(Schema.toType(MessageV2.Event.Updated.data))(event.data)
+        if (data.info.id === msg.id && data.info.role === "assistant") writes.push(data.info.streamEventCount)
+      }))
+      const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+      burstCheck = Effect.gen(function* () {
+        expect(writes).toEqual([])
+        expect(handle.message.streamEventCount).toBeUndefined()
+        expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).not.toHaveProperty("streamEventCount")
+        expect(yield* status.get(chat.id)).toMatchObject({ type: "busy", activity: { streamEventCount: 200 } })
+      }).pipe(Effect.provideService(Database.Service, database), Effect.orDie)
+      const result = yield* handle.process({
+        user: parent, sessionID: chat.id, model, agent: agent(), system: [], messages: [], tools: {},
+      }).pipe(Effect.exit)
+      yield* off
+      expect(result._tag).toBe(outcome === "cancel" ? "Failure" : "Success")
+      expect(writes).toEqual(outcome === "success" ? [undefined, 200] : [200])
+      expect(handle.message.streamEventCount).toBe(200)
+      expect((yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })).info).toMatchObject({ streamEventCount: 200 })
+      yield* status.set(chat.id, { type: "idle" })
+    }
+    burstCheck = Effect.void
+  }), { config: cfg }),
+)
 
 // ---------------------------------------------------------------------------
 // Tests
