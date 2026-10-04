@@ -31,7 +31,7 @@ export function createTimelineModel(input: {
           refreshTimer = undefined
           if (input.sessionID() !== id) return
           untrack(() => {
-            if (stale) void sync().session.sync(id, { force: true })
+            if (stale) void sync().session.sync(id, { force: true, messageLimit: 20 })
           })
         }, 0)
       })

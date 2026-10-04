@@ -112,7 +112,7 @@ export const createDirSyncContext = (
           parts: input.parts,
         })
       },
-      async sync(sessionID: string, options?: { force?: boolean }) {
+      async sync(sessionID: string, options?: { force?: boolean; messageLimit?: number }) {
         await serverSync.session.sync(sessionID, options)
         index(sessionID)
       },

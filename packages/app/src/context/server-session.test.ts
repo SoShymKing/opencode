@@ -1553,6 +1553,70 @@ describe("server session", () => {
     expect(store.data.message.child).toEqual([older, latest])
   })
 
+  for (const cursor of [undefined, "cached-older-cursor"]) {
+    test(`preserves ${cursor ? "unfinished" : "complete"} pagination when a bounded refresh retains older history`, async () => {
+      const older = userMessage("message-1")
+      const latest = userMessage("message-2", { time: { created: 2 } })
+      const client = messageClient(
+        response([{ info: older, parts: [] }, { info: latest, parts: [] }], cursor),
+        response([{ info: latest, parts: [] }], "recent-tail-cursor"),
+        response(),
+      )
+      const store = createServerSession(client)
+      await store.sync("child")
+
+      await store.sync("child", { force: true, messageLimit: 1 })
+
+      expect(store.data.message.child).toEqual([older, latest])
+      expect(store.history.more("child")).toBe(cursor !== undefined)
+      await store.history.loadMore("child")
+      expect(client.requests).toEqual([
+        { sessionID: "child", limit: 20, before: undefined },
+        { sessionID: "child", limit: 1, before: undefined },
+        ...(cursor ? [{ sessionID: "child", limit: 200, before: cursor }] : []),
+      ])
+    })
+  }
+
+  test("uses new pagination when a bounded refresh replaces the cached prefix", async () => {
+    const cached = userMessage("message-2", { time: { created: 2 } })
+    const replacement = userMessage("message-1")
+    const client = messageClient(
+      response([{ info: cached, parts: [] }], "cached-older-cursor"),
+      response([{ info: replacement, parts: [] }], "replacement-cursor"),
+      response(),
+    )
+    const store = createServerSession(client)
+    await store.sync("child")
+
+    await store.sync("child", { force: true, messageLimit: 1 })
+
+    expect(store.data.message.child).toEqual([replacement])
+    await store.history.loadMore("child")
+    expect(client.requests.at(-1)).toEqual({ sessionID: "child", limit: 200, before: "replacement-cursor" })
+  })
+
+  test("uses new pagination when a bounded refresh only backfills a cached parent", async () => {
+    const parent = userMessage("message-1")
+    const assistant = assistantMessage("message-2", parent.id)
+    const client = rootMessageClient(
+      [
+        response([{ info: parent, parts: [] }, { info: assistant, parts: [] }]),
+        response([{ info: assistant, parts: [] }], "recent-tail-cursor"),
+        response(),
+      ],
+      [singleResponse(parent)],
+    )
+    const store = createServerSession(client)
+    await store.sync("child")
+
+    await store.sync("child", { force: true, messageLimit: 1 })
+
+    expect(store.history.more("child")).toBe(true)
+    await store.history.loadMore("child")
+    expect(client.requests.at(-1)).toEqual({ sessionID: "child", limit: 200, before: "recent-tail-cursor" })
+  })
+
   test("preserves loaded history during an incomplete refresh", async () => {
     const older = userMessage("message-1")
     const latest = userMessage("message-2", { time: { created: 2 } })
