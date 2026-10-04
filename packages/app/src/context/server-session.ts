@@ -712,6 +712,18 @@ export function createServerSession(
       preserveUnfetched,
       compare: compareMessages,
     })
+    const fetchedIDs = new Set(page.session.map((message) => message.id))
+    const cachedIDs = new Set((data.message[sessionID] ?? []).map((message) => message.id))
+    const retainPagination =
+      cleanupOrphans &&
+      !page.complete &&
+      meta.limit[sessionID] !== undefined &&
+      messages.some(
+        (message) =>
+          cachedIDs.has(message.id) &&
+          !fetchedIDs.has(message.id) &&
+          (typeof preserveUnfetched === "function" ? preserveUnfetched(message) : preserveUnfetched),
+      )
     batch(() => {
       if (source) setData("session_message", sessionID, reconcile(source))
       const messageIDs = replaceMessages(sessionID, messages)
@@ -724,8 +736,10 @@ export function createServerSession(
         orphanParts.delete(sessionID)
       }
       setMeta("limit", sessionID, messages.length)
-      setMeta("cursor", sessionID, merged.cursor)
-      setMeta("complete", sessionID, merged.complete)
+      if (!retainPagination) {
+        setMeta("cursor", sessionID, merged.cursor)
+        setMeta("complete", sessionID, merged.complete)
+      }
       setMeta("at", sessionID, Date.now())
     })
   }
