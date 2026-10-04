@@ -44,7 +44,6 @@ export function createTimelineProjection(input: {
     ),
   )
   const activeMessageID = createMemo(() => projection().activeMessageID)
-  const latestMessageID = createMemo(() => projection().latestMessageID)
   const rows = createMemo((previous: TimelineRow.TimelineRow[] | undefined) =>
     reuseTimelineRows(previous, projection().rows),
   )
@@ -74,7 +73,6 @@ export function createTimelineProjection(input: {
 
   return {
     activeMessageID,
-    latestMessageID,
     assistantMessagesByParent,
     lastAssistantGroupKey,
     messageByID,

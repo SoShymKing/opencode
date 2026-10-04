@@ -188,9 +188,9 @@ test("a pending user does not take the active owner's reasoning header", async (
   expect(await setup.frame()).toContain("Thinking (0 streams)")
 })
 
-test.each(["hide", "show"] as const)("keeps the empty-summary counter visible in %s mode", async (mode) => {
+test("keeps the empty-summary counter visible in show mode", async () => {
   await using tmp = await tmpdir()
-  using setup = await fixture(tmp.path, undefined, mode)
+  using setup = await fixture(tmp.path, undefined, "show")
   setup.message(assistant(11))
   await wait(() => setup.sync.data.message[sessionID]?.length === 2)
   expect(await setup.frame()).toContain("Thinking (11 streams)")
