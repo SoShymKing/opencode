@@ -2,7 +2,6 @@ import type {
   Config,
   OpencodeClient,
   Path,
-  PermissionRequest,
   Project,
   ProviderAuthResponse,
   QuestionRequest,
@@ -21,13 +20,12 @@ import type {
   ProjectListOutput,
   ReferenceListInput,
   ReferenceListOutput,
-  SessionApi,
 } from "@opencode-ai/client/promise"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { retry } from "@opencode-ai/core/util/retry"
 import { batch } from "solid-js"
-import { produce, reconcile, type SetStoreFunction, type Store } from "solid-js/store"
+import { reconcile, type SetStoreFunction, type Store } from "solid-js/store"
 import type { State, VcsCache } from "./types"
 import type { ServerSession } from "../server-session"
 import {
@@ -45,6 +43,7 @@ import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { normalizeSessionInfo } from "@/utils/session"
 import type { ServerProtocol } from "@/utils/server-protocol"
 import type { ServerApi } from "@/utils/server"
+type SessionApi = Pick<ServerApi["session"], "get">
 
 type GlobalStore = {
   ready: boolean
@@ -87,22 +86,6 @@ export function clearProviderRev(scope: ServerScope, directory: string) {
 
 function runAll(list: Array<() => Promise<unknown>>) {
   return Promise.allSettled(list.map((item) => item()))
-}
-
-function showErrors(input: {
-  errors: unknown[]
-  title: string
-  translate: (key: string, vars?: Record<string, string | number>) => string
-  formatMoreCount: (count: number) => string
-}) {
-  if (input.errors.length === 0) return
-  const message = formatServerError(input.errors[0], input.translate)
-  const more = input.errors.length > 1 ? input.formatMoreCount(input.errors.length - 1) : ""
-  showToast({
-    variant: "error",
-    title: input.title,
-    description: message + more,
-  })
 }
 
 export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, protocol?: Promise<ServerProtocol>) =>
@@ -327,6 +310,17 @@ export const loadReferencesQuery = (
     placeholderData: [],
   })
 
+export async function refreshDirectorySessionStatuses(input: {
+  sdk: OpencodeClient
+  session: ServerSession
+  directory: string
+}) {
+  const capture = input.session.snapshot.capture("session_status")
+  const statuses = (await input.sdk.session.status()).data ?? {}
+  input.session.snapshot.status(statuses, capture, input.directory)
+  await Promise.all(Object.keys(statuses).map((id) => input.session.resolve(id).catch(() => undefined)))
+}
+
 export async function bootstrapDirectory(input: {
   directory: string
   scope: ServerScope
@@ -387,27 +381,12 @@ export async function bootstrapDirectory(input: {
         retry(() =>
           (async () => {
             if ((await input.protocol) !== "v1") return
-            const x = await input.sdk.session.status()
             if (!input.session) {
+              const x = await input.sdk.session.status()
               input.setStore("session_status", x.data!)
               return
             }
-            const statuses = x.data ?? {}
-            input.session.set(
-              "session_status",
-              produce((draft) => {
-                for (const sessionID of Object.keys(draft)) {
-                  if (statuses[sessionID]) continue
-                  if (input.session?.get(sessionID)?.directory === input.directory) delete draft[sessionID]
-                }
-              }),
-            )
-            for (const [sessionID, status] of Object.entries(statuses)) {
-              input.session.set("session_status", sessionID, reconcile(status))
-            }
-            await Promise.all(
-              Object.keys(statuses).map((sessionID) => input.session!.resolve(sessionID).catch(() => undefined)),
-            )
+            await refreshDirectorySessionStatuses({ sdk: input.sdk, session: input.session, directory: input.directory })
           })(),
         ),
       !seededProject &&

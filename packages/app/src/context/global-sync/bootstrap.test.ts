@@ -6,6 +6,7 @@ import type { AgentApi, CatalogApi, CommandApi, ReferenceApi } from "@opencode-a
 import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import {
   bootstrapDirectory,
+  refreshDirectorySessionStatuses,
   loadAgentsQuery,
   loadCommands,
   loadGlobalConfigQuery,
@@ -17,6 +18,7 @@ import {
 import type { State, VcsCache } from "./types"
 import { ServerScope } from "@/utils/server-scope"
 import type { ServerApi } from "@/utils/server"
+import { createServerSession } from "../server-session"
 
 type ProjectApi = ServerApi["project"]
 
@@ -76,6 +78,20 @@ function directoryState() {
 }
 
 describe("bootstrapDirectory", () => {
+  test("keeps newer local status when the V1 directory status response is stale", async () => {
+    const pending = Promise.withResolvers<{ data: Record<string, { type: "busy" }> }>()
+    const started = Promise.withResolvers<void>()
+    const session = createServerSession({} as OpencodeClient)
+    session.remember({ id: "live", slug: "live", projectID: "project", directory: "/project", title: "live", version: "1", time: { created: 1, updated: 1 } })
+    const sdk = { session: { status: () => { started.resolve(); return pending.promise } } } as OpencodeClient
+    const refreshing = refreshDirectorySessionStatuses({ sdk, session, directory: "/project" })
+    await started.promise
+    session.set("session_status", "live", { type: "idle" })
+    pending.resolve({ data: { live: { type: "busy" } } })
+    await refreshing
+    expect(session.data.session_status.live).toEqual({ type: "idle" })
+  })
+
   test("uses legacy MCP endpoints while refreshing a v1 directory", async () => {
     const legacyConfigReads: string[] = []
     const mcpReads: string[] = []
