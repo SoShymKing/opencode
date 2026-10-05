@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test"
 import type { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi } from "@opencode-ai/client/promise"
+import type { NativeServerEvent } from "./server-sdk"
 import type { Message, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2/client"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2/client"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
+import { normalizeSessionMessages, type NativeSessionMessage } from "@/utils/session-message"
+import { unwrap } from "solid-js/store"
 
 type MessageApi = ServerApi["message"]
+type SessionApi = Pick<ServerApi["session"], "get" | "message">
 
 const session = (id: string, parentID?: string): Session => ({
   id,
@@ -70,6 +74,45 @@ const response = (data: MessageResponse["data"] = [], cursor?: string): MessageR
 const singleResponse = (info: Message, parts: Part[] = []): SingleMessageResponse => ({ data: { info, parts } })
 
 const deferredResponse = () => Promise.withResolvers<MessageResponse>()
+
+type NativePage = Awaited<ReturnType<MessageApi["list"]>>
+const nativeUser: NativeSessionMessage = { id: "msg_user", type: "user", text: "hello", time: { created: 1 } }
+const nativeAssistant = (content: Extract<NativeSessionMessage, { type: "assistant" }>["content"], extra: Partial<Extract<NativeSessionMessage, { type: "assistant" }>> = {}): NativeSessionMessage => ({
+  id: "msg_assistant", type: "assistant", agent: "build", model: { id: "model", providerID: "provider" }, content, time: { created: 2 }, ...extra,
+})
+const nativePage = (assistant: NativeSessionMessage, cursor?: string): NativePage => ({ data: [assistant, nativeUser], cursor: { next: cursor } })
+function nativeContext(...pages: (NativePage | Promise<NativePage>)[]) {
+  const calls: Parameters<MessageApi["list"]>[0][] = []
+  const waiting = new Map<number, () => void>()
+  let index = 0
+  const api: MessageApi = { list: async (input) => { calls.push(input); waiting.get(calls.length)?.(); return await pages[index++] } }
+  const sessionApi: SessionApi = {
+    get: async () => ({ id: "child", title: "child", projectID: "project", agent: "build", model: { id: "model", providerID: "provider" }, location: { directory: "/repo" }, time: { created: 1, updated: 1 }, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }),
+    message: async () => { throw new Error("unexpected parent read") },
+  }
+  return { store: createServerSession({} as OpencodeClient, sessionApi, api, { retry: retryImmediately }), sessionApi, calls, requested(count: number) { return calls.length >= count ? Promise.resolve() : new Promise<void>((resolve) => waiting.set(count, resolve)) } }
+}
+
+const nativeRecovered = nativeAssistant([
+  { type: "text", id: "text", text: "recovered" },
+  { type: "tool", id: "call", name: "read", state: { status: "completed", input: {}, structured: { done: true }, content: [{ type: "text", text: "output" }] }, time: { created: 2, ran: 2, completed: 3 } },
+], { finish: "stop", time: { created: 2, completed: 3 } })
+
+function missingNativeText(store: ReturnType<typeof nativeContext>["store"], messageID = "msg_assistant", textID = "text") {
+  store.applyV2({ id: `evt_missing_${messageID}`, type: "session.next.text.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: messageID, textID, text: "recovered" } })
+}
+
+function addPendingNativeInputs(store: ReturnType<typeof nativeContext>["store"], firstID = nativeUser.id) {
+  const inputs = [
+    { messageID: firstID, partID: "raw-first", text: "hello", created: 99 },
+    { messageID: "msg_second", partID: "raw-second", text: "second", created: 100 },
+  ]
+  for (const input of inputs) {
+    store.optimistic.add({ sessionID: "child", message: userMessage(input.messageID, { time: { created: input.created } }), parts: [textPart(input.messageID, { id: input.partID, text: input.text })] })
+    store.set("session_status", "child", { type: "busy" })
+    store.applyV2({ id: `evt_admit_${input.messageID}`, type: "session.next.prompt.admitted", data: { timestamp: input.created, sessionID: "child", messageID: input.messageID, prompt: { text: input.text }, delivery: "steer" } })
+  }
+}
 
 function messageClient(...responses: Array<MessageResponse | Promise<MessageResponse>>) {
   let index = 0
@@ -162,6 +205,462 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("keeps a newly started native assistant after held history releases", async () => {
+    const pending = Promise.withResolvers<NativePage>()
+    const initial = nativeAssistant([{ type: "text", id: "text", text: "old" }], { time: { created: 2, completed: 3 } })
+    const ctx = nativeContext(nativePage(initial), pending.promise)
+    await ctx.store.sync("child")
+    const history = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    ctx.store.applyV2({ id: "evt_start", type: "session.next.step.started", data: { timestamp: 4, sessionID: "child", assistantMessageID: "msg_new", agent: "build", model: { id: "model", providerID: "provider" } } })
+    ctx.store.applyV2({ id: "evt_text_start", type: "session.next.text.started", data: { timestamp: 5, sessionID: "child", assistantMessageID: "msg_new", textID: "new-text" } })
+    ctx.store.applyV2({ id: "evt_text_end", type: "session.next.text.ended", data: { timestamp: 6, sessionID: "child", assistantMessageID: "msg_new", textID: "new-text", text: "live new turn" } })
+    pending.resolve(nativePage(initial))
+    await history
+    expect(ctx.store.data.session_message.child.map((message) => message.id)).toEqual([nativeUser.id, "msg_assistant", "msg_new"])
+    expect(ctx.store.data.message.child?.find((message) => message.id === "msg_new")).toMatchObject({ role: "assistant", parentID: nativeUser.id })
+    expect(ctx.store.data.part.msg_new).toMatchObject([{ id: "msg_new:new-text", text: "live new turn" }])
+  })
+
+  test("ignores delayed native hydration after fresh history commits completed text and tool parts", async () => {
+    const page = Promise.withResolvers<NativePage>()
+    const hydration = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext(nativePage(nativeAssistant([])), page.promise)
+    ctx.sessionApi.message = () => hydration.promise
+    await ctx.store.sync("child")
+    const history = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    missingNativeText(ctx.store)
+    page.resolve(nativePage(nativeRecovered))
+    await history
+    hydration.resolve(nativeAssistant([]))
+    await hydration.promise
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toEqual(nativeRecovered)
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:call", callID: "call", state: { status: "completed", output: "output" } }, { id: "msg_assistant:text", text: "recovered" }])
+  })
+
+  test("ignores delayed native hydration after a live update mutates the existing Solid source object", async () => {
+    const hydration = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext(nativePage(nativeAssistant([{ type: "text", id: "text", text: "base" }])))
+    ctx.sessionApi.message = () => hydration.promise
+    await ctx.store.sync("child")
+    const previous = ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")
+    missingNativeText(ctx.store, "msg_assistant", "missing")
+    if (previous?.type === "assistant") previous.content.forEach((content) => {
+      if (content.type === "text") Object.assign(unwrap(content), { text: "live" })
+    })
+    ctx.store.data.part.msg_assistant.forEach((part) => {
+      if (part.type === "text") Object.assign(unwrap(part), { text: "live" })
+    })
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toBe(previous)
+    hydration.resolve(nativeAssistant([]))
+    await hydration.promise
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:text", text: "live" }])
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [{ id: "text", text: "live" }] })
+  })
+
+  test("ignores delayed native hydration from an older connection epoch", async () => {
+    const hydration = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext(nativePage(nativeAssistant([])))
+    ctx.sessionApi.message = () => hydration.promise
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    ctx.store.snapshot.connect()
+    hydration.resolve(nativeRecovered)
+    await hydration.promise
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [] })
+    expect(ctx.store.data.part.msg_assistant).toBeUndefined()
+  })
+
+  test("forced native history waits for older hydration before issuing its fresh read", async () => {
+    const hydration = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext(nativePage(nativeAssistant([])), nativePage(nativeRecovered))
+    ctx.sessionApi.message = () => hydration.promise
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    const history = ctx.store.sync("child", { force: true })
+    await Promise.resolve()
+    const readsBeforeHydration = ctx.calls.length
+    hydration.resolve(nativeAssistant([]))
+    await history
+    expect(readsBeforeHydration).toBe(1)
+    expect(ctx.calls.length).toBe(2)
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toEqual(nativeRecovered)
+  })
+
+  test("hydrates independent missing native messages and coalesces requests for the same message", async () => {
+    const first = Promise.withResolvers<NativeSessionMessage>()
+    const second = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext({ data: [nativeUser], cursor: {} })
+    const calls: string[] = []
+    ctx.sessionApi.message = (input) => { calls.push(input.messageID); return input.messageID === "msg_assistant" ? first.promise : second.promise }
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    missingNativeText(ctx.store, "msg_second")
+    missingNativeText(ctx.store)
+    first.resolve(nativeRecovered)
+    second.resolve(nativeAssistant([{ type: "text", id: "text", text: "second" }], { id: "msg_second", time: { created: 4, completed: 5 } }))
+    await Promise.all([first.promise, second.promise])
+    expect(calls).toEqual(["msg_assistant", "msg_second"])
+    expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual([nativeUser.id, "msg_assistant", "msg_second"])
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:call", callID: "call" }, { id: "msg_assistant:text", text: "recovered" }])
+    expect(ctx.store.data.part.msg_second).toMatchObject([{ id: "msg_second:text", text: "second" }])
+  })
+
+  test("positive native hydration projects a complete missing assistant snapshot", async () => {
+    const hydration = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext({ data: [nativeUser], cursor: {} })
+    const calls: Parameters<SessionApi["message"]>[0][] = []
+    ctx.sessionApi.message = (input) => { calls.push(input); return hydration.promise }
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    hydration.resolve(nativeRecovered)
+    await hydration.promise
+    expect(calls).toEqual([{ sessionID: "child", messageID: "msg_assistant" }])
+    expect(ctx.store.data.message.child?.find((message) => message.id === "msg_assistant")).toMatchObject({ role: "assistant", parentID: nativeUser.id, time: { completed: 3 } })
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:call", callID: "call", state: { status: "completed" } }, { id: "msg_assistant:text", text: "recovered" }])
+  })
+
+  test("old-generation hydration cannot commit or remove newer hydration bookkeeping after eviction", async () => {
+    const old = Promise.withResolvers<NativeSessionMessage>()
+    const fresh = Promise.withResolvers<NativeSessionMessage>()
+    const ctx = nativeContext({ data: [nativeUser], cursor: {} }, { data: [nativeUser], cursor: {} }, nativePage(nativeRecovered))
+    let calls = 0
+    ctx.sessionApi.message = () => (++calls === 1 ? old.promise : fresh.promise)
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    ctx.store.apply({ type: "session.deleted", properties: { sessionID: "child" } })
+    await ctx.store.sync("child")
+    missingNativeText(ctx.store)
+    old.resolve(nativeAssistant([]))
+    await old.promise
+    await Promise.resolve()
+    expect(ctx.store.data.session_message.child.map((message) => message.id)).toEqual([nativeUser.id])
+    const history = ctx.store.sync("child", { force: true })
+    await Promise.resolve()
+    const readsBeforeHydration = ctx.calls.length
+    fresh.resolve(nativeRecovered)
+    await history
+    expect(calls).toBe(2)
+    expect(readsBeforeHydration).toBe(2)
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toEqual(nativeRecovered)
+  })
+
+  test.each(["active-first", "history-first"])("settles inactive after matching promotion with another admitted local input pending: %s", async (order) => {
+    const page = Promise.withResolvers<NativePage>()
+    const active = Promise.withResolvers<Record<string, never>>()
+    const ctx = nativeContext(page.promise)
+    addPendingNativeInputs(ctx.store)
+    expect(ctx.store.data.session_message.child).toEqual([])
+    ctx.store.snapshot.connect()
+    const capture = ctx.store.snapshot.capture("session_status")
+    const history = ctx.store.sync("child", { force: true })
+    await ctx.requested(1)
+    if (order === "active-first") active.resolve({})
+    page.resolve(nativePage(nativeAssistant([], { finish: "stop", time: { created: 2, completed: 3 } })))
+    await history
+    if (order === "history-first") active.resolve({})
+    ctx.store.snapshot.status(await active.promise, capture)
+
+    expect(ctx.store.data.part[nativeUser.id]).toMatchObject([{ id: "msg_user:text:0", text: "hello" }])
+    expect(ctx.store.data.part.msg_second).toMatchObject([{ id: "raw-second", text: "second" }])
+    expect(ctx.store.data.message.child?.filter((message) => message.id === nativeUser.id)).toHaveLength(1)
+    expect(ctx.store.data.message.child?.some((message) => message.id === "msg_second")).toBe(true)
+    expect(ctx.store.data.session_message.child.map((message) => message.id)).toEqual([nativeUser.id, "msg_assistant"])
+    expect(ctx.store.data.session_working("child")).toBe(false)
+  })
+
+  test.each(["incoming", "retained"])("keeps genuine local waiting when the old canonical user is only %s", async (source) => {
+    const ctx = nativeContext({ data: source === "incoming" ? [nativeUser] : [], cursor: {} })
+    ctx.store.set("session_message", "child", [nativeUser])
+    addPendingNativeInputs(ctx.store, "msg_new")
+    ctx.store.snapshot.connect()
+    const capture = ctx.store.snapshot.capture("session_status")
+    await ctx.store.sync("child", { force: true })
+    ctx.store.snapshot.status({}, capture)
+
+    expect(ctx.store.data.session_working("child")).toBe(true)
+    expect(ctx.store.data.part.msg_new).toMatchObject([{ id: "raw-first", text: "hello" }])
+    expect(ctx.store.data.part.msg_second).toMatchObject([{ id: "raw-second", text: "second" }])
+  })
+
+  test.each(["local-before", "local-after", "wire", "epoch"])("vetoes promotion settlement after a newer %s change", async (change) => {
+    const page = Promise.withResolvers<NativePage>()
+    const ctx = nativeContext(page.promise)
+    addPendingNativeInputs(ctx.store)
+    ctx.store.snapshot.connect()
+    const capture = ctx.store.snapshot.capture("session_status")
+    const history = ctx.store.sync("child", { force: true })
+    await ctx.requested(1)
+    if (change === "local-before") ctx.store.set("session_status", "child", { type: "busy" })
+    page.resolve({ data: [nativeUser], cursor: {} })
+    await history
+    if (change === "local-after") ctx.store.set("session_status", "child", { type: "busy" })
+    if (change === "wire") ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } })
+    if (change === "epoch") ctx.store.snapshot.connect()
+    ctx.store.snapshot.status({}, capture)
+
+    expect(ctx.store.data.session_working("child")).toBe(true)
+    expect(ctx.store.data.part.msg_second).toMatchObject([{ id: "raw-second", text: "second" }])
+    if (change === "local-before" || change === "local-after") {
+      ctx.store.snapshot.status({}, ctx.store.snapshot.capture("session_status"))
+      expect(ctx.store.data.session_working("child")).toBe(true)
+    }
+  })
+
+  test("waits an older info request before forced fresh info and history reads", async () => {
+    const old = Promise.withResolvers<{ data: Session }>()
+    const calls: string[] = []
+    const client = createOpencodeClient({ baseUrl: "http://fixture", fetch: Object.assign(async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input)
+      if (url.pathname.endsWith("/message")) { calls.push("history"); return Response.json([]) }
+      calls.push("info")
+      return Response.json(calls.length === 1 ? (await old.promise).data : session("child"))
+    }, { preconnect: fetch.preconnect }) })
+    const store = createServerSession(client)
+    const resolving = store.resolve("child")
+    const forced = store.sync("child", { force: true })
+    await Promise.resolve()
+    old.resolve({ data: session("child") })
+    await Promise.all([resolving, forced])
+    expect(calls).toEqual(["info", "info", "history"])
+  })
+
+  test("does not treat native Step.ended as drain settlement", () => {
+    const ctx = nativeContext()
+    ctx.store.applyV2({ id: "evt_start", type: "session.next.step.started", data: { timestamp: 2, sessionID: "child", assistantMessageID: "msg_step", agent: "build", model: { id: "model", providerID: "provider" } } })
+    const capture = ctx.store.snapshot.capture("session_status")
+    ctx.store.applyV2({ id: "evt_end", type: "session.next.step.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_step", finish: "tool-calls", cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } })
+    ctx.store.snapshot.status({}, capture)
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy" })
+  })
+
+  test("distinguishes queued local waiting from observed native execution", () => {
+    const ctx = nativeContext()
+    ctx.store.optimistic.add({ sessionID: "child", message: userMessage("msg_queue"), parts: [textPart("msg_queue")] })
+    ctx.store.set("session_status", "child", { type: "busy" })
+    ctx.store.snapshot.status({}, ctx.store.snapshot.capture("session_status"))
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy" })
+    ctx.store.applyV2({ id: "evt_start", type: "session.next.step.started", data: { timestamp: 2, sessionID: "child", assistantMessageID: "msg_step", agent: "build", model: { id: "model", providerID: "provider" } } })
+    ctx.store.snapshot.status({}, ctx.store.snapshot.capture("session_status"))
+    expect(ctx.store.data.session_status.child).toBeUndefined()
+    expect(ctx.store.data.part.msg_queue).toBeDefined()
+  })
+
+  test("preserves a new local provisional busy write after older observed execution", () => {
+    const ctx = nativeContext()
+    ctx.store.applyV2({ id: "evt_start", type: "session.next.step.started", data: { timestamp: 2, sessionID: "child", assistantMessageID: "msg_step", agent: "build", model: { id: "model", providerID: "provider" } } })
+    ctx.store.optimistic.add({ sessionID: "child", message: userMessage("msg_waiting"), parts: [textPart("msg_waiting")] })
+    ctx.store.set("session_status", "child", { type: "busy" })
+    ctx.store.snapshot.status({}, ctx.store.snapshot.capture("session_status"))
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy" })
+  })
+
+  test("caps native reads and retains older pages after forced refresh", async () => {
+    const older: NativeSessionMessage = { id: "msg_older", type: "user", text: "older", time: { created: 0 } }
+    const ctx = nativeContext(nativePage(nativeAssistant([{ type: "text", id: "text", text: "initial" }]), "older"), { data: [older], cursor: {} }, nativePage(nativeAssistant([{ type: "text", id: "text", text: "fresh" }])))
+    await ctx.store.sync("child", { messageLimit: 4096 })
+    await ctx.store.history.loadMore("child", 4096)
+    await ctx.store.sync("child", { force: true, messageLimit: 4096 })
+    expect(ctx.calls.map((call) => call?.limit)).toEqual([200, 200, 200])
+    expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual([older.id, nativeUser.id, "msg_assistant"])
+  })
+
+  test("merges live native fields without losing fetched unrelated content or rich tool state", async () => {
+    const pending = Promise.withResolvers<NativePage>()
+    const tool = { type: "tool", id: "call", name: "read", state: { status: "running", input: {}, structured: {}, content: [] }, time: { created: 2, ran: 2 } } as const
+    const initial = nativeAssistant([{ type: "text", id: "text", text: "base" }, tool])
+    const ctx = nativeContext(nativePage(initial), pending.promise)
+    await ctx.store.sync("child")
+    const loading = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    ctx.store.applyV2({ id: "evt_text", type: "session.next.text.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", text: "LIVE" } })
+    ctx.store.applyV2({ id: "evt_tool", type: "session.next.tool.success", data: { timestamp: 4, sessionID: "child", assistantMessageID: "msg_assistant", callID: "call", structured: { live: true }, content: [{ type: "text", text: "output" }], result: { kept: true }, provider: { executed: false } } })
+    pending.resolve(nativePage(nativeAssistant([{ type: "text", id: "text", text: "fetched" }, { type: "reasoning", id: "reason", text: "recovered" }, { ...tool, provider: { executed: false, metadata: { rich: { value: 1 } } } }], { cost: 9 })))
+    await loading
+    const source = ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")
+    expect(source).toMatchObject({ cost: 9, content: [{ id: "text", text: "LIVE" }, { id: "reason", text: "recovered" }, { id: "call", provider: { metadata: { rich: { value: 1 } } }, state: { status: "completed", structured: { live: true }, result: { kept: true } } }] })
+    ctx.store.applyV2({ id: "evt_meta", type: "session.next.step.ended", data: { timestamp: 5, sessionID: "child", assistantMessageID: "msg_assistant", finish: "tool-calls", cost: 10, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } })
+    const projection = normalizeSessionMessages("child", ctx.store.data.session_message.child)
+    expect(ctx.store.data.part.msg_assistant).toEqual((projection.parts.get("msg_assistant") ?? []).toSorted((left, right) => left.id.localeCompare(right.id)))
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy" })
+  })
+
+  test.each([
+    ["base", "base suffix", "base suffix"],
+    ["base su", "base suffix", "base suffix"],
+    ["base suffix", "base suffix", undefined],
+    ["different", "different", undefined],
+    ["", "", undefined],
+  ])("selects native delta suffix against HTTP %s", async (fetched, expected, accumulator) => {
+    const ctx = nativeContext(nativePage(nativeAssistant([{ type: "text", id: "text", text: "base" }])), nativePage(nativeAssistant([{ type: "text", id: "text", text: fetched }])))
+    await ctx.store.sync("child")
+    ctx.store.applyV2({ id: "evt_delta", type: "session.next.text.delta", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", delta: " suffix" } })
+    await ctx.store.sync("child", { force: true })
+    if (expected) expect(ctx.store.data.part.msg_assistant).toMatchObject([{ text: expected }])
+    if (!expected) expect(ctx.store.data.part.msg_assistant).toBeUndefined()
+    if (accumulator) expect(ctx.store.data.part_text_accum_delta["msg_assistant:text"]).toBe(accumulator)
+    if (!accumulator) expect(ctx.store.data.part_text_accum_delta["msg_assistant:text"]).toBeUndefined()
+    const source = ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")
+    expect(source).toMatchObject({ content: [{ text: expected }] })
+  })
+
+  test("confirms incoming native user IDs once while preserving queued raw inputs", async () => {
+    const ctx = nativeContext({ data: [nativeUser], cursor: {} }, { data: [], cursor: {} })
+    ctx.store.optimistic.add({ sessionID: "child", message: userMessage(nativeUser.id, { time: { created: 99 } }), parts: [textPart(nativeUser.id, { id: "raw", text: "raw" })] })
+    ctx.store.optimistic.add({ sessionID: "child", message: userMessage("msg_queued"), parts: [textPart("msg_queued", { id: "queued", text: "queued" })] })
+    await ctx.store.sync("child")
+    expect(ctx.store.data.part[nativeUser.id]).toMatchObject([{ id: "msg_user:text:0", text: "hello" }])
+    ctx.store.optimistic.remove({ sessionID: "child", messageID: nativeUser.id })
+    expect(ctx.store.data.message.child?.some((message) => message.id === nativeUser.id)).toBe(true)
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.data.part.msg_queued).toMatchObject([{ id: "queued", text: "queued" }])
+  })
+
+  test("preserves native reasoning suffix and tombstones without restoring omitted content", async () => {
+    const initial = nativeAssistant([{ type: "reasoning", id: "reason", text: "base" }, { type: "text", id: "removed", text: "remove" }])
+    const ctx = nativeContext(nativePage(initial), nativePage(initial), nativePage(nativeAssistant([])))
+    await ctx.store.sync("child")
+    ctx.store.applyV2({ id: "evt_reason", type: "session.next.reasoning.delta", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", reasoningID: "reason", delta: " suffix" } })
+    ctx.store.apply({ type: "message.part.removed", properties: { sessionID: "child", messageID: "msg_assistant", partID: "msg_assistant:removed" } })
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:reason", text: "base suffix" }])
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.data.part.msg_assistant).toBeUndefined()
+    expect(ctx.store.data.part_text_accum_delta["msg_assistant:reason"]).toBeUndefined()
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [] })
+  })
+
+  test("keeps a known native suffix when the original HTTP content has an empty prefix", async () => {
+    const empty = nativeAssistant([{ type: "text", id: "text", text: "" }])
+    const ctx = nativeContext(nativePage(empty), nativePage(empty))
+    await ctx.store.sync("child")
+    ctx.store.applyV2({ id: "evt_delta", type: "session.next.text.delta", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", delta: "known" } })
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ id: "msg_assistant:text", text: "known" }])
+    expect(ctx.store.data.part_text_accum_delta["msg_assistant:text"]).toBe("known")
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [{ id: "text", text: "known" }] })
+  })
+
+  test("preserves live source fields through native older-root cursor extension", async () => {
+    const first = Promise.withResolvers<NativePage>()
+    const root = Promise.withResolvers<NativePage>()
+    const initial = nativeAssistant([{ type: "text", id: "text", text: "base" }])
+    const ctx = nativeContext(nativePage(initial), first.promise, root.promise)
+    await ctx.store.sync("child")
+    const loading = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    ctx.store.applyV2({ id: "evt_text", type: "session.next.text.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", text: "live" } })
+    first.resolve({ data: [initial], cursor: { next: "root" } })
+    await ctx.requested(3)
+    ctx.store.applyV2({ id: "evt_meta", type: "session.next.step.ended", data: { timestamp: 5, sessionID: "child", assistantMessageID: "msg_assistant", finish: "tool-calls", cost: 10, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } } })
+    root.resolve({ data: [nativeUser], cursor: {} })
+    await loading
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ finish: "tool-calls", content: [{ id: "text", text: "live" }] })
+    expect(ctx.calls[2]).toEqual({ sessionID: "child", limit: 2, cursor: "root" })
+  })
+
+  test("native retry discards failed full values but retains known deltas", async () => {
+    const failed = Promise.withResolvers<NativePage>()
+    const retried = Promise.withResolvers<NativePage>()
+    const initial = nativeAssistant([{ type: "text", id: "full", text: "base" }, { type: "reasoning", id: "delta", text: "base" }])
+    const ctx = nativeContext(nativePage(initial), failed.promise, retried.promise)
+    await ctx.store.sync("child")
+    const loading = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    ctx.store.applyV2({ id: "evt_text", type: "session.next.text.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "full", text: "failed live" } })
+    ctx.store.applyV2({ id: "evt_delta", type: "session.next.reasoning.delta", data: { timestamp: 4, sessionID: "child", assistantMessageID: "msg_assistant", reasoningID: "delta", delta: " suffix" } })
+    failed.reject(new Error("retry"))
+    await ctx.requested(3)
+    retried.resolve(nativePage(nativeAssistant([{ type: "text", id: "full", text: "retry fresh" }, { type: "reasoning", id: "delta", text: "base" }])))
+    await loading
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [{ id: "full", text: "retry fresh" }, { id: "delta", text: "base suffix" }] })
+  })
+
+  test("native cursor retry keeps pre-extension values but discards failed extension full text", async () => {
+    const first = Promise.withResolvers<NativePage>()
+    const failed = Promise.withResolvers<NativePage>()
+    const retried = Promise.withResolvers<NativePage>()
+    const initial = nativeAssistant([{ type: "text", id: "text", text: "base" }])
+    const ctx = nativeContext(nativePage(initial), first.promise, failed.promise, retried.promise)
+    await ctx.store.sync("child")
+    const loading = ctx.store.sync("child", { force: true })
+    await ctx.requested(2)
+    ctx.store.applyV2({ id: "evt_baseline", type: "session.next.text.ended", data: { timestamp: 3, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", text: "baseline live" } })
+    first.resolve({ data: [initial], cursor: { next: "root" } })
+    await ctx.requested(3)
+    ctx.store.applyV2({ id: "evt_failed", type: "session.next.text.ended", data: { timestamp: 4, sessionID: "child", assistantMessageID: "msg_assistant", textID: "text", text: "failed extension" } })
+    failed.reject(new Error("retry"))
+    await ctx.requested(4)
+    retried.resolve({ data: [nativeUser], cursor: {} })
+    await loading
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ text: "baseline live" }])
+    expect(ctx.store.data.session_message.child.find((message) => message.id === "msg_assistant")).toMatchObject({ content: [{ text: "baseline live" }] })
+  })
+
+  test("a promoted native input clears raw optimistic IDs but admission alone does not", () => {
+    const ctx = nativeContext()
+    ctx.store.optimistic.add({ sessionID: "child", message: userMessage(nativeUser.id, { time: { created: 99 } }), parts: [textPart(nativeUser.id, { id: "raw" })] })
+    ctx.store.applyV2({ id: "evt_admit", type: "session.next.prompt.admitted", data: { timestamp: 2, sessionID: "child", messageID: nativeUser.id, prompt: { text: "hello" }, delivery: "queue" } })
+    expect(ctx.store.data.part[nativeUser.id]).toMatchObject([{ id: "raw" }])
+    expect(ctx.store.data.session_message.child).toEqual([])
+    ctx.store.applyV2({ id: "evt_promote", type: "session.next.prompted", data: { timestamp: 3, sessionID: "child", messageID: nativeUser.id, prompt: { text: "hello" }, delivery: "queue" } })
+    ctx.store.optimistic.remove({ sessionID: "child", messageID: nativeUser.id })
+    expect(ctx.store.data.part[nativeUser.id]).toMatchObject([{ id: "msg_user:text:0", text: "hello" }])
+    expect(ctx.store.data.message.child?.map((message) => ({ id: message.id, created: message.time.created }))).toEqual([{ id: nativeUser.id, created: 3 }])
+  })
+
+  test("forces a fresh read after an older sync finishes", async () => {
+    const older = deferredResponse()
+    const client = messageClient(older.promise, response([{ info: userMessage("fresh"), parts: [] }]))
+    const store = createServerSession(client)
+    const first = store.sync("child")
+    await client.requested(1)
+    const forced = store.sync("child", { force: true })
+    older.resolve(response([{ info: userMessage("old"), parts: [] }]))
+    await Promise.all([first, forced])
+    expect(client.requests.length).toBe(2)
+    expect(store.data.message.child?.map((item) => item.id)).toEqual(["fresh"])
+  })
+
+  test("forces a fresh read after an older history prepend finishes", async () => {
+    const older = deferredResponse()
+    const client = messageClient(response([{ info: userMessage("latest"), parts: [] }], "cursor"), older.promise, response())
+    const store = createServerSession(client)
+    await store.sync("child")
+    const prepend = store.history.loadMore("child")
+    await client.requested(2)
+    const forced = store.sync("child", { force: true })
+    older.resolve(response([{ info: userMessage("older", { time: { created: 0 } }), parts: [] }], "next"))
+    await Promise.all([prepend, forced])
+    expect(client.requests.length).toBe(3)
+    expect(store.history.loading("child")).toBe(false)
+  })
+
+  test("guards status snapshots against local writes and connection epochs", () => {
+    const store = createServerSession({} as OpencodeClient)
+    store.set("session_status", "stale", { type: "retry", attempt: 1, message: "retry", next: 10 })
+    const capture = store.snapshot.capture("session_status")
+    store.set("session_status", "local", { type: "busy" })
+    store.snapshot.status({}, capture)
+    expect(store.data.session_status.stale).toBeUndefined()
+    expect(store.data.session_status.local).toEqual({ type: "busy" })
+    const old = store.snapshot.capture("session_status")
+    store.snapshot.connect()
+    store.snapshot.status({ local: { type: "idle" } }, old)
+    expect(store.data.session_status.local).toEqual({ type: "busy" })
+  })
+
+  test("guards older status responses after a newer snapshot commits", () => {
+    const store = createServerSession({} as OpencodeClient)
+    store.set("session_status", "child", { type: "busy" })
+    const older = store.snapshot.capture("session_status")
+    const newer = store.snapshot.capture("session_status")
+    store.snapshot.status({}, newer)
+    store.snapshot.status({ child: { type: "busy" } }, older)
+    expect(store.data.session_status.child).toBeUndefined()
+  })
+
   test("projects V2 session events into current and legacy message state", () => {
     const ctx = setup({ child: session("child") })
     ctx.store.remember(session("child"))
@@ -173,16 +672,16 @@ describe("server session", () => {
         time: { created: 1 },
       },
     ])
-    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+    const apply = (input: NativeServerEvent) => ctx.store.applyV2(input)
 
     apply({
       id: "evt_step",
-      created: 2,
-      type: "session.step.started",
+      type: "session.next.step.started",
       durable: { aggregateID: "child", seq: 1, version: 1 },
       location: { directory: "/repo" },
       data: {
         sessionID: "child",
+        timestamp: 2,
         assistantMessageID: "msg_2_assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
@@ -190,18 +689,16 @@ describe("server session", () => {
     })
     apply({
       id: "evt_text_start",
-      created: 3,
-      type: "session.text.started",
+      type: "session.next.text.started",
       durable: { aggregateID: "child", seq: 2, version: 1 },
       location: { directory: "/repo" },
-      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0 },
+      data: { sessionID: "child", timestamp: 3, assistantMessageID: "msg_2_assistant", textID: "txt_1" },
     })
     apply({
       id: "evt_text_delta",
-      created: 4,
-      type: "session.text.delta",
+      type: "session.next.text.delta",
       location: { directory: "/repo" },
-      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "world" },
+      data: { sessionID: "child", timestamp: 4, assistantMessageID: "msg_2_assistant", textID: "txt_1", delta: "world" },
     })
 
     expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
@@ -241,7 +738,7 @@ describe("server session", () => {
       type: "assistant",
       agent: "build",
       model: { id: "model", providerID: "provider" },
-      content: [{ type: "text", text: "hi" }],
+      content: [{ type: "text", id: "txt_1", text: "hi" }],
       time: { created: 2, completed: 3 },
     }
     const client = {
@@ -274,7 +771,7 @@ describe("server session", () => {
       type: "assistant" as const,
       agent: "build",
       model: { id: "model", providerID: "provider" },
-      content: [{ type: "text" as const, text: id }],
+      content: [{ type: "text" as const, id: "txt_1", text: id }],
       time: { created, completed: created },
     })
     const assistants = [
