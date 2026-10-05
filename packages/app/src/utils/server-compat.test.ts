@@ -74,6 +74,7 @@ describe("createCompatibleApi", () => {
       text: "hello @src/index.ts",
       agent: "build",
       model: { providerID: "provider", modelID: "model" },
+      variant: "selected",
       files: [
         { uri: "file:///repo/src/index.ts", name: "index.ts", mention: { text: "@src/index.ts", start: 6, end: 19 } },
         { uri: "data:text/plain;base64,aGVsbG8=", name: "notes.txt" },
@@ -86,6 +87,7 @@ describe("createCompatibleApi", () => {
       messageID: "msg_1",
       agent: "build",
       model: { providerID: "provider", modelID: "model" },
+      variant: "selected",
       parts: [
         { type: "text", text: "hello @src/index.ts" },
         {
