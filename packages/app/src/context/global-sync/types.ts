@@ -15,7 +15,8 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
-import type { CommandInfo, McpResource, McpServer, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { CommandInfo, McpResource, McpServer } from "@opencode-ai/client/promise"
+import type { NativeSessionMessage } from "@/utils/session-message"
 import type { Accessor } from "solid-js"
 import type { SetStoreFunction, Store } from "solid-js/store"
 
@@ -75,7 +76,7 @@ export type State = {
     [sessionID: string]: Message[]
   }
   session_message: {
-    [sessionID: string]: SessionMessageInfo[]
+    [sessionID: string]: NativeSessionMessage[]
   }
   part: {
     [messageID: string]: Part[]
