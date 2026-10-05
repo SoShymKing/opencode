@@ -10,7 +10,7 @@ import type {
 import { QueryClient } from "@tanstack/solid-query"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses, recoverSessionConnection, createNativeSessionPoller } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
@@ -66,6 +66,157 @@ describe("MCP queries", () => {
 })
 
 describe("active session query", () => {
+  test("seeds fresh active presence while retained history is still loading", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const statuses = Promise.withResolvers<Record<string, { type: "busy" }>>()
+    const read = Promise.withResolvers<void>()
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async () => { started.resolve(); await history.promise } },
+      statuses: async () => { const value = await statuses.promise; read.resolve(); return value },
+      capture: session.snapshot.capture("session_status"),
+    })
+    await started.promise
+    statuses.resolve({ active: { type: "busy" } })
+    await read.promise
+    await Promise.resolve()
+    expect(session.data.session_status.active).toEqual({ type: "busy" })
+    history.resolve()
+    await recovery
+  })
+
+  test.each(["wire", "epoch", "local"])("settlement keeps newer %s writes while final history is loading", async (mode) => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("session_status", "running", { type: "busy" })
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async () => { started.resolve(); await history.promise } },
+      statuses: async () => ({}),
+      capture: session.snapshot.capture("session_status"),
+      settleOnly: true,
+    })
+    await started.promise
+    if (mode === "wire") session.applyV2({ id: "evt_step", type: "session.next.step.started", data: { timestamp: 2, sessionID: "running", assistantMessageID: "msg_step", agent: "build", model: { id: "model", providerID: "provider" } } })
+    if (mode === "epoch") session.snapshot.connect()
+    if (mode === "local") session.set("session_status", "running", { type: "retry", attempt: 2, message: "newer", next: 10 })
+    history.resolve()
+    await recovery
+    expect(session.data.session_status.running).toEqual(mode === "local" ? { type: "retry", attempt: 2, message: "newer", next: 10 } : { type: "busy" })
+  })
+
+  test("recovers off-page retained history before clearing absent busy state", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    session.set("session_status", "cached", { type: "busy" })
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const calls: string[] = []
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async (id, options) => { calls.push(id); expect(options?.force).toBe(true); started.resolve(); await history.promise } },
+      statuses: async () => ({}),
+      capture: session.snapshot.capture("session_status"),
+    })
+    await started.promise
+    expect(session.data.session_status.cached).toEqual({ type: "busy" })
+    history.resolve()
+    await recovery
+    expect(calls).toEqual(["cached"])
+    expect(session.data.session_status.cached).toBeUndefined()
+  })
+
+  test("failed active reads still refresh retained history without clearing status", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    session.set("session_status", "cached", { type: "retry", attempt: 1, message: "retry", next: 1 })
+    const calls: string[] = []
+    await expect(recoverSessionConnection({
+      session: { ...session, sync: async (id) => { calls.push(id) } },
+      statuses: async () => { throw new Error("offline") },
+      capture: session.snapshot.capture("session_status"),
+    })).rejects.toThrow("offline")
+    expect(calls).toEqual(["cached"])
+    expect(session.data.session_status.cached.type).toBe("retry")
+  })
+
+  test("native poller keeps one request, aborts on timeout, and cleans up", async () => {
+    const tasks = new Map<() => void, number>()
+    const pending = Promise.withResolvers<void>()
+    const finished = Promise.withResolvers<void>()
+    const signals: AbortSignal[] = []
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => 1,
+      poll: async (signal) => { signals.push(signal); await pending.promise; finished.resolve() },
+      schedule: (task, ms) => { tasks.set(task, ms); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    expect(tick).toBeDefined()
+    tick?.()
+    poller.start()
+    expect(signals.length).toBe(1)
+    const timeout = [...tasks].find(([, ms]) => ms === 10000)?.[0]
+    timeout?.()
+    expect(signals[0].aborted).toBe(true)
+    poller.dispose()
+    pending.resolve()
+    await finished.promise
+    expect(tasks.size).toBe(0)
+    expect(signals.length).toBe(1)
+  })
+
+  test("native poller retries failed membership reads only at the next fixed cadence", async () => {
+    const tasks = new Map<() => void, number>()
+    const scheduled = Promise.withResolvers<() => void>()
+    let calls = 0
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => 1,
+      poll: async () => { calls++; throw new Error("offline") },
+      schedule: (task, ms) => { tasks.set(task, ms); if (calls > 0 && ms === 1000) scheduled.resolve(task); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    tick?.()
+    const retry = await scheduled.promise
+    expect(calls).toBe(1)
+    expect(tasks.get(retry)).toBe(1000)
+    poller.dispose()
+    retry()
+    expect(calls).toBe(1)
+    expect(tasks.size).toBe(0)
+  })
+
+  test("native poller aborts an old connection request before scheduling the next epoch", async () => {
+    const tasks = new Map<() => void, number>()
+    const scheduled = Promise.withResolvers<() => void>()
+    const pending = Promise.withResolvers<void>()
+    const signals: AbortSignal[] = []
+    let epoch = 1
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => epoch,
+      poll: async (signal) => { signals.push(signal); await pending.promise },
+      schedule: (task, ms) => { tasks.set(task, ms); if (epoch === 2 && ms === 1000) scheduled.resolve(task); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    tick?.()
+    epoch = 2
+    poller.reset()
+    expect(signals[0].aborted).toBe(true)
+    expect(signals.length).toBe(1)
+    const next = await scheduled.promise
+    next()
+    expect(signals.length).toBe(2)
+    poller.dispose()
+    pending.resolve()
+    expect(signals[1].aborted).toBe(true)
+  })
+
   test("loads active sessions immediately and once per server cache", async () => {
     let calls = 0
     const queryClient = new QueryClient()

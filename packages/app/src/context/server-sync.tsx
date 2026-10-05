@@ -8,8 +8,8 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { type Accessor, batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
-import { createStore, produce, reconcile } from "solid-js/store"
+import { type Accessor, batch, createEffect, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
+import { createStore, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
 import { ServerSDK } from "./server-sdk"
@@ -43,11 +43,10 @@ import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
-import { retry } from "@opencode-ai/core/util/retry"
 import type { ServerScope } from "@/utils/server-scope"
 import { createHomeSessionIndexCache } from "./global-sync/home-session-index"
 import { persisted } from "@/utils/persist"
-import type { ServerApi } from "@/utils/server"
+import type { CompatibleApi } from "@/utils/server-compat"
 import type {
   McpListInput,
   McpListOutput,
@@ -176,10 +175,102 @@ export function seedActiveSessionStatuses(
   }
 }
 
+export async function recoverSessionConnection(input: {
+  session: Pick<ServerSession, "data" | "set" | "snapshot" | "retained" | "sync">
+  statuses: () => Promise<Record<string, SessionStatus>>
+  capture: ReturnType<ServerSession["snapshot"]["capture"]>
+  settleOnly?: boolean
+  signal?: AbortSignal
+}) {
+  const current = () => !input.signal?.aborted && input.capture.epoch === input.session.snapshot.epoch()
+  const revisions = new Map(input.capture.revisions)
+  const retained = input.session.retained()
+  const history = input.settleOnly ? [] : retained.map((id) => input.session.sync(id, { force: true }))
+  const read = input.statuses().then((statuses) => {
+    if (!current()) return statuses
+    for (const id of Object.keys(statuses)) {
+      if (!input.session.snapshot.current(input.capture, id) || input.session.data.session_status[id] !== undefined) continue
+      input.session.set("session_status", id, statuses[id])
+      revisions.set(id, input.session.snapshot.capture("session_status").revisions.get(id) ?? 0)
+    }
+    return statuses
+  })
+  const result = await Promise.allSettled([read, ...history])
+  const statusResult = result[0]
+  if (statusResult.status === "rejected") throw statusResult.reason
+  const statuses = statusResult.value
+  if (!current()) return statuses
+  const failure = result.find((item) => item.status === "rejected")
+  if (failure?.status === "rejected") throw failure.reason
+  const extra = input.settleOnly
+    ? retained.filter((id) => !statuses[id] && input.session.data.session_status[id]?.type !== "idle")
+    : Object.keys(statuses).filter((id) => !retained.includes(id))
+  await Promise.all(extra.map((id) => input.session.sync(id, { force: true })))
+  if (current()) input.session.snapshot.status(statuses, { ...input.capture, revisions })
+  return statuses
+}
+
+export function createNativeSessionPoller(input: {
+  needed: () => boolean
+  epoch: () => number
+  poll: (signal: AbortSignal) => Promise<unknown>
+  schedule?: (task: () => void, ms: number) => () => void
+}) {
+  const schedule = input.schedule ?? ((task, ms) => {
+    const timer = setTimeout(task, ms)
+    return () => clearTimeout(timer)
+  })
+  let cancel: (() => void) | undefined
+  let controller: AbortController | undefined
+  let cancelTimeout: (() => void) | undefined
+  let disposed = false
+  const start = () => {
+    if (disposed || cancel || controller || !input.needed()) return
+    cancel = schedule(() => {
+      cancel?.()
+      cancel = undefined
+      if (disposed || !input.needed()) return
+      const epoch = input.epoch()
+      const request = new AbortController()
+      controller = request
+      const timeout = schedule(() => request.abort(), 10_000)
+      cancelTimeout = timeout
+      const aborted = new Promise<void>((resolve) => request.signal.addEventListener("abort", () => resolve(), { once: true }))
+      void Promise.race([input.poll(request.signal), aborted]).then(() => undefined, () => undefined).finally(() => {
+        timeout()
+        if (cancelTimeout === timeout) cancelTimeout = undefined
+        if (controller !== request) return
+        controller = undefined
+        if (epoch !== input.epoch()) request.abort()
+        start()
+      })
+    }, 1000)
+  }
+  return {
+    start,
+    reset() {
+      cancel?.()
+      cancel = undefined
+      controller?.abort()
+      cancelTimeout?.()
+      cancelTimeout = undefined
+      start()
+    },
+    dispose() {
+      disposed = true
+      cancel?.()
+      cancel = undefined
+      controller?.abort()
+      cancelTimeout?.()
+      cancelTimeout = undefined
+    },
+  }
+}
+
 function makeQueryOptionsApi(
   scope: ServerScope,
   serverSDK: () => OpencodeClient,
-  serverAPI: ServerApi,
+  serverAPI: CompatibleApi,
   sdkFor: (dir: PathKey) => OpencodeClient,
   protocol: Promise<"v1" | "v2">,
 ) {
@@ -238,27 +329,62 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
     queries: [queryOptionsApi.globalConfig(), queryOptionsApi.providers(null), queryOptionsApi.path(null)],
   }))
-  const activeSessionsQuery = useQuery(() =>
+  let native = false
+  const nativeActive = new Set<string>()
+  const lifetime = new AbortController()
+  let activeRequest: { epoch: number; controller: AbortController; promise: Promise<SessionActiveOutput> } | undefined
+  onCleanup(() => lifetime.abort())
+  const readStatuses = async (signal?: AbortSignal): Promise<Record<string, SessionStatus>> => {
+    native = (await serverSDK.protocol) !== "v1"
+    if (!native) return (await serverSDK.client.session.status(undefined, { signal })).data ?? {}
+    const epoch = session.snapshot.epoch()
+    const request = (() => {
+      if (activeRequest?.epoch === epoch) return activeRequest.promise
+      activeRequest?.controller.abort()
+      const controller = new AbortController()
+      const combined = AbortSignal.any([lifetime.signal, controller.signal, ...(signal ? [signal] : [])])
+      combined.throwIfAborted()
+      const timeout = setTimeout(() => controller.abort(), 10_000)
+      const aborted = Promise.withResolvers<SessionActiveOutput>()
+      const abort = () => aborted.reject(combined.reason)
+      combined.addEventListener("abort", abort, { once: true })
+      const promise = Promise.race([serverSDK.api.session.active({ signal: combined }), aborted.promise]).finally(() => {
+        clearTimeout(timeout)
+        combined.removeEventListener("abort", abort)
+        if (activeRequest?.promise === promise) activeRequest = undefined
+      })
+      activeRequest = { epoch, controller, promise }
+      return promise
+    })()
+    const active = await request
+    if (epoch === session.snapshot.epoch() && !signal?.aborted && !lifetime.signal.aborted) Object.keys(active).forEach((id) => nativeActive.add(id))
+    return Object.fromEntries(Object.keys(active).map((id) => [id, { type: "busy" as const }]))
+  }
+  const recoverStatuses = async (capture: ReturnType<ServerSession["snapshot"]["capture"]>, signal?: AbortSignal, settleOnly?: boolean) => {
+    const statuses = await recoverSessionConnection({ session, statuses: () => readStatuses(signal), capture, signal, settleOnly })
+    if (native && !signal?.aborted && capture.epoch === session.snapshot.epoch()) {
+      for (const id of nativeActive) if (!statuses[id] && session.snapshot.current(capture, id)) nativeActive.delete(id)
+    }
+    return statuses
+  }
+  const poller = createNativeSessionPoller({
+    needed: () => {
+      for (const id of nativeActive) if (!session.data.session_status[id] || session.data.session_status[id].type === "idle") nativeActive.delete(id)
+      return native && nativeActive.size > 0
+    },
+    epoch: session.snapshot.epoch,
+    poll: (signal) => recoverStatuses(session.snapshot.capture("session_status"), signal, true),
+  })
+  createEffect(() => {
+    if (Object.values(session.data.session_status).some((status) => status.type !== "idle")) poller.start()
+  })
+  onCleanup(poller.dispose)
+  useQuery(() =>
     loadActiveSessionsQuery(serverSDK.scope, {
       active: async () => {
-        if ((await serverSDK.protocol) === "v1") {
-          const statuses = (await serverSDK.client.session.status()).data ?? {}
-          seedActiveSessionStatuses(session, statuses)
-          for (const sessionID of Object.keys(statuses)) {
-            void session.resolve(sessionID).catch(() => undefined)
-          }
-          return Object.fromEntries(
-            Object.entries(statuses).flatMap(([sessionID, status]) =>
-              status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
-            ),
-          )
-        }
-        const active = await serverSDK.api.session.active()
-        seedActiveSessionStatuses(session, active)
-        for (const sessionID of Object.keys(active)) {
-          void session.resolve(sessionID).catch(() => undefined)
-        }
-        return active
+        const statuses = await recoverStatuses(session.snapshot.capture("session_status"))
+        poller.start()
+        return Object.fromEntries(Object.entries(statuses).flatMap(([id, status]) => status.type === "idle" ? [] : [[id, { type: "running" as const }]]))
       },
     }),
   )
@@ -535,7 +661,22 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const eventType: string = event.type
     const recent = bootingRoot || Date.now() - bootedAt < 1500
 
-    if (event.current) session.applyV2(event.current)
+    if (directory === "global" && eventType === "server.connected") {
+      session.snapshot.connect()
+      activeRequest?.controller.abort()
+      poller.reset()
+      const capture = session.snapshot.capture("session_status")
+      void recoverStatuses(capture).then(() => poller.start(), () => poller.start())
+    }
+
+    if (event.current) {
+      if ("sessionID" in event.current.data && typeof event.current.data.sessionID === "string" && (event.current.type === "session.next.prompted" || event.current.type.startsWith("session.next.step.") || event.current.type.startsWith("session.next.text.") || event.current.type.startsWith("session.next.reasoning.") || event.current.type.startsWith("session.next.tool.") || event.current.type.startsWith("session.next.shell.") || event.current.type === "session.next.retried")) {
+        native = true
+        nativeActive.add(event.current.data.sessionID)
+      }
+      session.applyV2(event.current)
+      poller.start()
+    }
     session.apply(event)
     if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
       homeSessions.apply(event)
@@ -544,8 +685,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     if (eventType === "integration.connection.updated") void refreshProviders()
 
     if (directory === "global") {
-      if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
-        void activeSessionsQuery.refetch()
       applyGlobalEvent({
         event,
         project: globalStore.project,
@@ -572,23 +711,17 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       return
     }
 
-    if (event.current?.type === "session.moved") {
+    if (event.current?.type === "session.next.moved") {
       const info = session.get(event.current.data.sessionID)
       if (info) indexSession(info)
     }
-    if (event.current?.type === "session.forked")
-      void session
-        .resolve(event.current.data.sessionID, { force: true })
-        .then(indexSession)
-        .catch(() => {})
 
     const existing = children.children[key]
     if (!existing) return
     children.mark(key)
     if (
-      event.current?.type === "session.moved" ||
+      event.current?.type === "session.next.moved" ||
       // event.current?.type === "session.archived" ||
-      event.current?.type === "session.forked" ||
       eventType === "command.updated" ||
       eventType === "config.updated" ||
       eventType === "agent.updated"
