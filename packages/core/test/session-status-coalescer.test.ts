@@ -34,6 +34,18 @@ it.effect("status coalescer keeps one trailing window across a burst and quiet g
   expect(statuses).toHaveLength(3)
 }))
 
+it.effect("status coalescer restarts after cancellation before worker startup", () => Effect.gen(function* () {
+  const statuses: SessionStatusEvent.Info[] = []
+  const coalescer = yield* SessionStatusCoalescer.make((status) => Effect.sync(() => { statuses.push(status) }))
+  yield* coalescer.set(busy(1))
+  yield* coalescer.set(busy(2))
+  yield* coalescer.flush
+  expect(statuses).toEqual([busy(1), busy(2)])
+  yield* coalescer.set(busy(3))
+  yield* TestClock.adjust("100 millis")
+  expect(statuses).toEqual([busy(1), busy(2), busy(3)])
+}))
+
 it.effect("status coalescer barriers cancel pending owner reset phase retry and terminal updates", () => Effect.gen(function* () {
   const statuses: SessionStatusEvent.Info[] = []
   const coalescer = yield* SessionStatusCoalescer.make((status) => Effect.sync(() => { statuses.push(status) }))

@@ -21,6 +21,7 @@ export const make = Effect.fnUntraced(function* (publish: (status: SessionStatus
     generation++
     const pending = worker
     if (pending?.fiber) yield* Fiber.interrupt(pending.fiber)
+    if (worker === pending) worker = undefined
   })
   const flush = Effect.gen(function* () {
     yield* cancel
