@@ -1,6 +1,5 @@
 import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
-import type { SessionApi } from "@opencode-ai/client/promise"
 import type {
   Message,
   OpencodeClient,
@@ -12,18 +11,14 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import { batch } from "solid-js"
-import { createStore, produce, reconcile } from "solid-js/store"
+import { isDeepEqual, isPlainObject } from "remeda"
+import { createStore, produce, reconcile, unwrap } from "solid-js/store"
 import { message as cleanMessage } from "@/utils/diffs"
 import { sessionNotFoundError } from "@/utils/server-errors"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
-import {
-  compareMessages,
-  messageKey,
-  normalizeSessionMessages,
-  type CurrentSessionMessage,
-} from "@/utils/session-message"
-import type { ServerSessionEvent } from "./server-sdk"
+import { compareMessages, messageKey, normalizeSessionMessages, sessionMessagePartID, type NativeSessionMessage } from "@/utils/session-message"
+import type { NativeServerEvent } from "./server-sdk"
 import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
 import { normalizeTouchedSessionMessages } from "./server-session-v2-projection"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
@@ -31,6 +26,7 @@ import type { ServerApi } from "@/utils/server"
 import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 
 type MessageApi = ServerApi["message"]
+type SessionApi = Pick<ServerApi["session"], "get" | "message">
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
@@ -43,15 +39,18 @@ type SessionSnapshot = {
   readonly epoch: number
   readonly domain: SnapshotDomain
   readonly revisions: ReadonlyMap<string, number>
+  readonly inferred?: ReadonlySet<string>
 }
 
-function needsOlderTurnRoot(source: readonly CurrentSessionMessage[]) {
+const equal = (left: unknown, right: unknown): boolean => isDeepEqual(left, right)
+
+function needsOlderTurnRoot(source: readonly NativeSessionMessage[]) {
   const boundary = source.find(
     (message) =>
       message.type === "user" ||
       message.type === "shell" ||
       message.type === "assistant" ||
-      (message.type === "synthetic" && message.description?.trim()),
+      (message.type === "synthetic" && message.text.trim()),
   )
   return boundary?.type === "assistant"
 }
@@ -66,14 +65,14 @@ type OptimisticItem = {
 type MessagePage = {
   session: Message[]
   part: { id: string; part: Part[] }[]
-  source?: CurrentSessionMessage[]
+  source?: NativeSessionMessage[]
   sourceMode?: "latest" | "older"
   projectSource?: boolean
   cursor?: string
   complete: boolean
 }
 
-function legacyMessageSource(items: { info: Message; parts: Part[] }[]): CurrentSessionMessage[] {
+function legacyMessageSource(items: { info: Message; parts: Part[] }[]): NativeSessionMessage[] {
   return items
     .slice()
     .sort((a, b) => compareMessages(a.info, b.info))
@@ -100,6 +99,7 @@ function legacyMessageSource(items: { info: Message; parts: Part[] }[]): Current
 
 // Most markers describe the current HTTP attempt; deltaParts persists non-durable stream state across retries.
 type MessageLoadState = {
+  statusRevision: number
   touchedMessages: Set<string>
   removedMessages: Set<string>
   retainedMessages: Set<string>
@@ -110,13 +110,65 @@ type MessageLoadState = {
   optimisticParts: Map<string, Set<string>>
   orphanParents: Set<string>
   clearedMessageParts: Set<string>
-  touchedSource: Set<string>
+  sourceChanges: Map<string, SourceChange>
 }
 
 type MessageLoadBaseline = Pick<
   MessageLoadState,
-  "touchedMessages" | "retainedMessages" | "touchedParts" | "clearedMessageParts"
+  "touchedMessages" | "retainedMessages" | "touchedParts" | "clearedMessageParts" | "sourceChanges"
 >
+
+type SourceFields = { [field: string]: true | SourceFields }
+type SourceChange = { fields: SourceFields; content: Map<string, SourceFields>; source: NativeSessionMessage }
+type NativeAssistant = Extract<NativeSessionMessage, { type: "assistant" }>
+type DeltaSnapshot = { id: string; text?: string }
+
+function changedSourceFields(before: object | undefined, after: object, previous: SourceFields = {}): SourceFields {
+  const old = new Map<string, unknown>(Object.entries(before ?? {}))
+  const next = new Map<string, unknown>(Object.entries(after))
+  const fields = { ...previous }
+  for (const key of new Set([...old.keys(), ...next.keys()])) {
+    const value = next.get(key)
+    const prior = old.get(key)
+    if (equal(prior, value)) continue
+    fields[key] = (prior === undefined || isPlainObject(prior)) && isPlainObject(value) && fields[key] !== true
+      ? changedSourceFields(prior, value, fields[key]) : true
+  }
+  return fields
+}
+
+function mergeSourceFields<T extends object>(incoming: T, live: object, fields: SourceFields): T {
+  const fetched = new Map<string, unknown>(Object.entries(incoming))
+  const current = new Map<string, unknown>(Object.entries(live))
+  return { ...incoming, ...Object.fromEntries(Object.entries(fields).map(([key, changed]) => {
+    const value = current.get(key)
+    const old = fetched.get(key)
+    return [key, changed === true ? value : mergeSourceFields(isPlainObject(old) ? old : {}, isPlainObject(value) ? value : {}, changed)]
+  })) }
+}
+
+function nativeContent(message: NativeAssistant) {
+  return message.content.map((value) => ({ id: sessionMessagePartID(message.id, value.id), value }))
+}
+
+function mergeNativeMessage(incoming: NativeSessionMessage, live: NativeSessionMessage | undefined, changes?: SourceChange): NativeSessionMessage {
+  if (!live || !changes) return incoming
+  const selected = changes.source
+  const result = mergeSourceFields(incoming, selected, changes.fields)
+  if (incoming.type !== "assistant" || selected.type !== "assistant" || result.type !== "assistant") return result
+  const current = new Map(nativeContent(selected).map((item) => [item.id, item.value]))
+  const fetched = nativeContent(incoming)
+  const ids = new Set(fetched.map((item) => item.id))
+  return { ...result, content: [
+    ...fetched.flatMap((item) => {
+      const fields = changes.content.get(item.id)
+      if (!fields) return [item.value]
+      const value = current.get(item.id)
+      return value ? [mergeSourceFields(item.value, value, fields)] : []
+    }),
+    ...nativeContent(selected).filter((item) => !ids.has(item.id) && changes.content.has(item.id)).map((item) => item.value),
+  ] }
+}
 
 function mergeOptimisticPage(page: MessagePage, items: OptimisticItem[]) {
   if (items.length === 0) return { ...page, observed: [] as { messageID: string; parts: Part[] }[] }
@@ -207,7 +259,7 @@ export function createServerSession(
 ) {
   const sessionApi = messageApi ? (sessionApiOrOptions as SessionApi) : undefined
   const options = messageApi ? currentOptions : (sessionApiOrOptions as ServerSessionOptions | undefined)
-  const protocol = { kind: sessionApi ? "v2" as const : "v1" as const }
+  const protocol: { kind: "v1" | "v2" } = { kind: sessionApi ? "v2" : "v1" }
   void options?.protocol?.then((kind) => { protocol.kind = kind })
   const [data, setStore] = createStore({
     info: {} as Record<string, Session | undefined>,
@@ -218,7 +270,7 @@ export function createServerSession(
     permission: {} as Record<string, PermissionRequest[]>,
     question: {} as Record<string, QuestionRequest[]>,
     message: {} as Record<string, Message[]>,
-    session_message: {} as Record<string, CurrentSessionMessage[]>,
+    session_message: {} as Record<string, NativeSessionMessage[]>,
     part: {} as Record<string, Part[]>,
     part_text_accum_delta: {} as Record<string, string>,
     session_working(id: string) {
@@ -226,6 +278,8 @@ export function createServerSession(
     },
   })
   const snapshotState = { epoch: 0 }
+  const observedExecution = new Set<string>()
+  const authoritativeStatus = new Set<string>()
   const revisions = {
     session_status: new Map<string, number>(),
     permission: new Map<string, number>(),
@@ -233,16 +287,32 @@ export function createServerSession(
   }
   const setData = new Proxy(setStore, {
     apply(target, receiver, args: unknown[]) {
-      const result = Reflect.apply(target, receiver, args)
       const domain = args[0]
-      if (domain === "session_status" || domain === "permission" || domain === "question") {
-        const ids =
-          typeof args[1] === "string" ? [args[1]] : [...new Set([...Object.keys(data[domain]), ...revisions[domain].keys()])]
-        ids.forEach((id) => revisions[domain].set(id, (revisions[domain].get(id) ?? 0) + 1))
+      const selected = domain === "session_status" || domain === "permission" || domain === "question" ? domain : undefined
+      const ids = selected
+        ? typeof args[1] === "string" ? [args[1]] : [...new Set([...Object.keys(data[selected]), ...revisions[selected].keys()])]
+        : []
+      const result = Reflect.apply(target, receiver, args)
+      if (selected) {
+        if (typeof args[1] !== "string") ids.push(...Object.keys(data[selected]))
+        new Set(ids).forEach((id) => {
+          revisions[selected].set(id, (revisions[selected].get(id) ?? 0) + 1)
+          if (selected !== "session_status") return
+          observedExecution.delete(id)
+          authoritativeStatus.delete(id)
+        })
       }
       return result
     },
   })
+  const writeStatus = (id: string, status: typeof SessionStatusEvent.Info.Encoded, inferred = false) => {
+    revisions.session_status.set(id, (revisions.session_status.get(id) ?? 0) + 1)
+    if (status.type !== "idle") observedExecution.add(id)
+    if (status.type === "idle") observedExecution.delete(id)
+    if (inferred && authoritativeStatus.has(id)) return
+    if (!inferred) authoritativeStatus.add(id)
+    setStore("session_status", id, reconcile(status))
+  }
   const snapshotCurrent = (snapshot: SessionSnapshot, id: string) =>
     snapshot.epoch === snapshotState.epoch &&
     (snapshot.revisions.get(id) ?? 0) === (revisions[snapshot.domain].get(id) ?? 0)
@@ -265,10 +335,20 @@ export function createServerSession(
         produce((draft) => {
           for (const id of new Set([...Object.keys(draft), ...Object.keys(statuses)])) {
             if (!snapshotCurrent(captured, id)) continue
-            if (!statuses[id] && Object.values(data.pending_input[id] ?? {}).some(Boolean)) continue
+            if (!statuses[id] && !observedExecution.has(id) &&
+              (optimistic.get(id)?.size || admissions.get(id)?.size || Object.values(data.pending_input[id] ?? {}).some(Boolean))) continue
             if (directory && data.info[id]?.directory !== directory && !statuses[id]) continue
-            if (statuses[id]) draft[id] = statuses[id]
-            if (!statuses[id]) delete draft[id]
+            if (statuses[id]) {
+              draft[id] = statuses[id]
+              if (!captured.inferred?.has(id)) authoritativeStatus.add(id)
+              if (statuses[id].type !== "idle") observedExecution.add(id)
+              if (statuses[id].type === "idle") observedExecution.delete(id)
+            }
+            if (!statuses[id]) {
+              delete draft[id]
+              observedExecution.delete(id)
+              authoritativeStatus.delete(id)
+            }
             revisions.session_status.set(id, (revisions.session_status.get(id) ?? 0) + 1)
           }
         }),
@@ -278,8 +358,10 @@ export function createServerSession(
   const requests = new Map<string, Promise<Session>>()
   const inflight = new Map<string, Promise<void>>()
   const messageRequests = new Map<string, Promise<void>>()
+  const hydrations = new Map<string, Map<string, Promise<void>>>()
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
+  const admissions = new Map<string, Map<string, { prompt: Extract<NativeServerEvent, { type: "session.next.prompt.admitted" }>["data"]["prompt"]; delivery: "steer" | "queue" }>>()
   const v2 = createV2SessionReducer()
   const messageLoads = new Map<string, MessageLoadState>()
   const pendingParts = new Map<string, Map<string, Set<string>>>()
@@ -395,6 +477,7 @@ export function createServerSession(
         !data.info[sessionID] &&
         !requests.has(sessionID) &&
         !messageLoads.has(sessionID) &&
+        !hydrations.get(sessionID)?.size &&
         !inflight.has(sessionID) &&
         !inflightTodo.has(sessionID)
       )
@@ -428,6 +511,28 @@ export function createServerSession(
     if (!items) return
     items.delete(messageID)
     if (items.size === 0) optimistic.delete(sessionID)
+  }
+
+  const confirmNativeUser = (sessionID: string, messageID: string) => {
+    const admitted = admissions.get(sessionID)?.delete(messageID)
+    const item = optimistic.get(sessionID)?.get(messageID)
+    clearOptimistic(sessionID, messageID)
+    setData("pending_input", sessionID, produce((draft = {}) => { delete draft[messageID] }))
+    const load = messageLoads.get(sessionID)
+    if ((admitted || item) && (!load || load.statusRevision === (revisions.session_status.get(sessionID) ?? 0)))
+      observedExecution.add(sessionID)
+    load?.optimisticParts.delete(messageID)
+    load?.clearedMessageParts.delete(messageID)
+    if (!item) return
+    load?.touchedMessages.delete(messageID)
+    for (const part of item.parts) {
+      load?.touchedParts.get(messageID)?.delete(part.id)
+      load?.deltaParts.get(messageID)?.delete(part.id)
+      load?.carriedDeltaParts.get(messageID)?.delete(part.id)
+      deltaBases.delete(part.id)
+      setData("part_text_accum_delta", produce((draft) => { delete draft[part.id] }))
+    }
+    setData("part", messageID, (parts = []) => parts.filter((part) => !item.parts.some((raw) => raw.id === part.id)))
   }
 
   const clearOptimisticPart = (sessionID: string, messageID: string, partID: string) => {
@@ -498,6 +603,7 @@ export function createServerSession(
     load.touchedParts.clear()
     load.carriedDeltaParts.clear()
     load.clearedMessageParts.clear()
+    load.sourceChanges.clear()
     for (const messageID of load.removedMessages) {
       load.touchedMessages.add(messageID)
       load.clearedMessageParts.add(messageID)
@@ -531,6 +637,7 @@ export function createServerSession(
       parts.forEach((partID) => touched.add(partID))
       load.touchedParts.set(messageID, touched)
     })
+    baseline?.sourceChanges.forEach((change, messageID) => load.sourceChanges.set(messageID, change))
   }
 
   const messageLoadBaseline = (load: MessageLoadState, exclude: string): MessageLoadBaseline => ({
@@ -542,6 +649,7 @@ export function createServerSession(
         .map(([messageID, parts]) => [messageID, new Set(parts)]),
     ),
     clearedMessageParts: new Set([...load.clearedMessageParts].filter((messageID) => messageID !== exclude)),
+    sourceChanges: new Map([...load.sourceChanges].filter(([messageID]) => messageID !== exclude)),
   })
 
   const evict = (sessionIDs: string[]) => {
@@ -556,12 +664,16 @@ export function createServerSession(
       requests.delete(sessionID)
       inflight.delete(sessionID)
       messageRequests.delete(sessionID)
+      hydrations.delete(sessionID)
       inflightTodo.delete(sessionID)
       messageLoads.delete(sessionID)
-      v2.clear(sessionID)
       pendingParts.delete(sessionID)
       orphanParts.delete(sessionID)
       removedMessages.delete(sessionID)
+      admissions.delete(sessionID)
+      observedExecution.delete(sessionID)
+      authoritativeStatus.delete(sessionID)
+      Object.values(revisions).forEach((domain) => domain.set(sessionID, (domain.get(sessionID) ?? 0) + 1))
     })
     setData(
       produce((draft) => {
@@ -609,15 +721,20 @@ export function createServerSession(
 
   const fetchMessages = async (sessionID: string, limit: number, before?: string, onAttempt?: () => void) => {
     if (messageApi && (await options?.protocol) !== "v1") {
-      const request = (cursor?: string) =>
+      const request = (cursor?: string, baseline?: MessageLoadBaseline) =>
         (options?.retry ?? retry)(() => {
           onAttempt?.()
-          return messageApi.list(cursor ? { sessionID, limit, cursor } : { sessionID, limit, order: "desc" })
+          const load = messageLoads.get(sessionID)
+          if (load && baseline) resetMessageLoad(sessionID, load, baseline)
+           const capped = Math.max(1, Math.min(historyMessagePageSize, limit))
+           return messageApi.list(cursor ? { sessionID, limit: capped, cursor } : { sessionID, limit: capped, order: "desc" })
         })
       const first = await request(before)
       const pages = [first]
       while (pages.at(-1)?.cursor.next && needsOlderTurnRoot(pages.flatMap((page) => page.data).toReversed())) {
-        const response = await request(pages.at(-1)!.cursor.next ?? undefined)
+        const baseline = messageLoads.get(sessionID)
+        const preserved = baseline ? messageLoadBaseline(baseline, "") : undefined
+        const response = await request(pages.at(-1)!.cursor.next ?? undefined, preserved)
         pages.push(response)
         if (!response.data.length) break
       }
@@ -693,16 +810,18 @@ export function createServerSession(
     items: MessagePage["part"],
     messageIDs: Set<string>,
     load?: MessageLoadState,
+    original?: Map<string, readonly DeltaSnapshot[]>,
   ) => {
     for (const item of items) {
       if (!messageIDs.has(item.id)) continue
       const fetched = load?.clearedMessageParts.has(item.id)
         ? []
         : item.part.filter((part) => !SKIP_PARTS.has(part.type))
-      const fetchedIDs = new Set(fetched.map((part) => part.id))
+      const deltaSnapshot = original?.get(item.id) ?? fetched
+      const fetchedIDs = new Set(deltaSnapshot.map((part) => part.id))
       const pending = pendingParts.get(sessionID)?.get(item.id)
       const touched = new Set([...(load?.touchedParts.get(item.id) ?? []), ...(pending ?? [])])
-      for (const part of fetched) {
+      for (const part of deltaSnapshot) {
         const accumulated = data.part_text_accum_delta[part.id]
         const base = deltaBases.get(part.id)?.base
         const preserveDelta =
@@ -714,9 +833,9 @@ export function createServerSession(
           accumulated.startsWith(part.text) &&
           accumulated !== part.text
         if (preserveDelta) touched.add(part.id)
-        if (load?.carriedDeltaParts.get(item.id)?.has(part.id) && !preserveDelta) touched.delete(part.id)
+        if (deltaBases.has(part.id) && !preserveDelta && !(load?.touchedParts.get(item.id)?.has(part.id) && !load?.carriedDeltaParts.get(item.id)?.has(part.id))) touched.delete(part.id)
       }
-      for (const partID of load?.carriedDeltaParts.get(item.id) ?? []) {
+      for (const partID of new Set([...(load?.carriedDeltaParts.get(item.id) ?? []), ...(data.part[item.id] ?? []).filter((part) => deltaBases.has(part.id)).map((part) => part.id)])) {
         if (!fetchedIDs.has(partID)) touched.delete(partID)
       }
       const parts = reconcileFetched(fetched, data.part[item.id] ?? [], { touched })
@@ -749,15 +868,22 @@ export function createServerSession(
     preserveUnfetched: boolean | ((message: Message) => boolean),
     cleanupOrphans: boolean,
   ) => {
+    if (page.projectSource) {
+      for (const message of page.source ?? []) {
+        if (message.type !== "user" || load?.removedMessages.has(message.id) || removedMessages.get(sessionID)?.has(message.id)) continue
+        confirmNativeUser(sessionID, message.id)
+      }
+    }
     const source = page.source
       ? (() => {
           const incoming = new Map(page.source.map((message) => [message.id, message]))
           const existing = data.session_message[sessionID] ?? []
           const current = existing.filter((message) => !incoming.has(message.id))
           const live = new Map(existing.map((message) => [message.id, message]))
-          return (page.sourceMode === "older" ? [...page.source, ...current] : [...current, ...page.source]).map(
-            (message) => (load?.touchedSource.has(message.id) ? (live.get(message.id) ?? message) : message),
-          )
+          return (page.sourceMode === "older" ? [...page.source, ...current] : [...current, ...page.source])
+            .filter((message) => !page.projectSource || (!load?.removedMessages.has(message.id) && !removedMessages.get(sessionID)?.has(message.id)))
+            .map((message) => mergeNativeMessage(message, live.get(message.id), load?.sourceChanges.get(message.id)))
+            .sort(compareMessages)
         })()
       : undefined
     const projected =
@@ -799,9 +925,25 @@ export function createServerSession(
           (typeof preserveUnfetched === "function" ? preserveUnfetched(message) : preserveUnfetched),
       )
     batch(() => {
-      if (source) setData("session_message", sessionID, reconcile(source))
       const messageIDs = replaceMessages(sessionID, messages)
-      replaceParts(sessionID, merged.part, messageIDs, load)
+      replaceParts(sessionID, merged.part, messageIDs, load, page.projectSource ? new Map<string, readonly DeltaSnapshot[]>([
+        ...page.part.map((item) => [item.id, item.part] as const),
+        ...(page.source ?? []).flatMap((message) => message.type === "assistant" ? [[message.id, nativeContent(message).map((item) => ({ id: item.id, text: item.value.type === "tool" ? undefined : item.value.text }))] as const] : []),
+      ]) : undefined)
+      if (source) setData("session_message", sessionID, reconcile(page.projectSource ? source.map((message) => {
+        if (message.type === "user") {
+          const text = data.part[message.id]?.find((part) => part.id === sessionMessagePartID(message.id, "text:0"))
+          return text?.type === "text" ? { ...message, text: text.text } : message
+        }
+        if (message.type !== "assistant") return message
+        const parts = new Map((data.part[message.id] ?? []).map((part) => [part.id, part]))
+        return { ...message, content: nativeContent(message).flatMap((item) => {
+          const part = parts.get(item.id)
+          if (!part) return item.value.type !== "tool" && !item.value.text.trim() ? [item.value] : []
+          if ((item.value.type === "text" && part.type === "text") || (item.value.type === "reasoning" && part.type === "reasoning")) return [{ ...item.value, text: part.text }]
+          return [item.value]
+        }) }
+      }) : source))
       const orphans = orphanParts.get(sessionID)
       if (cleanupOrphans && page.complete && orphans) {
         for (const messageID of orphans) {
@@ -822,6 +964,7 @@ export function createServerSession(
     if (meta.loading[sessionID]) return
     const active = generation(sessionID)
     const load: MessageLoadState = {
+      statusRevision: revisions.session_status.get(sessionID) ?? 0,
       touchedMessages: new Set(),
       removedMessages: new Set(),
       retainedMessages: new Set(),
@@ -832,7 +975,7 @@ export function createServerSession(
       optimisticParts: new Map(),
       orphanParents: new Set(),
       clearedMessageParts: new Set(),
-      touchedSource: new Set(),
+      sourceChanges: new Map(),
     }
     messageLoads.set(sessionID, load)
     setMeta("loading", sessionID, true)
@@ -926,8 +1069,9 @@ export function createServerSession(
 
   const sync = async (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
     touch(sessionID)
-    if (options?.force && (inflight.has(sessionID) || messageRequests.has(sessionID)))
-      await Promise.allSettled([inflight.get(sessionID), messageRequests.get(sessionID)])
+    if (options?.force && (inflight.has(sessionID) || messageRequests.has(sessionID) || requests.has(sessionID) || hydrations.get(sessionID)?.size)) {
+      await Promise.allSettled([inflight.get(sessionID), messageRequests.get(sessionID), requests.get(sessionID), ...(hydrations.get(sessionID)?.values() ?? [])])
+    }
     return runInflight(inflight, sessionID, async () => {
       const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
       if (cached && data.info[sessionID] && !options?.force) return
@@ -973,57 +1117,107 @@ export function createServerSession(
       return properties.part.sessionID
   }
 
-  const projectV2 = (reduction: V2SessionReduction) => {
-    reduction.touched.forEach((messageID) => messageLoads.get(reduction.sessionID)?.touchedSource.add(messageID))
-    setData("session_message", reduction.sessionID, reconcile(reduction.messages))
-    if (reduction.touched.length === 0) return
-
-    const normalized = normalizeTouchedSessionMessages(reduction.sessionID, reduction.messages, reduction.touched)
+  const projectV2 = (reduction: V2SessionReduction, delta = false) => {
+    const previous = data.session_message[reduction.sessionID] ?? []
+    const source = reduction.messages.toSorted(compareMessages)
+    const oldSource = new Map(previous.map((message) => [message.id, message]))
+    const load = messageLoads.get(reduction.sessionID)
+    for (const message of source) {
+      if (!load || !reduction.touched.includes(message.id)) continue
+      const old = oldSource.get(message.id)
+      const changes = load.sourceChanges.get(message.id)
+      const content = new Map(changes?.content)
+      if (message.type === "assistant") {
+        const before = new Map(old?.type === "assistant" ? nativeContent(old).map((item) => [item.id, item.value]) : [])
+        const after = new Map(nativeContent(message).map((item) => [item.id, item.value]))
+        for (const id of new Set([...before.keys(), ...after.keys()])) {
+          if (equal(before.get(id), after.get(id))) continue
+          content.set(id, changedSourceFields(before.get(id), after.get(id) ?? {}, content.get(id)))
+        }
+      }
+      load.sourceChanges.set(message.id, {
+        source: structuredClone(unwrap(message)),
+        fields: changedSourceFields(old && Object.fromEntries(Object.entries(old).filter(([key]) => key !== "content")), Object.fromEntries(Object.entries(message).filter(([key]) => key !== "content")), changes?.fields),
+        content,
+      })
+    }
+    const before = normalizeTouchedSessionMessages(reduction.sessionID, previous, reduction.touched)
+    const after = normalizeTouchedSessionMessages(reduction.sessionID, source, reduction.touched)
+    const expanded = [...new Set([...before.touched, ...after.touched])]
+    const normalized = expanded.every((id) => after.touched.has(id))
+      ? after
+      : normalizeTouchedSessionMessages(reduction.sessionID, source, expanded)
+    const oldMessages = new Map(before.messages.map((message) => [message.id, message]))
     batch(() => {
       for (const message of normalized.messages) {
-        apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
+        if (equal(oldMessages.get(message.id), message)) continue
+        apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } }, true)
       }
-      for (const messageID of normalized.touched) {
+      for (const messageID of expanded) {
         const next = normalized.parts.get(messageID) ?? []
+        const oldParts = new Map((before.parts.get(messageID) ?? []).map((part) => [part.id, part]))
+        const oldMessage = oldSource.get(messageID)
+        const oldContent = new Map(oldMessage?.type === "assistant" ? nativeContent(oldMessage).map((item) => [item.id, item.value]) : [])
         const nextIDs = new Set(next.map((part) => part.id))
         for (const part of next) {
-          apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } })
+          const old = oldParts.get(part.id)
+          if (equal(old, part)) continue
+          const content = old ?? oldContent.get(part.id)
+          if (delta && (content?.type === "text" || content?.type === "reasoning") && (part.type === "text" || part.type === "reasoning")) {
+            if (!data.part[messageID]?.some((value) => value.id === part.id)) apply({ type: "message.part.updated", properties: { part: { ...part, text: "" } } }, true)
+            apply({ type: "message.part.delta", properties: { sessionID: reduction.sessionID, messageID, partID: part.id, field: "text", delta: part.text.slice(content.text.length) } })
+            continue
+          }
+          apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } }, true)
         }
-        for (const part of data.part[messageID] ?? []) {
-          if (nextIDs.has(part.id)) continue
+        for (const partID of oldParts.keys()) {
+          if (nextIDs.has(partID)) continue
           apply({
             type: "message.part.removed",
-            properties: { sessionID: reduction.sessionID, messageID, partID: part.id },
-          })
+            properties: { sessionID: reduction.sessionID, messageID, partID },
+          }, true)
         }
       }
+      setData("session_message", reduction.sessionID, reconcile(source))
     })
   }
 
   const hydrateV2Message = (sessionID: string, messageID: string) => {
     if (!sessionApi) return
-    void sessionApi
-      .message({ sessionID, messageID })
-      .then((message) => {
-        const current = data.session_message[sessionID] ?? []
-        const messages = [...current.filter((item) => item.id !== message.id), message].sort(compareMessages)
-        projectV2({ sessionID, messages, touched: [message.id] })
+    const pending = hydrations.get(sessionID) ?? new Map<string, Promise<void>>()
+    hydrations.set(sessionID, pending)
+    void runInflight(pending, messageID, async () => {
+      const active = generation(sessionID)
+      const epoch = snapshot.epoch()
+      const source = structuredClone(unwrap(data.session_message[sessionID]?.find((message) => message.id === messageID)))
+      const message = await sessionApi.message({ sessionID, messageID })
+      const current = data.session_message[sessionID] ?? []
+      if (generations.get(sessionID) !== active || snapshot.epoch() !== epoch || removedMessages.get(sessionID)?.has(messageID)) return
+      if (!equal(source, current.find((item) => item.id === messageID))) return
+      const messages = [...current.filter((item) => item.id !== message.id), message].sort(compareMessages)
+      projectV2({ sessionID, messages, touched: [message.id] })
+    })
+      .finally(() => {
+        if (hydrations.get(sessionID) === pending && pending.size === 0) hydrations.delete(sessionID)
       })
-      .catch(() => {})
+      .catch(() => undefined)
   }
 
-  const applyV2 = (event: ServerSessionEvent) => {
+  const applyV2 = (event: NativeServerEvent) => {
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
     const sessionID = event.data.sessionID
+    touch(sessionID)
+    if (event.type === "session.next.prompt.admitted") {
+      const pending = admissions.get(sessionID) ?? new Map()
+      pending.set(event.data.messageID, { prompt: event.data.prompt, delivery: event.data.delivery })
+      admissions.set(sessionID, pending)
+    }
     const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
     if (reduction) {
       const admitted = reduction.admitted
       if (admitted) setData("pending_input", sessionID, (current = {}) => ({ ...current, [admitted]: true }))
-      if (reduction.promoted)
-        setData("pending_input", sessionID, produce((draft = {}) => {
-          reduction.promoted?.forEach((id) => delete draft[id])
-        }))
-      projectV2(reduction)
+      reduction.promoted?.forEach((id) => confirmNativeUser(sessionID, id))
+      projectV2(reduction, event.type === "session.next.text.delta" || event.type === "session.next.reasoning.delta")
       if (reduction.pendingMessage && !data.message[sessionID]?.some((message) => message.id === reduction.pendingMessage?.id)) {
         const normalized = normalizeSessionMessages(sessionID, [reduction.pendingMessage])
         setData("message", sessionID, (messages = []) => merge(messages, normalized.messages).sort(compareMessages))
@@ -1032,51 +1226,48 @@ export function createServerSession(
       }
       if (reduction.missing) hydrateV2Message(sessionID, reduction.missing)
     }
+    if (event.type === "session.next.text.ended" || event.type === "session.next.reasoning.ended") {
+      const contentID = event.type === "session.next.text.ended" ? event.data.textID : event.data.reasoningID
+      const partID = sessionMessagePartID(event.data.assistantMessageID, contentID)
+      deltaBases.delete(partID)
+      setData("part_text_accum_delta", produce((draft) => { delete draft[partID] }))
+      messageLoads.get(sessionID)?.deltaParts.get(event.data.assistantMessageID)?.delete(partID)
+      messageLoads.get(sessionID)?.carriedDeltaParts.get(event.data.assistantMessageID)?.delete(partID)
+    }
 
     const info = data.info[sessionID]
-    if (event.type === "session.renamed" && info)
-      remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
-    if (event.type === "session.moved" && info)
+    if (event.type === "session.next.moved" && info)
       remember({
         ...info,
-        projectID: event.data.projectID ?? info.projectID,
         workspaceID: event.data.location.workspaceID,
         directory: event.data.location.directory,
-        path: event.data.subpath,
-        time: { ...info.time, updated: event.created },
+        path: event.data.subdirectory,
+        time: { ...info.time, updated: event.data.timestamp },
       })
-    if (event.type === "session.usage.updated" && info)
-      remember({ ...info, cost: event.data.cost, tokens: event.data.tokens })
     // if (event.type === "session.archived") {
     //   if (info) remember({ ...info, time: { ...info.time, archived: event.created, updated: event.created } })
     //   evict([sessionID])
     // }
-    const status = data.session_status[sessionID]
-    if (event.type === "session.execution.started" && (status?.type === "idle" || !status?.activity))
-      setData("session_status", sessionID, { type: "busy" })
-    if (
-      event.type === "session.execution.succeeded" ||
-      event.type === "session.execution.failed" ||
-      event.type === "session.execution.interrupted"
-    )
-      setData("session_status", sessionID, { type: "idle" })
-    if (event.type === "session.retry.scheduled")
-      setData("session_status", sessionID, {
+    if (event.type === "session.next.prompted" || event.type.startsWith("session.next.step.") || event.type.startsWith("session.next.text.") || event.type.startsWith("session.next.reasoning.") || event.type.startsWith("session.next.tool.") || event.type.startsWith("session.next.shell.")) {
+      writeStatus(sessionID, { type: "busy" }, true)
+    }
+    if (event.type === "session.next.retried") {
+      writeStatus(sessionID, {
         type: "retry",
         attempt: event.data.attempt,
         message: event.data.error.message,
-        next: event.data.at,
-      })
-    if (event.type === "session.forked") void resolve(sessionID, { force: true }).catch(() => {})
+        next: event.data.timestamp,
+      }, true)
+    }
     if (
-      event.type === "session.revert.staged" ||
-      event.type === "session.revert.cleared" ||
-      event.type === "session.revert.committed"
+      event.type === "session.next.revert.staged" ||
+      event.type === "session.next.revert.cleared" ||
+      event.type === "session.next.revert.committed"
     )
-      void resolve(sessionID, { force: true }).catch(() => {})
+      void resolve(sessionID, { force: true }).catch(() => undefined)
   }
 
-  const apply = (event: { type: string; properties?: unknown }) => {
+  const apply = (event: { type: string; properties?: unknown }, projected = false) => {
     const eventID = eventSessionID(event)
     if (eventID) {
       touch(eventID)
@@ -1086,7 +1277,7 @@ export function createServerSession(
         event.type !== "session.updated" &&
         event.type !== "session.deleted"
       )
-        void resolve(eventID).catch(() => {})
+        void resolve(eventID).catch(() => undefined)
     }
     switch (event.type) {
       case "session.created":
@@ -1117,7 +1308,7 @@ export function createServerSession(
       }
       case "session.status": {
         const props = event.properties as { sessionID: string; status: typeof SessionStatusEvent.Info.Encoded }
-        setData("session_status", props.sessionID, reconcile(props.status))
+        writeStatus(props.sessionID, props.status)
         const owner = props.status.type !== "idle" ? props.status.activity?.userMessageID : undefined
         if (owner && protocol.kind === "v1") {
           const boundary = data.message[props.sessionID]?.find((message) => message.id === owner)
@@ -1132,7 +1323,7 @@ export function createServerSession(
       }
       case "message.updated": {
         const info = cleanMessage((event.properties as { info: Message }).info)
-        if (protocol.kind === "v1" && info.role === "assistant" && info.time.completed === undefined) {
+        if (!projected && protocol.kind === "v1" && info.role === "assistant" && info.time.completed === undefined) {
           const boundary = data.message[info.sessionID]?.find((message) => message.id === info.parentID)
           if (boundary)
             setData("pending_input", info.sessionID, produce((draft = {}) => {
@@ -1141,13 +1332,13 @@ export function createServerSession(
               })
             }))
         }
-        indexLegacyMessage(info)
+        if (!projected) indexLegacyMessage(info)
         const load = messageLoads.get(info.sessionID)
-        load?.touchedMessages.add(info.id)
+        if (!projected) load?.touchedMessages.add(info.id)
         load?.removedMessages.delete(info.id)
         const items = optimistic.get(info.sessionID)
         const item = items?.get(info.id)
-        if (items && item) {
+        if (!projected && items && item) {
           if (item.parts.length === 0) clearOptimistic(info.sessionID, info.id)
           if (item.parts.length > 0) items.set(info.id, { ...item, confirmedMessage: true })
         }
@@ -1160,6 +1351,11 @@ export function createServerSession(
         const messages = data.message[info.sessionID]
         if (!messages) {
           setData("message", info.sessionID, [info])
+          return
+        }
+        const existing = messages.find((message) => message.id === info.id)
+        if (existing && messageKey(existing) !== messageKey(info)) {
+          setData("message", info.sessionID, reconcile([...messages.filter((message) => message.id !== info.id), info].sort(compareMessages), { key: "id" }))
           return
         }
         const result = Binary.search(messages, messageKey(info), messageKey)
@@ -1240,8 +1436,8 @@ export function createServerSession(
         optimistic?.delete(part.id)
         if (optimistic?.size === 0) load?.optimisticParts.delete(part.messageID)
         deltaBases.delete(part.id)
-        trackPartChange(part.sessionID, part.messageID, part.id)
-        confirmOptimisticPart(part.sessionID, part.messageID, part)
+        if (!projected) trackPartChange(part.sessionID, part.messageID, part.id)
+        if (!projected) confirmOptimisticPart(part.sessionID, part.messageID, part)
         setData(
           "part_text_accum_delta",
           produce((draft) => void delete draft[part.id]),
@@ -1264,11 +1460,13 @@ export function createServerSession(
       case "message.part.removed": {
         const props = event.properties as { sessionID: string; messageID: string; partID: string }
         // Part removal is event-only on the server, so its tombstone lasts until a later update or eviction.
-        const pending = pendingParts.get(props.sessionID) ?? new Map<string, Set<string>>()
-        const parts = pending.get(props.messageID) ?? new Set<string>()
-        parts.add(props.partID)
-        pending.set(props.messageID, parts)
-        pendingParts.set(props.sessionID, pending)
+        if (!projected) {
+          const pending = pendingParts.get(props.sessionID) ?? new Map<string, Set<string>>()
+          const parts = pending.get(props.messageID) ?? new Set<string>()
+          parts.add(props.partID)
+          pending.set(props.messageID, parts)
+          pendingParts.set(props.sessionID, pending)
+        }
         const deltas = messageLoads.get(props.sessionID)?.deltaParts.get(props.messageID)
         deltas?.delete(props.partID)
         if (deltas?.size === 0) messageLoads.get(props.sessionID)?.deltaParts.delete(props.messageID)
@@ -1276,7 +1474,7 @@ export function createServerSession(
         const carried = load?.carriedDeltaParts.get(props.messageID)
         carried?.delete(props.partID)
         if (carried?.size === 0) load?.carriedDeltaParts.delete(props.messageID)
-        if (load) {
+        if (load && !projected) {
           const parts = load.removedParts.get(props.messageID) ?? new Set<string>()
           parts.add(props.partID)
           load.removedParts.set(props.messageID, parts)
@@ -1284,7 +1482,7 @@ export function createServerSession(
           optimistic?.delete(props.partID)
           if (optimistic?.size === 0) load.optimisticParts.delete(props.messageID)
         }
-        trackPartChange(props.sessionID, props.messageID, props.partID)
+        if (!projected) trackPartChange(props.sessionID, props.messageID, props.partID)
         clearOptimisticPart(props.sessionID, props.messageID, props.partID)
         setData(
           produce((draft) => {

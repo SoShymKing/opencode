@@ -14,6 +14,7 @@ import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/con
 import {
   bootstrapGlobal,
   bootstrapDirectory,
+  refreshDirectorySessionStatuses,
   loadAgentsQuery,
   loadCommands,
   loadGlobalConfigQuery,
@@ -333,6 +334,23 @@ describe("bootstrapDirectory", () => {
     expect(session.data.question.live).toEqual([question])
     expect(session.data.permission.quiet?.map((item) => item.id)).toEqual(["perm_quiet"])
     expect(session.data.question.quiet?.map((item) => item.id)).toEqual(["question_quiet"])
+  })
+
+  test("keeps newer local status when the V1 directory status response is stale", async () => {
+    const pending = Promise.withResolvers<Response>()
+    const started = Promise.withResolvers<void>()
+    const sdk = createOpencodeClient({
+      baseUrl: "http://fixture",
+      fetch: testFetch(async () => { started.resolve(); return pending.promise }),
+    })
+    const session = createServerSession(sdk)
+    session.remember({ id: "live", slug: "live", projectID: "project", directory: "/project", title: "live", version: "1", time: { created: 1, updated: 1 } })
+    const refreshing = refreshDirectorySessionStatuses({ sdk, session, directory: "/project" })
+    await started.promise
+    session.set("session_status", "live", { type: "idle" })
+    pending.resolve(Response.json({ live: { type: "busy" } }))
+    await refreshing
+    expect(session.data.session_status.live).toEqual({ type: "idle" })
   })
 
   test("uses legacy MCP endpoints while refreshing a v1 directory", async () => {

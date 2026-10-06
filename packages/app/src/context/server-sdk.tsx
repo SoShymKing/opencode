@@ -1,6 +1,4 @@
-import type { OpenCodeEvent } from "@opencode-ai/client/promise"
-import type { SessionEvent } from "@opencode-ai/schema/session-event"
-import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import type { EventManifest } from "@opencode-ai/schema/event-manifest"
 import type { Event } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
@@ -20,44 +18,22 @@ const isAbortError = (error: unknown) =>
   error !== null && typeof error === "object" && "name" in error && error.name === "AbortError"
 
 const isStreamClosed = (error: unknown, signal?: AbortSignal) => isAbortError(error) || signal?.aborted === true
-export type CurrentStepEvent =
-  | typeof SessionEvent.Step.Started.Encoded
-  | typeof SessionEvent.Step.StreamUpdated.Encoded
-  | typeof SessionEvent.Step.Ended.Encoded
-  | typeof SessionEvent.Step.Failed.Encoded
-export type ServerSessionEvent =
-  | OpenCodeEvent
-  | CurrentStepEvent
-  | typeof SessionEvent.PromptAdmitted.Encoded
-  | typeof SessionEvent.Prompted.Encoded
-  | typeof SessionStatusEvent.Status.Encoded
-export type ServerEvent = Event & { current?: ServerSessionEvent }
+export type NativeServerEvent = (typeof EventManifest.Definitions)[number]["Encoded"]
+export type ServerSessionEvent = NativeServerEvent
+export type ServerEvent = Event & { current?: NativeServerEvent }
 type QueuedServerEvent = { directory: string; payload: ServerEvent }
 type CurrentDelta = Extract<
-  OpenCodeEvent,
-  { type: "session.text.delta" | "session.reasoning.delta" | "session.tool.input.delta" | "session.compaction.delta" }
+  NativeServerEvent,
+  {
+    type:
+      | "session.next.text.delta"
+      | "session.next.reasoning.delta"
+      | "session.next.tool.input.delta"
+      | "session.next.compaction.delta"
+  }
 >
 
-export function adaptServerEvent(event: ServerSessionEvent): ServerEvent {
-  switch (event.type) {
-    case "session.next.prompt.admitted":
-    case "session.next.prompted":
-    case "session.status":
-      return { id: event.id, type: event.type, properties: event.data, current: event } as ServerEvent
-    case "session.next.step.started":
-      return { id: event.id, type: event.type, properties: event.data, current: event }
-    case "session.next.step.stream.updated":
-      return { id: event.id, type: event.type, properties: event.data, current: event }
-    case "session.next.step.ended":
-      return {
-        id: event.id,
-        type: event.type,
-        properties: { ...event.data, files: event.data.files && [...event.data.files] },
-        current: event,
-      }
-    case "session.next.step.failed":
-      return { id: event.id, type: event.type, properties: event.data, current: event }
-  }
+export function adaptServerEvent(event: NativeServerEvent): ServerEvent {
   if (event.type === "permission.v2.asked") {
     return {
       id: event.id,
@@ -123,7 +99,7 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
       ) {
         const fragment = currentDeltaFragment(prior) + currentDeltaFragment(current)
         const data =
-          current.type === "session.compaction.delta"
+          current.type === "session.next.compaction.delta"
             ? { ...current.data, text: fragment }
             : { ...current.data, delta: fragment }
         output[output.length - 1] = {
@@ -170,25 +146,27 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
   return output
 }
 
-function currentDelta(event: ServerSessionEvent | undefined): CurrentDelta | undefined {
+function currentDelta(event: NativeServerEvent | undefined): CurrentDelta | undefined {
   if (
-    event?.type === "session.text.delta" ||
-    event?.type === "session.reasoning.delta" ||
-    event?.type === "session.tool.input.delta" ||
-    event?.type === "session.compaction.delta"
+    event?.type === "session.next.text.delta" ||
+    event?.type === "session.next.reasoning.delta" ||
+    event?.type === "session.next.tool.input.delta" ||
+    event?.type === "session.next.compaction.delta"
   )
     return event
 }
 
 function currentDeltaKey(event: CurrentDelta) {
-  if (event.type === "session.tool.input.delta")
-    return `${event.type}:${event.data.sessionID}:${event.data.assistantMessageID}:${event.data.callID}`
-  if (event.type === "session.compaction.delta") return `${event.type}:${event.data.sessionID}`
-  return `${event.type}:${event.data.sessionID}:${event.data.assistantMessageID}:${event.data.ordinal}`
+  if (event.type === "session.next.tool.input.delta")
+    return JSON.stringify([event.type, event.data.sessionID, event.data.assistantMessageID, event.data.callID])
+  if (event.type === "session.next.compaction.delta")
+    return JSON.stringify([event.type, event.data.sessionID, event.data.messageID])
+  const contentID = event.type === "session.next.text.delta" ? event.data.textID : event.data.reasoningID
+  return JSON.stringify([event.type, event.data.sessionID, event.data.assistantMessageID, contentID])
 }
 
 function currentDeltaFragment(event: CurrentDelta) {
-  return event.type === "session.compaction.delta" ? event.data.text : event.data.delta
+  return event.type === "session.next.compaction.delta" ? event.data.text : event.data.delta
 }
 
 export function resumeStreamAfterPageShow(event: PageTransitionEvent, start: () => unknown) {

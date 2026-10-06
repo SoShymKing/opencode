@@ -1,5 +1,5 @@
 import { parseCommentNote, readCommentMetadata } from "@/utils/comment-note"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { NativeSessionMessage } from "@/utils/session-message"
 import { AssistantMessage, Part, UserMessage } from "@opencode-ai/sdk/v2"
 import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { groupParts, renderable, type PartGroup } from "@opencode-ai/session-ui/message-part"
@@ -43,7 +43,7 @@ export type TimelineRowMap = {
 
 export namespace Timeline {
   export function constructSessionMessageRows(
-    messages: SessionMessageInfo[],
+    messages: NativeSessionMessage[],
     getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
     getMessageParts: (messageID: string) => Part[],
     showReasoning: boolean,

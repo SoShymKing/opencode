@@ -12,7 +12,7 @@ import { QueryClient } from "@tanstack/solid-query"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
 import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses, resyncServerSessions } from "./server-sync"
+import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses, refreshActiveSessionStatuses, resyncServerSessions, recoverSessionConnection, createNativeSessionPoller } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
@@ -71,22 +71,86 @@ describe("MCP queries", () => {
 })
 
 describe("active session query", () => {
+  test.each(["bare", "explicit", "event"] as const)("active provenance keeps ordinary native retry correct for %s presence", (source) => {
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture" }))
+    session.remember({ id: "ses_retry", slug: "retry", projectID: "project", directory: "/repo", title: "retry", version: "1", time: { created: 1, updated: 1 } })
+    if (source === "event") session.apply({ type: "session.status", properties: { sessionID: "ses_retry", status: { type: "busy" } } })
+    seedActiveSessionStatuses(session, {
+      ses_retry: source === "explicit" ? { type: "running", status: { type: "busy" } } : { type: "running" },
+    }, session.snapshot.capture("session_status"))
+    session.applyV2({ id: "evt_retry", type: "session.next.retried", data: {
+      sessionID: "ses_retry", timestamp: 1700000005000, attempt: 1,
+      error: { message: "Fixture retry", isRetryable: true },
+    } })
+    expect(session.data.session_status.ses_retry).toEqual(source === "bare"
+      ? { type: "retry", attempt: 1, message: "Fixture retry", next: 1700000005000 }
+      : { type: "busy" })
+  })
+
+  test("repeated bare presence preserves cached retry without claiming authority", () => {
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture" }))
+    seedActiveSessionStatuses(session, { ses_retry: { type: "running" } }, session.snapshot.capture("session_status"))
+    session.applyV2({ id: "evt_retry_first", type: "session.next.retried", data: {
+      sessionID: "ses_retry", timestamp: 1700000005000, attempt: 1,
+      error: { message: "Fixture retry", isRetryable: true },
+    } })
+    seedActiveSessionStatuses(session, { ses_retry: { type: "running" } }, session.snapshot.capture("session_status"))
+    expect(session.data.session_status.ses_retry).toEqual({ type: "retry", attempt: 1, message: "Fixture retry", next: 1700000005000 })
+    session.applyV2({ id: "evt_retry_second", type: "session.next.retried", data: {
+      sessionID: "ses_retry", timestamp: 1700000006000, attempt: 2,
+      error: { message: "Fixture retry again", isRetryable: true },
+    } })
+    expect(session.data.session_status.ses_retry).toEqual({ type: "retry", attempt: 2, message: "Fixture retry again", next: 1700000006000 })
+  })
+
+  test.each(["refresh", "reconnect"] as const)("%s recovery keeps raw bare presence inferred through the native transport", async (mode) => {
+    const fetch = Object.assign(async (input: RequestInfo | URL) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname
+      if (path === "/api/session/active") return Response.json({ data: { ses_retry: { type: "running" } } })
+      if (path.endsWith("/message")) return Response.json({ data: [], cursor: {} })
+      return Response.json({ data: sessionInfo("ses_retry") })
+    }, { preconnect() {} })
+    const api = createApiForServer({ server: { url: "http://fixture" }, fetch })
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture", fetch }), api.session, api.message, { protocol: Promise.resolve("v2") })
+    if (mode === "refresh") await refreshActiveSessionStatuses(session, api.session)
+    if (mode === "reconnect") await resyncServerSessions({
+      event: { name: "global", details: { type: "server.connected" } },
+      session, api: api.session, refreshDirectories: async () => undefined,
+    })
+    session.applyV2({ id: "evt_retry", type: "session.next.retried", data: {
+      sessionID: "ses_retry", timestamp: 1700000005000, attempt: 1,
+      error: { message: "Fixture retry", isRetryable: true },
+    } })
+    expect(session.data.message.ses_retry).toEqual([])
+    expect(session.data.session_status.ses_retry).toEqual({ type: "retry", attempt: 1, message: "Fixture retry", next: 1700000005000 })
+  })
+
   test("reconnect native wire snapshot keeps full status through the installed client bridge", async () => {
-    const fetch = Object.assign(async () => Response.json({ data: {
-      ses_running: { type: "running", status: { type: "busy", activity: {
-        userMessageID: "msg_owner", model: "receiving", streamEventCount: 200,
-      } } },
-      ses_unknown: { type: "running" },
-    } }), { preconnect() {} })
+    const reads: string[] = []
+    const fetch = Object.assign(async (input: RequestInfo | URL) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname
+      reads.push(path)
+      if (path === "/api/session/active") return Response.json({ data: {
+        ses_running: { type: "running", status: { type: "busy", activity: {
+          userMessageID: "msg_owner", model: "receiving", streamEventCount: 200,
+        } } },
+        ses_unknown: { type: "running" },
+      } })
+      if (path.endsWith("/message")) return Response.json({ data: [], cursor: {} })
+      return Response.json({ data: sessionInfo(path.split("/").at(-1) ?? "") })
+    }, { preconnect() {} })
     const current = createApiForServer({ server: { url: "http://fixture" }, fetch })
     const legacy = createOpencodeClient({ baseUrl: "http://fixture", fetch })
     const api = createCompatibleApi({ protocol: Promise.resolve("v2"), current, legacy: () => legacy })
-    const session = createServerSession(legacy)
+    const session = createServerSession(legacy, api.session, api.message, { protocol: Promise.resolve("v2") })
     await resyncServerSessions({ event: { name: "global", details: { type: "server.connected" } }, session, api: api.session, refreshDirectories: async () => undefined })
     expect(session.data.session_status.ses_running).toEqual({ type: "busy", activity: {
       userMessageID: "msg_owner", model: "receiving", streamEventCount: 200,
     } })
     expect(session.data.session_status.ses_unknown).toEqual({ type: "busy" })
+    expect(session.data.message.ses_running).toEqual([])
+    expect(session.data.message.ses_unknown).toEqual([])
+    expect(reads.filter((path) => path === "/api/session/active")).toHaveLength(1)
   })
 
   test("reconnect legacy active adapter keeps full status instead of bare running", async () => {
@@ -198,6 +262,157 @@ describe("active session query", () => {
     expect(session.data.session_status.ses_running).toBeUndefined()
   })
 
+  test("seeds fresh active presence while retained history is still loading", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const statuses = Promise.withResolvers<Record<string, { type: "busy" }>>()
+    const read = Promise.withResolvers<void>()
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async () => { started.resolve(); await history.promise } },
+      statuses: async () => { const value = await statuses.promise; read.resolve(); return value },
+      capture: session.snapshot.capture("session_status"),
+    })
+    await started.promise
+    statuses.resolve({ active: { type: "busy" } })
+    await read.promise
+    await Promise.resolve()
+    expect(session.data.session_status.active).toEqual({ type: "busy" })
+    history.resolve()
+    await recovery
+  })
+
+  test.each(["wire", "epoch", "local"])("settlement keeps newer %s writes while final history is loading", async (mode) => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("session_status", "running", { type: "busy" })
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async () => { started.resolve(); await history.promise } },
+      statuses: async () => ({}),
+      capture: session.snapshot.capture("session_status"),
+      settleOnly: true,
+    })
+    await started.promise
+    if (mode === "wire") session.applyV2({ id: "evt_step", type: "session.next.step.started", data: { timestamp: 2, sessionID: "running", assistantMessageID: "msg_step", agent: "build", model: { id: "model", providerID: "provider" } } })
+    if (mode === "epoch") session.snapshot.connect()
+    if (mode === "local") session.set("session_status", "running", { type: "retry", attempt: 2, message: "newer", next: 10 })
+    history.resolve()
+    await recovery
+    expect(session.data.session_status.running).toEqual(mode === "local" ? { type: "retry", attempt: 2, message: "newer", next: 10 } : { type: "busy" })
+  })
+
+  test("recovers off-page retained history before clearing absent busy state", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    session.set("session_status", "cached", { type: "busy" })
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const calls: string[] = []
+    const recovery = recoverSessionConnection({
+      session: { ...session, sync: async (id, options) => { calls.push(id); expect(options?.force).toBe(true); started.resolve(); await history.promise } },
+      statuses: async () => ({}),
+      capture: session.snapshot.capture("session_status"),
+    })
+    await started.promise
+    expect(session.data.session_status.cached).toEqual({ type: "busy" })
+    history.resolve()
+    await recovery
+    expect(calls).toEqual(["cached"])
+    expect(session.data.session_status.cached).toBeUndefined()
+  })
+
+  test("failed active reads still refresh retained history without clearing status", async () => {
+    const session = createServerSession({} as OpencodeClient)
+    session.set("message", "cached", [])
+    session.set("session_status", "cached", { type: "retry", attempt: 1, message: "retry", next: 1 })
+    const calls: string[] = []
+    await expect(recoverSessionConnection({
+      session: { ...session, sync: async (id) => { calls.push(id) } },
+      statuses: async () => { throw new Error("offline") },
+      capture: session.snapshot.capture("session_status"),
+    })).rejects.toThrow("offline")
+    expect(calls).toEqual(["cached"])
+    expect(session.data.session_status.cached.type).toBe("retry")
+  })
+
+  test("native poller keeps one request, aborts on timeout, and cleans up", async () => {
+    const tasks = new Map<() => void, number>()
+    const pending = Promise.withResolvers<void>()
+    const finished = Promise.withResolvers<void>()
+    const signals: AbortSignal[] = []
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => 1,
+      poll: async (signal) => { signals.push(signal); await pending.promise; finished.resolve() },
+      schedule: (task, ms) => { tasks.set(task, ms); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    expect(tick).toBeDefined()
+    tick?.()
+    poller.start()
+    expect(signals.length).toBe(1)
+    const timeout = [...tasks].find(([, ms]) => ms === 10000)?.[0]
+    timeout?.()
+    expect(signals[0].aborted).toBe(true)
+    poller.dispose()
+    pending.resolve()
+    await finished.promise
+    expect(tasks.size).toBe(0)
+    expect(signals.length).toBe(1)
+  })
+
+  test("native poller retries failed membership reads only at the next fixed cadence", async () => {
+    const tasks = new Map<() => void, number>()
+    const scheduled = Promise.withResolvers<() => void>()
+    let calls = 0
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => 1,
+      poll: async () => { calls++; throw new Error("offline") },
+      schedule: (task, ms) => { tasks.set(task, ms); if (calls > 0 && ms === 1000) scheduled.resolve(task); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    tick?.()
+    const retry = await scheduled.promise
+    expect(calls).toBe(1)
+    expect(tasks.get(retry)).toBe(1000)
+    poller.dispose()
+    retry()
+    expect(calls).toBe(1)
+    expect(tasks.size).toBe(0)
+  })
+
+  test("native poller aborts an old connection request before scheduling the next epoch", async () => {
+    const tasks = new Map<() => void, number>()
+    const scheduled = Promise.withResolvers<() => void>()
+    const pending = Promise.withResolvers<void>()
+    const signals: AbortSignal[] = []
+    let epoch = 1
+    const poller = createNativeSessionPoller({
+      needed: () => true,
+      epoch: () => epoch,
+      poll: async (signal) => { signals.push(signal); await pending.promise },
+      schedule: (task, ms) => { tasks.set(task, ms); if (epoch === 2 && ms === 1000) scheduled.resolve(task); return () => { tasks.delete(task) } },
+    })
+    poller.start()
+    const tick = [...tasks].find(([, ms]) => ms === 1000)?.[0]
+    tick?.()
+    epoch = 2
+    poller.reset()
+    expect(signals[0].aborted).toBe(true)
+    expect(signals.length).toBe(1)
+    const next = await scheduled.promise
+    next()
+    expect(signals.length).toBe(2)
+    poller.dispose()
+    pending.resolve()
+    expect(signals[1].aborted).toBe(true)
+  })
+
   test("loads active sessions immediately and once per server cache", async () => {
     let calls = 0
     const queryClient = new QueryClient()
@@ -232,6 +447,54 @@ describe("active session query", () => {
       message: "retrying",
       next: 10,
     })
+  })
+
+  test("bare active presence keeps cached authoritative retry details", () => {
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture" }))
+    const status = { type: "retry" as const, attempt: 2, message: "auth", next: 10,
+      activity: { model: "waiting" as const, userMessageID: "msg_owner", streamEventCount: 200 },
+      action: { reason: "auth", provider: "provider", title: "title", message: "message", label: "label" },
+    }
+    session.set("session_status", "ses_retry", status)
+    seedActiveSessionStatuses(session, { ses_retry: { type: "running" } }, session.snapshot.capture("session_status"))
+    expect(session.data.session_status.ses_retry).toEqual(status)
+  })
+
+  test("idle terminal recovery waits for retained history before settling", async () => {
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture" }))
+    session.set("message", "ses_ended", [])
+    const history = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    const status = { type: "idle" as const, terminal: { userMessageID: "msg_owner", reason: "completed" as const } }
+    const recovering = recoverSessionConnection({
+      session: { ...session, sync: async () => { started.resolve(); await history.promise } },
+      capture: session.snapshot.capture("session_status"),
+      statuses: async () => ({ ses_ended: status }),
+    })
+    await started.promise
+    await Promise.resolve()
+    expect(session.data.session_status.ses_ended).toBeUndefined()
+    history.resolve()
+    await recovering
+    expect(session.data.session_status.ses_ended).toEqual(status)
+  })
+
+  test("reconnect uses one epoch and awaits directory restoration", async () => {
+    const session = createServerSession(createOpencodeClient({ baseUrl: "http://fixture" }))
+    const directory = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<void>()
+    let complete = false
+    const recovering = resyncServerSessions({
+      event: { name: "global", details: { type: "server.connected" } }, session,
+      api: { active: async () => ({}) },
+      refreshDirectories: async () => { started.resolve(); await directory.promise },
+    }).then(() => { complete = true })
+    await started.promise
+    expect(session.snapshot.epoch()).toBe(1)
+    expect(complete).toBe(false)
+    directory.resolve()
+    await recovering
+    expect(complete).toBe(true)
   })
 })
 

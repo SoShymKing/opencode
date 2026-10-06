@@ -1,11 +1,10 @@
 import type { ServerApi } from "./server"
 import type { ServerProtocol } from "./server-protocol"
-import type { SessionActive } from "@opencode-ai/protocol/groups/session"
+export type { SessionActiveSnapshot } from "./server"
 import type { AgentPartInput, FilePartInput, OpencodeClient, Session, TextPartInput } from "@opencode-ai/sdk/v2/client"
 import type {
   Project,
   ProjectCurrent,
-  SessionApi,
   SessionCommandInput,
   SessionCommandOutput,
   SessionCompactInput,
@@ -19,19 +18,24 @@ import type {
 
 type LegacyClient = OpencodeClient
 type LegacyFor = (directory?: string) => LegacyClient
-export type SessionActiveSnapshot = Record<string, typeof SessionActive.Encoded>
 type CompatibleSessionApi = Omit<
-  SessionApi,
-  "active" | "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
+  ServerApi["session"],
+  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
 > & {
-  active: () => Promise<SessionActiveSnapshot>
-  prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
+  prompt: (
+    input: SessionPromptInput & LegacyPrompt,
+    options?: Parameters<ServerApi["session"]["prompt"]>[1],
+  ) => Promise<SessionPromptOutput | Awaited<ReturnType<ServerApi["session"]["prompt"]>>>
   command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
   compact: (input: SessionCompactInput & { model?: LegacyPrompt["model"] }) => Promise<SessionCompactOutput>
-  rename: (input: Parameters<SessionApi["rename"]>[0] & LegacyLocation) => ReturnType<SessionApi["rename"]>
+  rename: (
+    input: Parameters<ServerApi["session"]["rename"]>[0] & LegacyLocation,
+  ) => ReturnType<ServerApi["session"]["rename"]>
   // archive: (input: Parameters<SessionApi["archive"]>[0] & LegacyLocation) => ReturnType<SessionApi["archive"]>
-  remove: (input: Parameters<SessionApi["remove"]>[0] & LegacyLocation) => ReturnType<SessionApi["remove"]>
+  remove: (
+    input: Parameters<ServerApi["session"]["remove"]>[0] & LegacyLocation,
+  ) => ReturnType<ServerApi["session"]["remove"]>
 }
 type CompatiblePermissionApi = Omit<ServerApi["permission"], "reply"> & {
   reply: (
@@ -88,9 +92,33 @@ function sessionInfo(session: Session): SessionInfo {
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const v1 = createV1Api(input)
+  const current = {
+    ...input.current,
+    session: {
+      ...input.current.session,
+      async prompt(
+        value: SessionPromptInput & LegacyPrompt,
+        options?: Parameters<ServerApi["session"]["prompt"]>[1],
+      ) {
+        if (value.agent) {
+          await input.current.session.switchAgent({ sessionID: value.sessionID, agent: value.agent }, options)
+        }
+        if (value.model) {
+          await input.current.session.switchModel(
+            {
+              sessionID: value.sessionID,
+              model: { id: value.model.modelID, providerID: value.model.providerID, variant: value.variant },
+            },
+            options,
+          )
+        }
+        return input.current.session.prompt(value, options)
+      },
+    },
+  }
   return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current)),
-    input.current,
+    input.protocol.then((protocol) => (protocol === "v1" ? v1 : current)),
+    current,
   )
 }
 
@@ -175,8 +203,8 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         if (!result.data) throw new Error(`Session not found: ${value.sessionID}`)
         return sessionInfo(result.data)
       },
-      async active() {
-        const result = await legacy().session.status()
+      async active(options?: Parameters<ServerApi["session"]["active"]>[0]) {
+        const result = await legacy().session.status(undefined, options)
         return Object.fromEntries(
           Object.entries(result.data ?? {}).flatMap(([sessionID, status]) =>
             status.type === "idle" ? [] : [[sessionID, { type: "running" as const, status }]],

@@ -19,7 +19,6 @@ import type {
   ProjectListOutput,
   ReferenceListInput,
   ReferenceListOutput,
-  SessionApi,
 } from "@opencode-ai/client/promise"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
@@ -43,6 +42,7 @@ import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { normalizeSessionInfo } from "@/utils/session"
 import type { ServerProtocol } from "@/utils/server-protocol"
 import type { ServerApi } from "@/utils/server"
+type SessionApi = Pick<ServerApi["session"], "get">
 
 type GlobalStore = {
   ready: boolean
@@ -307,6 +307,17 @@ export const loadReferencesQuery = (
     placeholderData: [],
   })
 
+export async function refreshDirectorySessionStatuses(input: {
+  sdk: OpencodeClient
+  session: ServerSession
+  directory: string
+}) {
+  const capture = input.session.snapshot.capture("session_status")
+  const statuses = (await input.sdk.session.status()).data ?? {}
+  input.session.snapshot.status(statuses, capture, input.directory)
+  await Promise.all(Object.keys(statuses).map((id) => input.session.resolve(id).catch(() => undefined)))
+}
+
 export async function bootstrapDirectory(input: {
   directory: string
   scope: ServerScope
@@ -386,17 +397,12 @@ export async function bootstrapDirectory(input: {
         retry(() =>
           (async () => {
             if ((await input.protocol) !== "v1") return
-            const captured = input.session?.snapshot.capture("session_status")
-            const x = await input.sdk.session.status()
             if (!input.session) {
+              const x = await input.sdk.session.status()
               input.setStore("session_status", x.data!)
               return
             }
-            const statuses = x.data ?? {}
-            if (captured) input.session.snapshot.status(statuses, captured, input.directory)
-            await Promise.all(
-              Object.keys(statuses).map((sessionID) => input.session!.resolve(sessionID).catch(() => undefined)),
-            )
+            await refreshDirectorySessionStatuses({ sdk: input.sdk, session: input.session, directory: input.directory })
           })(),
         ),
       !seededProject &&

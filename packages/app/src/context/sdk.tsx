@@ -4,7 +4,7 @@ import { type ServerSDK, useServerSDK } from "./server-sdk"
 
 export type DirectorySDK = ReturnType<ServerSDK["ensureDirSdkContext"]>
 
-export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
+const context = createSimpleContext({
   name: "SDK",
   // Resolves the directory-scoped SDK reactively from the (possibly changing) server.
   init: (props: { directory: string | Accessor<string> }) => {
@@ -15,3 +15,6 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     })
   },
 })
+
+export const useSDK: () => Accessor<DirectorySDK> = context.use
+export const SDKProvider = context.provider

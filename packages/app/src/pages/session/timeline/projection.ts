@@ -1,4 +1,4 @@
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { NativeSessionMessage } from "@/utils/session-message"
 import type { AssistantMessage, Message, Part, UserMessage } from "@opencode-ai/sdk/v2"
 import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { createMemo, type Accessor } from "solid-js"
@@ -10,7 +10,7 @@ export { reuseTimelineRows } from "./row-reconciliation"
 export function createTimelineProjection(input: {
   messages: Accessor<Message[]>
   userMessages: Accessor<UserMessage[]>
-  sessionMessages: Accessor<SessionMessageInfo[]>
+  sessionMessages: Accessor<NativeSessionMessage[]>
   parts: (messageID: string) => Part[]
   status: Accessor<typeof SessionStatusEvent.Info.Encoded>
   pending?: Accessor<Record<string, boolean>>

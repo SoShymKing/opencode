@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { NativeSessionMessage } from "@/utils/session-message"
 import { normalizeSessionMessages } from "@/utils/session-message"
 import type { CurrentSessionMessage } from "@/utils/session-message"
 import type { ServerSessionEvent } from "@/context/server-sdk"
@@ -49,7 +49,7 @@ describe("current session timeline rows", () => {
         model: { id: "model", providerID: "provider" },
         content: ["bash", "background_output"].map((name) => ({
           type: "tool" as const, id: `tool_${name}`, name,
-          state: { status: "completed" as const, input: {}, metadata: {}, content: [{ type: "text", text: "done" }] satisfies [{ type: "text"; text: string }] },
+          state: { status: "completed" as const, input: {}, structured: {}, content: [{ type: "text", text: "done" }] satisfies [{ type: "text"; text: string }] },
           time: { created: 2, completed: 3 },
         })),
         streamEventCount: 99, time: { created: 2, completed: 3 },
@@ -216,7 +216,7 @@ describe("current session timeline rows", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "text", text: "answer" }],
+        content: [{ type: "text", id: "answer", text: "answer" }],
         time: { created: 2, completed: 3 },
       },
       { id: "msg_3", type: "user", text: "second", time: { created: 4 } },
@@ -225,10 +225,10 @@ describe("current session timeline rows", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "reasoning", text: "working" }],
+        content: [{ type: "reasoning", id: "reasoning", text: "working" }],
         time: { created: 5 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
     const normalized = normalizeSessionMessages("ses_1", source)
     const messages = new Map(normalized.messages.map((message) => [message.id, message]))
 
@@ -245,10 +245,10 @@ describe("current session timeline rows", () => {
     expect(result.activeMessageID).toBe("msg_3")
     expect(result.rows.map(TimelineRow.key)).toEqual([
       "user-message:msg_1",
-      "assistant-part:msg_1:msg_2:text:0",
+      "assistant-part:msg_1:msg_2:answer",
       "turn-gap:msg_3",
       "user-message:msg_3",
-      "assistant-part:msg_3:msg_4:reasoning:0",
+      "assistant-part:msg_3:msg_4:reasoning",
     ])
   })
 
@@ -257,14 +257,12 @@ describe("current session timeline rows", () => {
       {
         id: "msg_shell",
         type: "shell",
-        shellID: "shell_1",
+        callID: "shell_1",
         command: "pwd",
-        status: "exited",
-        exit: 0,
-        output: { output: "/repo", cursor: 5, size: 5, truncated: false },
+        output: "/repo",
         time: { created: 1, completed: 2 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
     const normalized = normalizeSessionMessages("ses_1", source)
     const messages = new Map(normalized.messages.map((message) => [message.id, message]))
 
@@ -281,7 +279,7 @@ describe("current session timeline rows", () => {
     expect(result.activeMessageID).toBe("msg_shell")
     expect(result.rows.map(TimelineRow.key)).toEqual([
       "user-message:msg_shell",
-      "assistant-part:msg_shell:msg_shell:tool",
+      "assistant-part:msg_shell:msg_shell:shell_1",
     ])
   })
 
@@ -293,7 +291,7 @@ describe("current session timeline rows", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "text", text: "first answer" }],
+        content: [{ type: "text", id: "answer", text: "first answer" }],
         time: { created: 2, completed: 3 },
       },
       { id: "msg_user_2", type: "user", text: "second question", time: { created: 4 } },
@@ -302,10 +300,10 @@ describe("current session timeline rows", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "text", text: "second answer" }],
+        content: [{ type: "text", id: "answer", text: "second answer" }],
         time: { created: 5, completed: 6 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
     const normalized = normalizeSessionMessages("ses_1", source)
     const messages = new Map(normalized.messages.map((message) => [message.id, message]))
 
@@ -321,17 +319,17 @@ describe("current session timeline rows", () => {
 
     expect(result.rows.map(TimelineRow.key)).toEqual([
       "user-message:msg_user_1",
-      "assistant-part:msg_user_1:msg_assistant_1:text:0",
+      "assistant-part:msg_user_1:msg_assistant_1:answer",
       "turn-gap:msg_user_2",
       "user-message:msg_user_2",
-      "assistant-part:msg_user_2:msg_assistant_2:text:0",
+      "assistant-part:msg_user_2:msg_assistant_2:answer",
     ])
   })
 
   test("renders an optimistic user turn and thinking before the protocol message arrives", () => {
     const source = [
       { id: "msg_z", type: "user", text: "existing", time: { created: 1 } },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
     const normalized = normalizeSessionMessages("ses_1", source)
     const optimistic = {
       id: "msg_a",
@@ -370,7 +368,7 @@ describe("current session timeline rows", () => {
         agent: "build",
         model: { id: "model", providerID: "provider" },
         content: [],
-        error: { type: "ProviderError", message: "temporary failure" },
+        error: { type: "unknown", message: "temporary failure" },
         time: { created: 2, completed: 3 },
       },
       {
@@ -378,10 +376,10 @@ describe("current session timeline rows", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "text", text: "streaming again" }],
+        content: [{ type: "text", id: "answer", text: "streaming again" }],
         time: { created: 4 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
     const normalized = normalizeSessionMessages("ses_1", source)
     const messages = new Map(normalized.messages.map((message) => [message.id, message]))
 

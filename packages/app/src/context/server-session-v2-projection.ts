@@ -1,15 +1,14 @@
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
-import { normalizeSessionMessages } from "@/utils/session-message"
+import { normalizeSessionMessages, type NativeSessionMessage } from "@/utils/session-message"
 
 type ContextSource = {
   position: number
-  message: SessionMessageInfo
+  message: NativeSessionMessage
 }
 
 type RootUnit = {
   rootID: string
-  source: SessionMessageInfo[]
+  source: NativeSessionMessage[]
   agent: ContextSource | undefined
   model: ContextSource | undefined
   selected: boolean
@@ -17,7 +16,7 @@ type RootUnit = {
 
 export function normalizeTouchedSessionMessages(
   sessionID: string,
-  source: readonly SessionMessageInfo[],
+  source: readonly NativeSessionMessage[],
   touched: readonly string[],
 ) {
   const expanded = new Set(touched)
@@ -29,7 +28,7 @@ export function normalizeTouchedSessionMessages(
 
   const project = (unit: RootUnit) => {
     if (!unit.selected) return
-    const context = new Map<number, SessionMessageInfo>()
+    const context = new Map<number, NativeSessionMessage>()
     if (unit.agent) context.set(unit.agent.position, unit.agent.message)
     if (unit.model) context.set(unit.model.position, unit.model.message)
     const normalized = normalizeSessionMessages(sessionID, [
@@ -43,7 +42,7 @@ export function normalizeTouchedSessionMessages(
   }
 
   source.forEach((message, position) => {
-    const root = message.type === "user" || (message.type === "synthetic" && message.description?.trim())
+    const root = message.type === "user" || (message.type === "synthetic" && message.text.trim())
     if (root || message.type === "shell") {
       if (current) project(current)
       current = undefined

@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { NativeSessionMessage } from "@/utils/session-message"
 import { normalizeTouchedSessionMessages } from "./server-session-v2-projection"
 
-type Assistant = Extract<SessionMessageInfo, { type: "assistant" }>
+type Assistant = Extract<NativeSessionMessage, { type: "assistant" }>
 
 const model = (id: string) => ({ id, providerID: `${id}-provider` })
-const user = (id: string): SessionMessageInfo => ({ id, type: "user", text: id, time: { created: 1 } })
+const user = (id: string): NativeSessionMessage => ({ id, type: "user", text: id, time: { created: 1 } })
 const assistant = (
   id: string,
   input: { agent?: string; modelID?: string; text?: string } = {},
@@ -14,13 +14,12 @@ const assistant = (
   type: "assistant",
   agent: input.agent ?? "build",
   model: model(input.modelID ?? "default"),
-  content: [{ type: "text", text: input.text ?? id }],
+  content: [{ type: "text", id: "text", text: input.text ?? id }],
   time: { created: 2 },
 })
-const compaction = (id: string): SessionMessageInfo => ({
+const compaction = (id: string): NativeSessionMessage => ({
   id,
   type: "compaction",
-  status: "completed",
   reason: "auto",
   summary: id,
   recent: "recent",
@@ -65,7 +64,7 @@ describe("normalizeTouchedSessionMessages", () => {
       { id: "agent-marker", type: "agent-switched", agent: "review", time: { created: 1 } },
       { id: "model-marker", type: "model-switched", model: model("marker-model"), time: { created: 2 } },
       user("user"),
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
 
     const result = normalizeTouchedSessionMessages("session", source, ["agent-marker", "model-marker", "user"])
 
@@ -86,15 +85,13 @@ describe("normalizeTouchedSessionMessages", () => {
       {
         id: "shell",
         type: "shell",
-        shellID: "shell-id",
+        callID: "shell-id",
         command: "printf hello",
-        status: "exited",
-        exit: 0,
-        output: { output: "hello", cursor: 5, size: 5, truncated: false },
+        output: "hello",
         time: { created: 3, completed: 4 },
       },
       user("next-user"),
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
 
     const result = normalizeTouchedSessionMessages("session", source, ["shell"])
 
@@ -157,7 +154,7 @@ describe("normalizeTouchedSessionMessages", () => {
       user("user"),
       { id: "marker", type: "agent-switched", agent: "review", time: { created: 2 } },
       assistant("assistant"),
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeSessionMessage[]
 
     const result = normalizeTouchedSessionMessages("session", source, ["marker"])
 

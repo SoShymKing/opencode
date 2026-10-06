@@ -25,15 +25,14 @@ function setup(
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
-        return Response.json({
+        return Response.json({ data: {
           admittedSeq: 1,
           id: "msg_1",
           sessionID: "ses_1",
           timeCreated: 1,
-          type: "user",
-          data: { text: "hello" },
+          prompt: { text: "hello" },
           delivery: "steer",
-        })
+        } })
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
@@ -74,6 +73,7 @@ describe("createCompatibleApi", () => {
       text: "hello @src/index.ts",
       agent: "build",
       model: { providerID: "provider", modelID: "model" },
+      variant: "selected",
       files: [
         { uri: "file:///repo/src/index.ts", name: "index.ts", mention: { text: "@src/index.ts", start: 6, end: 19 } },
         { uri: "data:text/plain;base64,aGVsbG8=", name: "notes.txt" },
@@ -86,6 +86,7 @@ describe("createCompatibleApi", () => {
       messageID: "msg_1",
       agent: "build",
       model: { providerID: "provider", modelID: "model" },
+      variant: "selected",
       parts: [
         { type: "text", text: "hello @src/index.ts" },
         {

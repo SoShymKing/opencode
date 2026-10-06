@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test"
-import type { SessionMessageInfo } from "@opencode-ai/client/promise"
-import { normalizeSessionMessages } from "./session-message"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { Schema } from "effect"
+import { normalizeSessionMessages, sessionMessagePartID } from "./session-message"
+type NativeMessage = typeof SessionMessage.Message.Encoded
+const native = Schema.decodeUnknownSync(Schema.Array(Schema.toEncoded(SessionMessage.Message)))
 
 describe("normalizeSessionMessages", () => {
   test("projects current turns into stable legacy rendering records", () => {
@@ -18,20 +21,18 @@ describe("normalizeSessionMessages", () => {
         text: "inspect @src/client.ts",
         files: [
           {
-            data: "aGVsbG8=",
+            uri: "data:text/plain;base64,aGVsbG8=",
             mime: "text/plain",
             name: "note.txt",
-            source: { type: "inline" },
           },
           {
-            data: "ZXhwb3J0IHt9",
+            uri: "data:text/plain;base64,ZXhwb3J0IHt9",
             mime: "text/plain",
             name: "client.ts",
-            source: { type: "inline" },
-            mention: { text: "@src/client.ts", start: 8, end: 22 },
+            source: { text: "@src/client.ts", start: 8, end: 22 },
           },
         ],
-        agents: [{ name: "review", mention: { text: "@review", start: 0, end: 7 } }],
+        agents: [{ name: "review", source: { text: "@review", start: 0, end: 7 } }],
         time: { created: 3 },
       },
       {
@@ -40,8 +41,8 @@ describe("normalizeSessionMessages", () => {
         agent: "build",
         model: { id: "claude", providerID: "anthropic", variant: "high" },
         content: [
-          { type: "reasoning", text: "Thinking", time: { created: 4, completed: 5 } },
-          { type: "text", text: "Result" },
+          { type: "reasoning", id: "reason_1", text: "Thinking", time: { created: 4, completed: 5 } },
+          { type: "text", id: "text_1", text: "Result" },
           {
             type: "tool",
             id: "call_1",
@@ -49,7 +50,7 @@ describe("normalizeSessionMessages", () => {
             state: {
               status: "completed",
               input: { filePath: "note.txt" },
-              metadata: { title: "note.txt" },
+              structured: { title: "note.txt" },
               content: [{ type: "text", text: "hello" }],
             },
             time: { created: 5, ran: 6, completed: 7 },
@@ -62,15 +63,14 @@ describe("normalizeSessionMessages", () => {
       {
         id: "msg_5",
         type: "compaction",
-        status: "completed",
         reason: "auto",
         summary: "summary",
         recent: "recent",
         time: { created: 8 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeMessage[]
 
-    const result = normalizeSessionMessages("ses_1", source)
+    const result = normalizeSessionMessages("ses_1", native(source))
 
     expect(result.messages).toHaveLength(2)
     expect(result.messages[0]).toMatchObject({
@@ -95,7 +95,7 @@ describe("normalizeSessionMessages", () => {
         text: { value: "@src/client.ts", start: 8, end: 22 },
       },
     })
-    expect(result.parts.get("msg_4")?.map((part) => part.id)).toEqual(["msg_4:reasoning:0", "msg_4:text:0", "call_1"])
+    expect(result.parts.get("msg_4")?.map((part) => part.id)).toEqual(["msg_4:reason_1", "msg_4:text_1", "msg_4:call_1"])
     expect(result.parts.get("msg_4")?.[2]).toMatchObject({
       type: "tool",
       tool: "read",
@@ -110,12 +110,12 @@ describe("normalizeSessionMessages", () => {
         type: "assistant",
         agent: "build",
         model: { id: "model", providerID: "provider" },
-        content: [{ type: "text", text: "orphan" }],
+        content: [{ type: "text", id: "text_1", text: "orphan" }],
         time: { created: 2 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeMessage[]
 
-    expect(normalizeSessionMessages("ses_1", source).messages).toEqual([])
+    expect(normalizeSessionMessages("ses_1", native(source)).messages).toEqual([])
   })
 
   test("projects a current shell message into a renderable standalone turn", () => {
@@ -123,16 +123,14 @@ describe("normalizeSessionMessages", () => {
       {
         id: "msg_shell",
         type: "shell",
-        shellID: "shell_1",
+        callID: "shell_1",
         command: "printf hello",
-        status: "exited",
-        exit: 0,
-        output: { output: "hello", cursor: 5, size: 5, truncated: false },
+        output: "hello",
         time: { created: 1, completed: 2 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeMessage[]
 
-    const result = normalizeSessionMessages("ses_1", source)
+    const result = normalizeSessionMessages("ses_1", native(source))
 
     expect(result.messages).toEqual([
       expect.objectContaining({ id: "msg_shell", role: "user" }),
@@ -170,7 +168,7 @@ describe("normalizeSessionMessages", () => {
               status: "completed",
               input: { path: "/repo/README.md", oldString: "old", newString: "new" },
               content: [{ type: "text", text: "Edited file successfully" }],
-              metadata: {
+              structured: {
                 files: [
                   {
                     file: "README.md",
@@ -188,9 +186,9 @@ describe("normalizeSessionMessages", () => {
         ],
         time: { created: 2, completed: 4 },
       },
-    ] satisfies SessionMessageInfo[]
+    ] satisfies NativeMessage[]
 
-    const result = normalizeSessionMessages("ses_1", source)
+    const result = normalizeSessionMessages("ses_1", native(source))
 
     expect(result.parts.get("msg_assistant")).toEqual([
       expect.objectContaining({
@@ -209,6 +207,65 @@ describe("normalizeSessionMessages", () => {
           }),
         }),
       }),
+    ])
+  })
+
+  test("scopes explicit content IDs and keeps identity after empty text omission", () => {
+    const source = [
+      { id: "msg_user", type: "user", text: "inspect", time: { created: 1 } },
+      ...["msg_a", "msg_b"].map((id) => ({
+        id, type: "assistant" as const, agent: "build", model: { id: "model", providerID: "provider" },
+        content: [
+          { type: "text" as const, id: "empty", text: "" },
+          { type: "text" as const, id: "shared", text: "answer" },
+          { type: "tool" as const, id: "call", name: "edit", state: { status: "pending" as const, input: "{}" }, time: { created: 2 } },
+        ], time: { created: 2 },
+      })),
+    ] satisfies NativeMessage[]
+    const result = normalizeSessionMessages("ses_1", native(source))
+    expect(result.parts.get("msg_a")?.map((part) => part.id)).toEqual(["msg_a:shared", "msg_a:call"])
+    expect(result.parts.get("msg_b")?.map((part) => part.id)).toEqual(["msg_b:shared", "msg_b:call"])
+    expect(result.parts.get("msg_b")?.[1]).toMatchObject({ callID: "call", state: { status: "pending", raw: "{}" } })
+    expect(sessionMessagePartID("msg_a", "shared")).toBe("msg_a:shared")
+    expect(sessionMessagePartID("msg_a", "text:0")).toBe("msg_a:text:0")
+  })
+
+  test("projects native synthetic text without a description", () => {
+    const source = [{ id: "msg_s", sessionID: "ses_1", type: "synthetic", text: "context", metadata: { retained: true }, time: { created: 3 } }] satisfies NativeMessage[]
+    expect(normalizeSessionMessages("ses_1", native(source)).parts.get("msg_s")).toEqual([
+      expect.objectContaining({ id: "msg_s:text:0", text: "context", synthetic: true }),
+    ])
+    expect(source[0].metadata).toEqual({ retained: true })
+  })
+
+  test("retains canonical rich snapshot fields while adapting UI tool states", () => {
+    const source = native([
+      { id: "msg_user", type: "user", text: "run", time: { created: 1 } },
+      { id: "msg_assistant", type: "assistant", agent: "build", model: { id: "model", providerID: "provider" },
+        metadata: { canonical: true }, streamEventCount: 0, snapshot: { start: "before", end: "after", files: ["a"] }, time: { created: 2, completed: 9 },
+        content: [
+          { type: "tool", id: "pending", name: "write", state: { status: "pending", input: "{\"path\":\"a\"}" }, time: { created: 2 } },
+          { type: "tool", id: "running", name: "write", state: { status: "running", input: { path: "a" }, structured: { progress: 1 }, content: [{ type: "text", text: "partial" }] }, time: { created: 3, ran: 4 } },
+          { type: "tool", id: "completed", name: "write", provider: { executed: true, metadata: { vendor: { request: true } }, resultMetadata: { vendor: { response: true } } },
+            state: { status: "completed", input: { path: "a" }, structured: { done: true }, content: [{ type: "text", text: "done" }, { type: "file", uri: "file:///repo/a", mime: "text/plain" }],
+              attachments: [{ uri: "file:///repo/b", mime: "text/plain", description: "attachment" }], outputPaths: ["a", "b"], result: { preserved: true } }, time: { created: 5, ran: 6, completed: 7, pruned: 8 } },
+          { type: "tool", id: "error", name: "write", state: { status: "error", input: { path: "a" }, structured: { partial: true }, content: [{ type: "text", text: "partial" }], error: { type: "unknown", message: "failure" }, result: { preserved: true } }, time: { created: 8, completed: 9 } },
+        ],
+      },
+    ])
+    const before = structuredClone(source)
+    const result = normalizeSessionMessages("ses_1", source)
+    expect(source).toEqual(before)
+    expect(result.messages[1]).toMatchObject({ time: { created: 2, completed: 9 }, streamEventCount: 0 })
+    expect(result.parts.get("msg_assistant")).toEqual([
+      expect.objectContaining({ id: "msg_assistant:pending", callID: "pending", state: expect.objectContaining({ status: "pending", input: { path: "a", filePath: "a" } }) }),
+      expect.objectContaining({ id: "msg_assistant:running", state: expect.objectContaining({ status: "running", metadata: { progress: 1 }, time: { start: 4 } }) }),
+      expect.objectContaining({ id: "msg_assistant:completed", metadata: { executed: true, metadata: { vendor: { request: true } }, resultMetadata: { vendor: { response: true } } },
+        state: expect.objectContaining({ status: "completed", output: "done", time: { start: 6, end: 7 }, attachments: [
+          expect.objectContaining({ id: "msg_assistant:completed:file:1", url: "file:///repo/a" }),
+          expect.objectContaining({ id: "msg_assistant:completed:file:2", url: "file:///repo/b" }),
+        ] }) }),
+      expect.objectContaining({ id: "msg_assistant:error", state: expect.objectContaining({ status: "error", error: "failure", metadata: { partial: true }, time: { start: 8, end: 9 } }) }),
     ])
   })
 })
