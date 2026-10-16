@@ -1,70 +1,80 @@
 /** @jsxImportSource @opentui/solid */
+import type { OpenCodeEvent } from "@opencode/client"
 import { testRender, type JSX } from "@opentui/solid"
-import { onMount } from "solid-js"
-import { ArgsProvider } from "../../../../src/context/args"
-import { ExitProvider } from "../../../../src/context/exit"
-import { KVProvider, useKV } from "../../../../src/context/kv"
-import { ProjectProvider, useProject } from "../../../../src/context/project"
-import { SDKProvider } from "../../../../src/context/sdk"
-import { SyncProvider, useSync } from "../../../../src/context/sync"
-import { PermissionProvider } from "../../../../src/context/permission"
-import { createEventSource, createFetch, type FetchHandler, directory } from "../../../fixture/tui-sdk"
+import { createEffect, createRoot, onCleanup } from "solid-js"
+import { ClientProvider, useClient } from "../../../../src/context/client"
+import { DataProvider, useData } from "../../../../src/context/data"
+import { createApi, createEventStream, createFetch, directory, type FetchHandler } from "../../../fixture/tui-client"
 import { TestTuiContexts } from "../../../fixture/tui-environment"
-export { createEventSource, createFetch, directory, eventSource, json, worktree } from "../../../fixture/tui-sdk"
 
-export async function wait(fn: () => boolean, timeout = 2000) {
-  const start = Date.now()
-  while (!fn()) {
-    if (Date.now() - start > timeout) throw new Error("timed out waiting for condition")
-    await Bun.sleep(10)
-  }
+export { createApi, createEventStream, createFetch, directory, json, worktree } from "../../../fixture/tui-client"
+
+export function wait(predicate: () => boolean) {
+  return new Promise<void>((resolve, reject) => {
+    createRoot((dispose) => {
+      const deadline = setTimeout(() => {
+        dispose()
+        reject(new Error("Timed out waiting for native TUI state"))
+      }, 4000)
+      onCleanup(() => clearTimeout(deadline))
+      createEffect(() => {
+        if (!predicate()) return
+        dispose()
+        resolve()
+      })
+    })
+  })
 }
 
-type Ctx = { kv: ReturnType<typeof useKV>; project: ReturnType<typeof useProject>; sync: ReturnType<typeof useSync> }
-
-export async function mount(override?: FetchHandler, state?: string, view?: () => JSX.Element) {
-  const calls = createFetch(override)
-  const events = createEventSource()
-  let sync!: ReturnType<typeof useSync>
-  let project!: ReturnType<typeof useProject>
-  let kv!: ReturnType<typeof useKV>
-  let done!: () => void
-  const ready = new Promise<void>((resolve) => {
-    done = resolve
-  })
-
+export async function mount(override?: FetchHandler, view?: () => JSX.Element) {
+  const events = createEventStream()
+  const calls = createFetch(override, events)
+  const mounted = Promise.withResolvers<{ data: ReturnType<typeof useData>; client: ReturnType<typeof useClient> }>()
   function Probe() {
-    const ctx: Ctx = { kv: useKV(), project: useProject(), sync: useSync() }
-    onMount(() => {
-      sync = ctx.sync
-      project = ctx.project
-      kv = ctx.kv
-      done()
-    })
+    mounted.resolve({ data: useData(), client: useClient() })
     return <box>{view?.()}</box>
   }
-
-  const app = await testRender(() => (
-    <TestTuiContexts paths={state ? { state } : undefined}>
-      <ArgsProvider>
-        <ExitProvider exit={() => {}}>
-          <KVProvider>
-            <SDKProvider url="http://test" directory={directory} fetch={calls.fetch} events={events.source}>
-              <PermissionProvider>
-                <ProjectProvider>
-                  <SyncProvider>
-                    <Probe />
-                  </SyncProvider>
-                </ProjectProvider>
-              </PermissionProvider>
-            </SDKProvider>
-          </KVProvider>
-        </ExitProvider>
-      </ArgsProvider>
-    </TestTuiContexts>
-  ))
-
-  await ready
-  await wait(() => sync.status === "complete")
-  return { app, emit: events.emit, kv, project, sync, session: calls.session }
+  const app = await testRender(
+    () => (
+      <TestTuiContexts>
+        <ClientProvider api={createApi(calls.fetch)}>
+          <DataProvider directory={directory}>
+            <Probe />
+          </DataProvider>
+        </ClientProvider>
+      </TestTuiContexts>
+    ),
+    { width: 100, height: 20, kittyKeyboard: true },
+  )
+  const context = await mounted.promise
+  try {
+    await wait(() => context.client.connection.status() === "connected")
+  } catch (error) {
+    app.renderer.destroy()
+    throw error
+  }
+  return {
+    app,
+    ...context,
+    async emit(event: OpenCodeEvent) {
+      const received = Promise.withResolvers<void>()
+      const off = context.client.event.listen(({ details }) => {
+        if (details.type === event.type && details.id === event.id) received.resolve()
+      })
+      try {
+        events.emit(event)
+        await received.promise
+      } finally {
+        off()
+      }
+    },
+    async frame() {
+      await app.renderOnce()
+      await app.renderOnce()
+      return app.captureCharFrame()
+    },
+    [Symbol.dispose]() {
+      app.renderer.destroy()
+    },
+  }
 }

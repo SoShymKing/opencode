@@ -1,10 +1,10 @@
 import { asc, desc, inArray, sql, type SQL } from "drizzle-orm"
 import { Effect, Schema } from "effect"
-import type { Database } from "../database/database"
-import { MessageDecodeError } from "./error"
-import { SessionMessage } from "./message"
-import { SessionSchema } from "./schema"
-import { SessionMessagePartTable, SessionMessageTable } from "./sql"
+import type { Database } from "../database/database.js"
+import { MessageDecodeError } from "./error.js"
+import { SessionMessage } from "./message.js"
+import { SessionSchema } from "./schema.js"
+import { SessionMessagePartTable, SessionMessageTable } from "./sql.js"
 
 type EnvelopeRow = {
   readonly sessionID: SessionSchema.ID
@@ -29,10 +29,39 @@ type HydrateInput = {
   readonly limit?: number
 }
 
-const parseJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)
-const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
+const parseJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
+const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Info)
 const decodeContent = Schema.decodeUnknownEffect(SessionMessage.AssistantContent)
-const encodeMessage = Schema.encodeEffect(SessionMessage.Message)
+const encodeMessage = Schema.encodeEffect(SessionMessage.Info)
+
+export const encodeStoredMessage = Effect.fn("MessageStorage.encodeStoredMessage")(function* (message: SessionMessage.Info) {
+  const encoded = yield* encodeMessage(message)
+  const parts: (typeof SessionMessagePartTable.$inferInsert)[] = []
+  const ordinals = { text: 0, reasoning: 0 }
+  if (encoded.type === "assistant") {
+    const { id: _, type, content, ...data } = encoded
+    content.forEach((part, position) => {
+      if (part.type === "tool") {
+        const { id: partID, type: partType, ...partData } = part
+        parts.push({ message_id: message.id, position, id: partID, type: partType, data: partData })
+        return
+      }
+      const { type: partType, ...partData } = part
+      parts.push({ message_id: message.id, position, id: String(ordinals[partType]++), type: partType, data: partData })
+    })
+    return { envelope: { id: message.id, type, data }, parts }
+  }
+  const { id: _, type, ...data } = encoded
+  return { envelope: { id: message.id, type, data }, parts }
+})
+
+export const insertMessageChildren = Effect.fn("MessageStorage.insertMessageChildren")(function* (
+  db: Pick<Database.Interface["db"], "insert">,
+  parts: readonly (typeof SessionMessagePartTable.$inferInsert)[],
+) {
+  if (parts.length === 0) return
+  yield* db.insert(SessionMessagePartTable).values([...parts]).run()
+})
 
 const failure = (row: { readonly sessionID: SessionSchema.ID; readonly messageID: SessionMessage.ID }) =>
   new MessageDecodeError({ sessionID: row.sessionID, messageID: row.messageID })
@@ -58,7 +87,9 @@ export const decodeChild = Effect.fn("MessageStorage.decodeChild")(function* (ro
   if (!isObject(data) || "id" in data || "type" in data || !Number.isSafeInteger(row.position) || row.position < 0) {
     return yield* failure(row)
   }
-  return yield* decodeContent({ ...data, id: row.id, type: row.type }).pipe(Effect.mapError(() => failure(row)))
+  return yield* decodeContent({ ...data, ...(row.type === "tool" ? { id: row.id } : {}), type: row.type }).pipe(
+    Effect.mapError(() => failure(row)),
+  )
 })
 
 export const hydrateSelection = Effect.fn("MessageStorage.hydrateSelection")(function* (input: HydrateInput) {

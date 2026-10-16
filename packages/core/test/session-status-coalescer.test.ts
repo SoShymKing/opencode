@@ -2,8 +2,8 @@ import { expect } from "bun:test"
 import { Deferred, Effect, Fiber, Scope, Exit } from "effect"
 import { TestClock } from "effect/testing"
 import { SessionStatusCoalescer } from "../src/session/status-coalescer"
-import { SessionMessage } from "@opencode-ai/schema/session-message"
-import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import { SessionMessage } from "@opencode/schema/session-message"
+import type { SessionStatusEvent } from "@opencode/schema/session-status-event"
 import { it } from "./lib/effect"
 
 const owner = SessionMessage.ID.create()

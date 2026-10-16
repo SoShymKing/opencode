@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { createReadStream } from "node:fs"
 import { link, lstat, open, rename, rm, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
-import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
+import type { EffectDrizzleSqlite } from "./drizzle.js"
 import { sql } from "drizzle-orm"
 import { Effect, Exit } from "effect"
 

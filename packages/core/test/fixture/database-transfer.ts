@@ -1,6 +1,7 @@
 import { Database as SqliteDatabase } from "bun:sqlite"
 import path from "node:path"
-import { Database } from "@opencode-ai/core/database/database"
+import sessionMessagePartMigration from "../../src/database/ws-message-parts"
+import { useDatabase } from "./database-migration"
 import { sql } from "drizzle-orm"
 import { Effect } from "effect"
 
@@ -42,9 +43,27 @@ export const userEnvelope = {
 }
 
 export async function createCurrentDatabase(filename: string) {
-  await Effect.runPromise(
+  await useDatabase(filename, (db) =>
     Effect.gen(function* () {
-      const db = (yield* Database.Service).db
+      yield* db.run("PRAGMA journal_mode = WAL")
+      yield* db.run("PRAGMA foreign_keys = ON")
+      yield* db.run(`CREATE TABLE project (
+        id text PRIMARY KEY, worktree text NOT NULL, time_created integer NOT NULL,
+        time_updated integer NOT NULL, sandboxes text NOT NULL
+      )`)
+      yield* db.run(`CREATE TABLE session (
+        id text PRIMARY KEY, project_id text NOT NULL REFERENCES project(id),
+        slug text NOT NULL, directory text NOT NULL, title text NOT NULL,
+        version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL
+      )`)
+      yield* db.run(`CREATE TABLE session_message (
+        id text PRIMARY KEY, session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+        type text NOT NULL, seq integer NOT NULL, time_created integer NOT NULL,
+        time_updated integer NOT NULL, data text NOT NULL
+      )`)
+      yield* db.run("CREATE TABLE migration (id text PRIMARY KEY, time_completed integer NOT NULL)")
+      yield* db.transaction((tx) => sessionMessagePartMigration.up(tx))
+      yield* db.run("INSERT INTO migration VALUES ('v01_baseline', 1), ('v02_session_message_part', 1)")
       yield* db.run(sql`INSERT INTO project (
         id, worktree, time_created, time_updated, sandboxes
       ) VALUES ('project', ${path.dirname(filename)}, 1, 1, '[]')`)
@@ -71,7 +90,7 @@ export async function createCurrentDatabase(filename: string) {
         { discard: true },
       )
       yield* db.run("PRAGMA wal_checkpoint(TRUNCATE)")
-    }).pipe(Effect.provide(Database.layerFromPath(filename)), Effect.scoped),
+    }),
   )
 }
 

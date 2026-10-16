@@ -1,19 +1,26 @@
-import { TextAttributes } from "@opentui/core"
-import { useKeyboard } from "@opentui/solid"
-import type { VcsFileStatus } from "@opencode-ai/sdk/v2"
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
+import type { VcsFileStatus } from "@opencode/client"
 import { createMemo, For } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Locale } from "../util/locale"
+import { FilePath } from "../ui/file-path"
 import { useTheme } from "../context/theme"
-import { useTuiConfig } from "../config"
-import { useDialog, type DialogContext } from "../ui/dialog"
+import { useConfig } from "../config"
+import {
+  DIALOG_INSET,
+  DialogBleed,
+  dialogWidth,
+  DialogHeader,
+  DialogLayout,
+  useDialog,
+  type DialogContext,
+} from "../ui/dialog"
 import { getScrollAcceleration } from "../util/scroll"
 
 const options = ["no", "yes"] as const
 
 export type WorkspaceFileChangesChoice = (typeof options)[number]
 
-function statusLabel(status: VcsFileStatus["status"]) {
+export function statusLabel(status: VcsFileStatus["status"]) {
   if (status === "added") return "A"
   if (status === "deleted") return "D"
   return "M"
@@ -31,12 +38,22 @@ export function DialogWorkspaceFileChanges(props: {
   message?: string
 }) {
   const dialog = useDialog()
-  const { theme } = useTheme()
-  const tuiConfig = useTuiConfig()
-  const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
+  const theme = useTheme().surface("dialog")
+  const overlayTheme = useTheme()
+  const config = useConfig().data
+  const dimensions = useTerminalDimensions()
+  const scrollAcceleration = createMemo(() => getScrollAcceleration(config))
   const [store, setStore] = createStore({ active: "yes" as WorkspaceFileChangesChoice })
   const height = createMemo(() => Math.min(props.files.length, 8))
-  const fileNameWidth = createMemo(() => 48 - Math.max(Math.max(7, ...props.files.map(changeCountWidth)) - 7, 0))
+  const fileNameWidth = createMemo(() =>
+    Math.max(
+      2,
+      Math.min(dialogWidth("medium"), dimensions().width - 2) -
+        DIALOG_INSET * 2 -
+        2 -
+        Math.max(7, ...props.files.map(changeCountWidth)),
+    ),
+  )
 
   function confirm() {
     props.onSelect(store.active)
@@ -66,67 +83,72 @@ export function DialogWorkspaceFileChanges(props: {
   })
 
   return (
-    <box gap={1}>
-      <box flexDirection="row" justifyContent="space-between" paddingLeft={2} paddingRight={2}>
-        <text attributes={TextAttributes.BOLD} fg={theme.text}>
-          {props.title ?? "File Changes Found"}
-        </text>
-        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
-          esc
-        </text>
-      </box>
-      <box paddingLeft={2} paddingRight={2}>
-        <text fg={theme.textMuted} wrapMode="word">
+    <DialogLayout
+      header={<DialogHeader title={props.title ?? "File Changes Found"} />}
+      footer={
+        <box flexDirection="row" justifyContent="flex-end">
+          <For each={options}>
+            {(item) => (
+              <box
+                paddingLeft={2}
+                paddingRight={2}
+                backgroundColor={item === store.active ? theme.background.action.primary.focused : undefined}
+                onMouseUp={() => {
+                  setStore("active", item)
+                  props.onSelect(item)
+                  dialog.clear()
+                }}
+              >
+                <text fg={item === store.active ? theme.text.action.primary.focused : theme.text.muted}>{item}</text>
+              </box>
+            )}
+          </For>
+        </box>
+      }
+    >
+      <box gap={1}>
+        <text fg={theme.text.muted} wrapMode="word">
           {props.message ?? "Do you want to move these changes with the session?"}
         </text>
-      </box>
-      <scrollbox
-        height={height()}
-        backgroundColor={theme.backgroundElement}
-        scrollbarOptions={{ visible: false }}
-        scrollAcceleration={scrollAcceleration()}
-      >
-        <For each={props.files}>
-          {(item) => (
-            <box flexDirection="row" justifyContent="space-between" paddingLeft={2} paddingRight={2}>
-              <box flexDirection="row" minWidth={0} flexShrink={1}>
-                <box width={2} flexShrink={0}>
-                  <text fg={theme.textMuted}>{statusLabel(item.status)}</text>
+        <DialogBleed>
+          <scrollbox
+            height={height()}
+            backgroundColor={overlayTheme.background.raised.high}
+            scrollbarOptions={{ visible: false }}
+            scrollAcceleration={scrollAcceleration()}
+          >
+            <For each={props.files}>
+              {(item) => (
+                <box
+                  flexDirection="row"
+                  justifyContent="space-between"
+                  paddingLeft={DIALOG_INSET}
+                  paddingRight={DIALOG_INSET}
+                >
+                  <box flexDirection="row" minWidth={0} flexShrink={1}>
+                    <box width={2} flexShrink={0}>
+                      <text fg={overlayTheme.text.muted}>{statusLabel(item.status)}</text>
+                    </box>
+                    <FilePath value={item.file} maxWidth={fileNameWidth()} fg={overlayTheme.text.muted} />
+                  </box>
+                  <box flexDirection="row" gap={1} minWidth={7} flexShrink={0} justifyContent="flex-end">
+                    <text>
+                      {" "}
+                      {item.additions ? (
+                        <span style={{ fg: overlayTheme.diff.text.added }}>+{item.additions}</span>
+                      ) : null}
+                      {item.deletions ? (
+                        <span style={{ fg: overlayTheme.diff.text.removed }}> -{item.deletions}</span>
+                      ) : null}
+                    </text>
+                  </box>
                 </box>
-                <text fg={theme.textMuted} wrapMode="none">
-                  {Locale.truncateLeft(item.file, fileNameWidth())}
-                </text>
-              </box>
-              <box flexDirection="row" gap={1} minWidth={7} flexShrink={0} justifyContent="flex-end">
-                <text>
-                  {" "}
-                  {item.additions ? <span style={{ fg: theme.diffAdded }}>+{item.additions}</span> : null}
-                  {item.deletions ? <span style={{ fg: theme.diffRemoved }}> -{item.deletions}</span> : null}
-                </text>
-              </box>
-            </box>
-          )}
-        </For>
-      </scrollbox>
-      <box flexDirection="row" justifyContent="flex-end" paddingLeft={2} paddingRight={2} paddingBottom={1}>
-        <For each={options}>
-          {(item) => (
-            <box
-              paddingLeft={2}
-              paddingRight={2}
-              backgroundColor={item === store.active ? theme.primary : undefined}
-              onMouseUp={() => {
-                setStore("active", item)
-                props.onSelect(item)
-                dialog.clear()
-              }}
-            >
-              <text fg={item === store.active ? theme.selectedListItemText : theme.textMuted}>{item}</text>
-            </box>
-          )}
-        </For>
+              )}
+            </For>
+          </scrollbox>
+        </DialogBleed>
       </box>
-    </box>
+    </DialogLayout>
   )
 }
 

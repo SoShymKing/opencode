@@ -1,21 +1,25 @@
 import { sql } from "drizzle-orm"
 import { isDeepStrictEqual } from "node:util"
 import { DateTime, Effect, Schema } from "effect"
-import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import type { Database } from "@opencode-ai/core/database/database"
-import { DatabaseMigration } from "@opencode-ai/core/database/migration"
-import { migrations } from "@opencode-ai/core/database/migration.gen"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { ProviderV2 } from "@opencode-ai/core/provider"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { BenchmarkContractError, measuredSamples, processCount, pragmas, warmupSamples } from "./session-projector-performance-fixture"
+import type { Database } from "@opencode/core/database/database"
+import { DatabaseMigration } from "@opencode/core/database/migration"
+import NativeNormalization from "../src/database/migration/20261016000000_session_message_part.js"
+import { migrations } from "../src/database/migration.gen.js"
+import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
+import { Agent } from "@opencode/schema/agent"
+import { SessionMessage } from "@opencode/schema/session-message"
+import { Session } from "@opencode/schema/session"
+import { Project } from "@opencode/schema/project"
+import { SessionTable } from "@opencode/core/session/sql"
+import { BenchmarkContractError, measuredSamples, processCount, pragmas, setupProject, warmupSamples } from "./session-projector-performance-fixture"
 
 export { BenchmarkContractError, pragmas }
 export const migrationRows = [0, 100, 1_000, 10_000] as const
 export const partDensities = [0, 3, 12, 32] as const
-export const predecessorMigrationID = "v01_baseline"
+export const normalizationMigrationID = "20261016000000_session_message_part"
 export type MigrationRows = (typeof migrationRows)[number]
-export type MigrationDatabase = EffectDrizzleSqlite.EffectSQLiteDatabase
+export type MigrationDatabase = Database.Interface["db"]
 
 export const benchmarkOption = (argv: readonly string[], name: string) => {
   const index = argv.indexOf(name)
@@ -40,7 +44,7 @@ export async function runBenchmarkWorkers<A>(input: { readonly script: string; r
       .find((line) => line.startsWith("RESULT "))
       ?.slice(7)
     if (!encoded) throw new BenchmarkContractError(`Worker ${index} produced no result: ${stderr}`)
-    const value = input.decode(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(encoded))
+    const value = input.decode(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(encoded))
     if (typeof value !== "object" || value === null || !("failed" in value) || typeof value.failed !== "boolean") throw new BenchmarkContractError(`Worker ${index} result has no strict failed state`)
     if ((exit === 0) === value.failed) throw new BenchmarkContractError(`Worker ${index} exit ${exit} disagrees with failed:${value.failed}`)
     raw.push(encoded)
@@ -82,28 +86,27 @@ export async function readQueryPlans(db: Database.Interface["db"], workload: str
 }
 
 const created = DateTime.makeUnsafe(0)
-const model = { id: ModelV2.ID.make("storage-migration"), providerID: ProviderV2.ID.make("benchmark") }
+const model = { id: Model.ID.make("storage-migration"), providerID: Provider.ID.make("benchmark") }
 const encode = Schema.encodeSync(SessionMessage.Assistant)
 
 function encodedAssistant(parts: number) {
   const message = SessionMessage.Assistant.make({
     id: SessionMessage.ID.make(`msg_template_${parts}`),
     type: "assistant",
-    agent: "build",
+    agent: Agent.ID.make("build"),
     model,
     content: Array.from({ length: parts }, (_, index): SessionMessage.AssistantContent => {
-      if (index % 3 === 0) return SessionMessage.AssistantText.make({ type: "text", id: `text-${index}`, text: `part-${index}` })
+      if (index % 3 === 0) return SessionMessage.AssistantText.make({ type: "text", text: `part-${index}` })
       if (index % 3 === 1)
         return SessionMessage.AssistantReasoning.make({
           type: "reasoning",
-          id: `reasoning-${index}`,
           text: `why-${index}`,
         })
       return SessionMessage.AssistantTool.make({
         type: "tool",
         id: `tool-${index}`,
         name: "read",
-        state: SessionMessage.ToolStateCompleted.make({ status: "completed", input: {}, structured: {}, content: [] }),
+        state: SessionMessage.ToolStateCompleted.make({ status: "completed", input: {}, content: [{ type: "text", text: "complete" }] }),
         time: { created, completed: created },
       })
     }),
@@ -114,7 +117,7 @@ function encodedAssistant(parts: number) {
 }
 
 const encodedDensities = partDensities.map(encodedAssistant)
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 const decodeData = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))
 const ParentRow = Schema.Struct({ id: Schema.String, seq: Schema.Number, data: Schema.String })
 const ChildRow = Schema.Struct({
@@ -126,14 +129,9 @@ const ChildRow = Schema.Struct({
 })
 type ChildRow = typeof ChildRow.Type
 const expectedDensities = encodedDensities.map((data) => decodeData(decodeJson(data)))
-const candidates = migrations.slice(migrations.findIndex((migration) => migration.id === predecessorMigrationID) + 1)
-const baselineAdapter = {
-  id: "benchmark_session_part_baseline",
-  up: () => Effect.void,
-} satisfies DatabaseMigration.Migration
-
 export function benchmarkMigrations() {
-  return candidates.length === 0 ? [baselineAdapter] : candidates
+  if (NativeNormalization.id !== normalizationMigrationID) throw new BenchmarkContractError("Native normalization migration is not available")
+  return [NativeNormalization]
 }
 
 export function setupPredecessor(db: MigrationDatabase, rows: MigrationRows, malformed = false) {
@@ -143,21 +141,13 @@ export function setupPredecessor(db: MigrationDatabase, rows: MigrationRows, mal
     yield* db.run("PRAGMA wal_autocheckpoint = 0")
     yield* db.run("PRAGMA foreign_keys = ON")
     yield* db.run("PRAGMA busy_timeout = 5000")
-    yield* db.run(sql`CREATE TABLE session (id TEXT PRIMARY KEY NOT NULL)`)
-    yield* db.run(sql`CREATE TABLE session_message (
-      id TEXT PRIMARY KEY NOT NULL,
-      session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-      type TEXT NOT NULL,
-      seq INTEGER NOT NULL,
-      time_created INTEGER NOT NULL,
-      time_updated INTEGER NOT NULL,
-      data TEXT NOT NULL
-    )`)
-    yield* db.run(sql`CREATE UNIQUE INDEX session_message_session_seq_idx ON session_message(session_id, seq)`)
-    yield* db.run(sql`CREATE INDEX session_message_session_type_seq_idx ON session_message(session_id, type, seq)`)
-    yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
+    if (migrations.at(-1)?.id !== normalizationMigrationID) return yield* Effect.die(new BenchmarkContractError("Native predecessor fixture requires normalization to be the latest migration"))
+    yield* DatabaseMigration.apply(db)
+    yield* db.run(sql`DROP TABLE session_message_part`)
+    yield* db.run(sql`DELETE FROM migration WHERE id = ${normalizationMigrationID}`)
     if (rows === 0) return
-    yield* db.run(sql`INSERT INTO session(id) VALUES ('ses_migration_benchmark')`)
+    yield* setupProject(db)
+    yield* db.insert(SessionTable).values({ id: Session.ID.make("ses_migration_benchmark"), project_id: Project.ID.global, slug: "migration-benchmark", directory: "/project", version: "benchmark" }).run()
     yield* db.run(sql`WITH RECURSIVE seed(value) AS (
       SELECT 0 UNION ALL SELECT value + 1 FROM seed WHERE value + 1 < ${rows}
     ) INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data)
@@ -192,7 +182,7 @@ export function growthInputs(rows: MigrationRows) {
 export function reconstructAssistant(envelope: Record<string, unknown>, children: readonly ChildRow[]) {
   const content = children.map((child, position) => {
     if (child.position !== position) throw new BenchmarkContractError(`Child position ${child.position} does not match ${position}`)
-    return { ...decodeData(decodeJson(child.data)), id: child.id, type: child.type }
+    return { ...decodeData(decodeJson(child.data)), ...(child.type === "tool" ? { id: child.id } : {}), type: child.type }
   })
   return { ...envelope, content }
 }
@@ -201,13 +191,15 @@ export function validateMigration(db: MigrationDatabase, rows: MigrationRows) {
   return Effect.gen(function* () {
     const journal = yield* db.all<{ id: string }>(sql`SELECT id FROM migration ORDER BY id`)
     const parents = Schema.decodeUnknownSync(Schema.Array(ParentRow))(yield* db.all(sql`SELECT id, seq, data FROM session_message ORDER BY seq`))
-    if (journal.length !== benchmarkMigrations().length || parents.length !== rows) return yield* Effect.die(new BenchmarkContractError(`Migration validation failed for ${rows} assistants`))
+    if (!isDeepStrictEqual(journal.map((item) => item.id), migrations.map((migration) => migration.id).toSorted()) || parents.length !== rows) return yield* Effect.die(new BenchmarkContractError(`Migration validation failed for ${rows} assistants`))
     const childTable = yield* db.get<{ readonly name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_message_part'`)
-    const children = childTable ? Schema.decodeUnknownSync(Schema.Array(ChildRow))(yield* db.all(sql`SELECT message_id, position, id, type, data FROM session_message_part ORDER BY message_id, position`)) : []
-    if (childTable && children.length !== 0) return yield* Effect.die(new BenchmarkContractError(`Expected no migrated children, received ${children.length}`))
+    if (!childTable) return yield* Effect.die(new BenchmarkContractError("Native normalization did not create child storage"))
+    const children = Schema.decodeUnknownSync(Schema.Array(ChildRow))(yield* db.all(sql`SELECT message_id, position, id, type, data FROM session_message_part ORDER BY message_id, position`))
+    if (children.length !== growthInputs(rows).totalParts) return yield* Effect.die(new BenchmarkContractError(`Wrong migrated child count: ${children.length}`))
+    const grouped = Map.groupBy(children, (child) => child.message_id)
     for (const parent of parents) {
       const envelope = decodeData(decodeJson(parent.data))
-      if (!isDeepStrictEqual(envelope, expectedDensities[parent.seq % partDensities.length])) return yield* Effect.die(new BenchmarkContractError(`Assistant ${parent.id} changed`))
+      if ("content" in envelope || !isDeepStrictEqual(reconstructAssistant(envelope, grouped.get(parent.id) ?? []), expectedDensities[parent.seq % partDensities.length])) return yield* Effect.die(new BenchmarkContractError(`Assistant ${parent.id} changed`))
     }
     return {
       journal: journal.map((item) => item.id),

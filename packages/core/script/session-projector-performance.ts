@@ -6,13 +6,13 @@ import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import { asc, eq, sql } from "drizzle-orm"
 import { Cause, Effect, Exit, Schema } from "effect"
-import { Database } from "@opencode-ai/core/database/database"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventV2 } from "@opencode-ai/core/event"
-import { EventTable } from "@opencode-ai/core/event/sql"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { Database } from "@opencode/core/database/database"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Bus } from "@opencode/core/bus"
+import { EventTable } from "@opencode/core/event/sql"
+import { SessionProjector } from "@opencode/core/session/projector"
+import { SessionMessageTable } from "@opencode/core/session/sql"
+import { replaceContent } from "@opencode/core/session/projector-content"
 import {
   BenchmarkContractError,
   assistantRow,
@@ -100,23 +100,23 @@ function storedEvents(db: DatabaseService, fixture: Fixture) {
     .pipe(
       Effect.orDie,
       Effect.map((events) =>
-        events.map((event) => ({ id: event.id, type: event.type, seq: event.seq, aggregateID: event.aggregate_id, data: decodeEventData(event.data) })),
+        events.map((event) => ({ id: event.id, type: event.type, created: event.created, seq: event.seq, aggregateID: event.aggregate_id, data: decodeEventData(event.data) })),
       ),
     )
 }
 
-function validateFinal(db: DatabaseService, fixture: Fixture) {
+export function validateFinal(db: DatabaseService, fixture: Fixture) {
   return Effect.gen(function* () {
     if (!isDeepStrictEqual(yield* readAssistant(db, fixture), fixture.expected))
       return yield* Effect.fail(new BenchmarkValidationError(fixture.workload, fixture.siblings, "payload"))
     const stored = yield* storedEvents(db, fixture)
     if (!isDeepStrictEqual(stored.map((event) => event.type.replace(/\.\d+$/, "")), workloadEventSequences[fixture.workload]))
-      return yield* Effect.fail(new BenchmarkValidationError(fixture.workload, fixture.siblings, "event sequence"))
+      return yield* Effect.fail(new BenchmarkValidationError(fixture.workload, fixture.siblings, `event sequence: ${stored.map((event) => event.type).join(",")}`))
     return stored
   })
 }
 
-function replay(db: DatabaseService, events: EventV2.Interface, fixture: Fixture, stored: readonly EventV2.SerializedEvent[]) {
+export function replay(db: DatabaseService, events: Bus.Interface, fixture: Fixture, stored: readonly Bus.SerializedEvent[]) {
   return Effect.gen(function* () {
     yield* events.remove(fixture.sessionID)
     const initial = assistantRow(fixture)
@@ -126,7 +126,8 @@ function replay(db: DatabaseService, events: EventV2.Interface, fixture: Fixture
       .where(eq(SessionMessageTable.id, fixture.assistantMessageID))
       .run()
       .pipe(Effect.orDie)
-    yield* events.replayAll([...stored])
+    yield* replaceContent(db, fixture.initial)
+    yield* Effect.forEach(stored, (event) => events.replay(event), { discard: true })
     if (!isDeepStrictEqual(yield* readAssistant(db, fixture), fixture.expected))
       return yield* Effect.fail(new BenchmarkValidationError(fixture.workload, fixture.siblings, "replay"))
   })
@@ -135,10 +136,10 @@ function replay(db: DatabaseService, events: EventV2.Interface, fixture: Fixture
 async function runBucket(input: WriteRunnerOptions & { readonly workload: WorkloadName; readonly siblings: SiblingCount }): Promise<BucketSuccess | BucketFailure> {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-session-projector-performance-"))
   const databasePath = path.join(temporary, "benchmark.sqlite")
-  const layer = AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node]), [[Database.node, Database.layerFromPath(databasePath)]])
+  const layer = LayerNode.compile(LayerNode.group([Database.node, Bus.node, SessionProjector.node]), { replacements: [Database.node.replace(Database.configured({ path: databasePath })), Bus.node.replace(Bus.configured({ persist: true }))] })
   const program = Effect.gen(function* () {
     const database = yield* Database.Service
-    const events = yield* EventV2.Service
+    const events = yield* Bus.Service
     yield* database.db.run("PRAGMA wal_autocheckpoint = 0").pipe(Effect.orDie)
     yield* setupProject(database.db)
     const warmups = Array.from({ length: input.warmups }, (_, index) => makeFixture({ siblings: input.siblings, workload: input.workload, label: `p${input.process}_warmup_${index}`, mismatchExpected: input.mismatchExpected }))
@@ -153,7 +154,7 @@ async function runBucket(input: WriteRunnerOptions & { readonly workload: Worklo
       Effect.sync(() => setInterval(() => rssSamples.push(process.memoryUsage().rss), 10)),
       (timer) => Effect.sync(() => clearInterval(timer)),
     )
-    const pending: Array<{ readonly fixture: Fixture; readonly durationNs: number; readonly stored: readonly EventV2.SerializedEvent[] }> = []
+    const pending: Array<{ readonly fixture: Fixture; readonly durationNs: number; readonly stored: readonly Bus.SerializedEvent[] }> = []
     for (const fixture of measured) {
       const start = Bun.nanoseconds()
       yield* publishUpdate(events, fixture)

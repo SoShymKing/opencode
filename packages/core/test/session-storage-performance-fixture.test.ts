@@ -2,17 +2,24 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
-import { DateTime, Schema } from "effect"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { ProviderV2 } from "@opencode-ai/core/provider"
+import { DateTime, Effect, Schema } from "effect"
+import { Database } from "@opencode/core/database/database"
+import { SessionStore } from "@opencode/core/session/store"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Global } from "@opencode/util/global"
+import { EffectDrizzleSqlite } from "../src/database/drizzle.js"
+import { sqliteLayer } from "../src/database/sqlite.bun.js"
+import { Session } from "@opencode/schema/session"
+import { SessionMessage } from "@opencode/schema/session-message"
+import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
+import { Agent } from "@opencode/schema/agent"
 import { BenchmarkContractError, measuredSamples, removeTemporary, summarizeSamples } from "../script/session-projector-performance-fixture"
 import { fixedOrder, harnessFiles } from "../script/session-storage-benchmark-slot"
-import { candidateQueryPlansIndexed, comparisonEvidence } from "../script/session-storage-benchmark-compare"
+import { candidateQueryPlansIndexed, comparisonEvidence, recomputeComparison } from "../script/session-storage-benchmark-compare"
 import { checkEvidence } from "../script/session-storage-evidence-check"
-import { growthInputs, migrationRows, partDensities, queryPlansMatchStatements, runBenchmarkWorkers } from "../script/session-storage-migration-performance-fixture"
-import { readWorkloads, validateRead } from "../script/session-storage-read-performance-fixture"
+import { applyBenchmarkMigration, benchmarkMigrations, growthInputs, migrationRows, normalizationMigrationID, partDensities, queryPlansMatchStatements, runBenchmarkWorkers, setupPredecessor, validateMigration } from "../script/session-storage-migration-performance-fixture"
+import { executeRead, readWorkloads, setupReadFixture, validateRead } from "../script/session-storage-read-performance-fixture"
 
 const FailedArtifact = Schema.Struct({
   failed: Schema.Literal(true),
@@ -38,10 +45,12 @@ async function negative(script: string, flag: string) {
     })
     const [exit, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
     expect(exit, stderr).not.toBe(0)
-    const artifact = Schema.decodeUnknownSync(FailedArtifact)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(output).text()))
+    const artifact = Schema.decodeUnknownSync(Schema.fromJsonString(FailedArtifact))(await Bun.file(output).text())
     expect(artifact.processes).toHaveLength(5)
     expect(artifact.aggregates).toHaveLength(0)
     expect(artifact.processes.flatMap((item) => item.buckets).every((bucket) => bucket.samplesNs.length === 0)).toBe(true)
+    const reason = script.includes("migration") ? "Cannot normalize assistant message" : flag === "--inject-invalid-cursor" ? "payload or order mismatch" : "MessageDecodeError"
+    expect(artifact.processes.flatMap((item) => item.buckets).every((bucket) => bucket.error.includes(reason))).toBe(true)
   } finally {
     await removeTemporary(temporary)
   }
@@ -52,6 +61,8 @@ async function fabricatedEvidence(root: string) {
   await Bun.write(
     path.join(root, "benchmark-manifest.json"),
     JSON.stringify({
+      storageContract: "native2-session-parts",
+      baselineStatus: "available",
       baselineCommit: "baseline",
       candidateCommit: "candidate",
       baselineWorktree: "baseline",
@@ -78,6 +89,40 @@ async function fabricatedEvidence(root: string) {
 }
 
 describe("session storage performance fixture", () => {
+  test("rejects comparison when a native baseline is not available", () => {
+    expect(() => recomputeComparison({ storageContract: "native2-session-parts", baselineStatus: "not-available", baselineWorktree: "", candidateWorktree: "", baselineCommit: "", candidateCommit: "", evidenceRoot: "", harnessFiles, harnessSha256: "", fixedOrder }, [], {})).toThrow("Native comparison baseline is not available")
+  })
+
+  test("reads native normalized fixtures through production readers", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const database = yield* Database.Service
+      const store = yield* SessionStore.Service
+      for (const workload of readWorkloads.filter((item, index, all) => all.findIndex((other) => other.name === item.name) === index)) {
+        const fixture = yield* setupReadFixture(database.db, workload, workload.name)
+        const result = yield* executeRead(database.db, store, fixture, workload)
+        expect(validateRead(result, fixture, workload)).toBe(true)
+        if (workload.name === "runner-context" && result && "entries" in result) {
+          expect(() => validateRead({
+            ...result,
+            rejectedAttachments: [{ source: "user", messageID: SessionMessage.ID.make("msg_unexpected_attachment"), fileIndex: 0 }],
+          }, fixture, workload)).toThrow("runner-context/200 payload or order mismatch")
+        }
+      }
+    }).pipe(Effect.provide(LayerNode.compile(LayerNode.group([Database.node, SessionStore.node]))), Effect.scoped))
+  })
+
+  test("runs only native normalization and reconstructs migrated children", async () => {
+    expect(benchmarkMigrations().map((migration) => migration.id)).toEqual([normalizationMigrationID])
+    await Effect.runPromise(Effect.gen(function* () {
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* setupPredecessor(db, 100)
+      yield* applyBenchmarkMigration(db)
+      const result = yield* validateMigration(db, 100)
+      expect(result.parents).toBe(100)
+      expect(result.children).toBe(1175)
+    }).pipe(Effect.provide(sqliteLayer({ filename: ":memory:" })), Effect.provideService(Global.Service, Global.make()), Effect.scoped))
+  })
+
   test("freezes every read and migration bucket", () => {
     expect(readWorkloads).toEqual([
       { name: "page", size: 50 },
@@ -168,12 +213,12 @@ describe("session storage performance fixture", () => {
   })
 
   test("rejects wrong interrupted-tool and revert payloads", () => {
-    const sessionID = SessionV2.ID.make("ses_wrong_payload")
+    const sessionID = Session.ID.make("ses_wrong_payload")
     const assistant = SessionMessage.Assistant.make({
       id: SessionMessage.ID.make("msg_wrong_payload"),
       type: "assistant",
-      agent: "build",
-      model: { id: ModelV2.ID.make("model"), providerID: ProviderV2.ID.make("provider") },
+      agent: Agent.ID.make("build"),
+      model: { id: Model.ID.make("model"), providerID: Provider.ID.make("provider") },
       content: [],
       time: { created: DateTime.makeUnsafe(0) },
     })

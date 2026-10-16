@@ -24,8 +24,10 @@ function scrollable(value: string) {
 
 function scrollRoot(container: HTMLElement) {
   let node = container.parentElement
+
   while (node) {
     const style = getComputedStyle(node)
+
     if (scrollable(style.overflowY)) return node
     node = node.parentElement
   }
@@ -35,9 +37,11 @@ function target(container: HTMLElement): Target | undefined {
   if (typeof document === "undefined") return
 
   const review = container.closest("[data-component='session-review']")
+
   if (review instanceof HTMLElement) {
     const root = scrollRoot(container) ?? review
     const content = review.querySelector("[data-slot='session-review-container']")
+
     return {
       key: review,
       root,
@@ -46,8 +50,10 @@ function target(container: HTMLElement): Target | undefined {
   }
 
   const root = scrollRoot(container)
+
   if (root) {
     const content = root.querySelector("[role='log']")
+
     return {
       key: root,
       root,
@@ -64,9 +70,11 @@ function target(container: HTMLElement): Target | undefined {
 
 export function acquireVirtualizer(container: HTMLElement) {
   const resolved = target(container)
+
   if (!resolved) return
 
   let entry = cache.get(resolved.key)
+
   if (!entry) {
     const virtualizer = new Virtualizer()
     virtualizer.setup(resolved.root, resolved.content)
@@ -87,9 +95,11 @@ export function acquireVirtualizer(container: HTMLElement) {
       done = true
 
       const current = cache.get(resolved.key)
+
       if (!current) return
 
       current.refs -= 1
+
       if (current.refs > 0) return
 
       current.virtualizer.cleanUp()

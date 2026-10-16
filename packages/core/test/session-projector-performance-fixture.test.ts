@@ -2,10 +2,20 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { Bus } from "@opencode/core/bus"
+import { Database } from "@opencode/core/database/database"
+import { SessionProjector } from "@opencode/core/session/projector"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { replay, validateFinal } from "../script/session-projector-performance"
 import {
   centralSummary,
   measuredSamples,
+  makeFixture,
+  publishUpdate,
+  readAssistant,
+  setupFixture,
+  setupProject,
   processCount,
   removeTemporary,
   siblingCounts,
@@ -47,6 +57,7 @@ const NormalRun = Schema.Struct({
 const FailedBucket = Schema.Struct({
   failed: Schema.Literal(true),
   samplesNs: Schema.Array(Schema.Number),
+  error: Schema.String,
 })
 const FailedRun = Schema.Struct({
   failed: Schema.Literal(true),
@@ -61,11 +72,27 @@ const FailedRun = Schema.Struct({
 })
 
 describe("session projector performance fixture", () => {
+  test("projects every native workload and hydrates its normalized children", async () => {
+    await Effect.runPromise(Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      yield* setupProject(database.db)
+      for (const workload of workloadNames) {
+        const fixture = makeFixture({ siblings: 512, workload, label: workload })
+        yield* setupFixture(database.db, fixture)
+        yield* publishUpdate(bus, fixture)
+        expect(yield* readAssistant(database.db, fixture)).toEqual(fixture.expected)
+        const stored = yield* validateFinal(database.db, fixture)
+        yield* replay(database.db, bus, fixture, stored)
+      }
+    }).pipe(Effect.provide(LayerNode.compile(LayerNode.group([Database.node, Bus.node, SessionProjector.node]), { replacements: [Bus.node.replace(Bus.configured({ persist: true }))] })), Effect.scoped))
+  })
+
   test("defines every targeted write workload at 512 and 2048 siblings", () => {
     expect(siblingCounts).toEqual([512, 2048])
     expect(workloadNames).toEqual(["tool", "text", "reasoning", "envelope-only", "duplicate-id-latest-match"])
     expect(Object.keys(workloadEventSequences)).toEqual([...workloadNames])
-    expect(workloadEventSequences.tool).toHaveLength(5)
+    expect(workloadEventSequences.tool).toHaveLength(4)
     expect(workloadEventSequences.text).toHaveLength(2)
     expect(workloadEventSequences.reasoning).toHaveLength(2)
     expect(workloadEventSequences["envelope-only"]).toHaveLength(1)
@@ -169,7 +196,7 @@ describe("session projector performance fixture", () => {
       const exitCode = await child.exited
       const stderr = await new Response(child.stderr).text()
       expect(exitCode, stderr).not.toBe(0)
-      const json = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(output).text())
+      const json = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await Bun.file(output).text())
       const result = Schema.decodeUnknownSync(FailedRun)(json)
       expect(result.processes).toHaveLength(5)
       expect(result.validation.status).toBe("FAIL")
@@ -177,6 +204,7 @@ describe("session projector performance fixture", () => {
       const failedBuckets = result.processes.flatMap((item) => item.buckets)
       expect(failedBuckets.length).toBeGreaterThan(0)
       expect(failedBuckets.every((bucket) => bucket.failed && bucket.samplesNs.length === 0)).toBe(true)
+      expect(failedBuckets.every((bucket) => bucket.error.includes("payload"))).toBe(true)
     } finally {
       await removeTemporary(temporary)
     }

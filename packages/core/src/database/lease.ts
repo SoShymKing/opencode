@@ -1,7 +1,7 @@
 export * as DatabaseLease from "./lease"
 
 import { open } from "node:fs/promises"
-import { lease as platformLease } from "#sqlite"
+import { lease } from "#sqlite"
 import { Effect } from "effect"
 import { DatabaseArtifact } from "./artifact"
 
@@ -32,7 +32,7 @@ function acquire(target: string, mode: Mode) {
     const entry = yield* DatabaseArtifact.entry(filename)
     if (entry.kind === "missing") yield* create(filename)
     yield* DatabaseArtifact.requireRegularFile(filename)
-    yield* platformLease({ filename, mode })
+    yield* lease({ filename, mode })
   }).pipe(Effect.mapError((cause) => new DatabaseLeaseError(target, { cause })))
 }
 

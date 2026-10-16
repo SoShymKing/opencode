@@ -76,6 +76,7 @@ export function comparisonEvidence(slots: readonly EvidenceSlot[]) {
 }
 
 export function recomputeComparison(manifest: typeof BenchmarkManifest.Type, slots: readonly ParsedBenchmarkSlot[], slotFileHashes: Readonly<Record<string, string>>) {
+  if (manifest.baselineStatus !== "available") throw new BenchmarkContractError("Native comparison baseline is not available")
   const baseline = slots.filter((slot) => slot.revision === "baseline"),
     candidate = slots.filter((slot) => slot.revision === "candidate")
   const baselineWrite = aggregate(baseline, "write"),
@@ -110,7 +111,11 @@ export function recomputeComparison(manifest: typeof BenchmarkManifest.Type, slo
   })
   const migrationDurationGrowth = median5(perSlotMigrationRatios.map((item) => item.durationGrowth)),
     migrationRssGrowth = median5(perSlotMigrationRatios.map((item) => item.rssGrowth))
-  const storageRatio = ratio(median5(candidate.map((slot) => slot.migration.storage?.storageTotal ?? 0)), median5(baseline.map((slot) => slot.migration.storage?.storageTotal ?? 0)))
+  const storageTotal = (slot: ParsedBenchmarkSlot) => {
+    if (!slot.migration.storage) throw new BenchmarkContractError(`Missing migration storage in ${slot.slot}`)
+    return slot.migration.storage.storageTotal
+  }
+  const storageRatio = ratio(median5(candidate.map(storageTotal)), median5(baseline.map(storageTotal)))
   const evidence = comparisonEvidence(slots)
   const gates = {
     correctness: slots.every((slot) => !slot.write.failed && !slot.read.failed && !slot.migration.failed),
@@ -176,7 +181,11 @@ export function recomputeComparison(manifest: typeof BenchmarkManifest.Type, slo
 }
 
 export async function compare(manifestPath: string) {
-  const manifest = Schema.decodeUnknownSync(BenchmarkManifest)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(manifestPath).text()))
+  const manifest = Schema.decodeUnknownSync(Schema.fromJsonString(BenchmarkManifest))(await Bun.file(manifestPath).text())
+  if (manifest.baselineStatus !== "available") {
+    await Bun.write(path.join(manifest.evidenceRoot, "comparison.json"), `${JSON.stringify({ schemaVersion: 2, storageContract: manifest.storageContract, result: "NOT_AVAILABLE", reason: "Native comparison baseline is not available" })}\n`)
+    return 1
+  }
   if (!path.isAbsolute(manifest.baselineWorktree) || !path.isAbsolute(manifest.candidateWorktree) || !path.isAbsolute(manifest.evidenceRoot)) throw new BenchmarkContractError("Manifest paths must be absolute")
   if (manifest.fixedOrder.join(",") !== fixedOrder.join(",") || manifest.harnessFiles.join("\n") !== harnessFiles.join("\n")) throw new BenchmarkContractError("Frozen order or harness list mismatch")
   for (const [root, commit] of [
@@ -198,7 +207,7 @@ export async function compare(manifestPath: string) {
     if (exit !== 0) throw new BenchmarkContractError(`Slot ${slot} failed: ${stderr}`)
     const slotBytes = new Uint8Array(await Bun.file(output).arrayBuffer())
     slotFileHashes[slot] = createHash("sha256").update(slotBytes).digest("hex")
-    slots.push(Schema.decodeUnknownSync(BenchmarkSlotArtifact)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(slotBytes))))
+    slots.push(Schema.decodeUnknownSync(Schema.fromJsonString(BenchmarkSlotArtifact))(new TextDecoder().decode(slotBytes)))
   }
   const { comparison, baselineWrite, candidateWrite, baselineRead, candidateRead, baselineMigration, candidateMigration, baseline, candidate } = recomputeComparison(manifest, slots, slotFileHashes)
   await Bun.write(path.join(manifest.evidenceRoot, "baseline-write.json"), `${JSON.stringify({ aggregates: baselineWrite })}\n`)

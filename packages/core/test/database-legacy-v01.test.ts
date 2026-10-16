@@ -15,7 +15,7 @@ import {
 } from "./fixture/database-transfer"
 import { tmpdir } from "./fixture/tmpdir"
 
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 describe("DatabaseLegacyV01", () => {
   test("exports a lossless legacy-v01 snapshot and manifest without changing the source", async () => {

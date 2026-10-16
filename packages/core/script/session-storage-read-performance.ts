@@ -5,18 +5,13 @@ import { sql } from "drizzle-orm"
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { EffectCache } from "drizzle-orm/cache/core/cache-effect"
 import { EffectLogger } from "drizzle-orm/effect-core"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Database } from "@opencode-ai/core/database/database"
-import { DatabaseMigration } from "@opencode-ai/core/database/migration"
-import { layer as sqliteLayer } from "../src/database/sqlite.bun"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventV2 } from "@opencode-ai/core/event"
-import { ProjectV2 } from "@opencode-ai/core/project"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionExecution } from "@opencode-ai/core/session/execution"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionStore } from "@opencode-ai/core/session/store"
+import { EffectDrizzleSqlite } from "../src/database/drizzle.js"
+import { Database } from "@opencode/core/database/database"
+import { DatabaseMigration } from "@opencode/core/database/migration"
+import { sqliteLayer } from "../src/database/sqlite.bun.js"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { Global } from "@opencode/util/global"
+import { SessionStore } from "@opencode/core/session/store"
 import { centralSummary, removeTemporary, summarizeSamples } from "./session-projector-performance-fixture"
 import { readQueryPlans, requireBenchmarkArguments, runBenchmarkWorkers } from "./session-storage-migration-performance-fixture"
 import { BenchmarkContractError, executeRead, pragmas, readWorkloads, setupReadFixture, validateRead, type ReadRunnerOptions, type ReadWorkload } from "./session-storage-read-performance-fixture"
@@ -46,31 +41,18 @@ function countedDatabaseLayer(filename: string, counter: QueryCounter) {
       yield* Effect.forEach(["PRAGMA journal_mode = WAL", "PRAGMA synchronous = NORMAL", "PRAGMA busy_timeout = 5000", "PRAGMA cache_size = -64000", "PRAGMA foreign_keys = ON"], (query) => db.run(query), { discard: true })
       yield* DatabaseMigration.apply(db, filename)
       return Database.Service.of({ db })
-    }),
+    }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename })), Layer.provide(EffectCache.Default), Layer.provide(logger))
 }
-
-const projects = Layer.succeed(
-  ProjectV2.Service,
-  ProjectV2.Service.of({
-    resolve: (directory) => Effect.succeed({ id: ProjectV2.ID.global, directory }),
-    directories: () => Effect.succeed([]),
-    commit: () => Effect.void,
-  }),
-)
 
 export async function runReadBucket(input: ReadRunnerOptions & { readonly workload: ReadWorkload }) {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-session-storage-read-"))
   const databasePath = path.join(temporary, "benchmark.sqlite")
   const counter: QueryCounter = { active: false, statements: [] }
-  const layer = AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node, SessionStore.node, SessionV2.node]), [
-    [Database.node, countedDatabaseLayer(databasePath, counter)],
-    [ProjectV2.node, projects],
-    [SessionExecution.node, SessionExecution.noopLayer],
-  ])
+  const layer = LayerNode.compile(LayerNode.group([Database.node, SessionStore.node]), { replacements: [Database.node.replace(countedDatabaseLayer(databasePath, counter).pipe(Layer.provide(Global.layerWith({ data: temporary }))))] })
   const program = Effect.gen(function* () {
     const database = yield* Database.Service
-    const sessions = yield* SessionV2.Service
+    const sessions = yield* SessionStore.Service
     yield* database.db.run("PRAGMA wal_autocheckpoint = 0").pipe(Effect.orDie)
     const fixture = yield* setupReadFixture(database.db, input.workload, `p${input.process}`, input.malformedRow)
     for (let index = 0; index < input.warmups; index++) validateRead(yield* executeRead(database.db, sessions, fixture, input.workload, input.invalidCursor), fixture, input.workload)

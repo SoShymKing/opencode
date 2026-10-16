@@ -12,6 +12,8 @@ export const fixedOrder = ["B1", "C1", "B2", "C2", "B3", "C3", "B4", "C4", "B5",
 export const harnessFiles = ["packages/core/script/session-projector-performance-fixture.ts", "packages/core/script/session-projector-performance.ts", "packages/core/script/session-storage-benchmark-compare.ts", "packages/core/script/session-storage-benchmark-slot.ts", "packages/core/script/session-storage-evidence-check.ts", "packages/core/script/session-storage-migration-performance-fixture.ts", "packages/core/script/session-storage-migration-performance.ts", "packages/core/script/session-storage-read-performance-fixture.ts", "packages/core/script/session-storage-read-performance.ts", "packages/core/test/session-projector-performance-fixture.test.ts", "packages/core/test/session-storage-performance-fixture.test.ts"] as const
 export const BenchmarkSlot = Schema.Literals(fixedOrder)
 export const BenchmarkManifest = Schema.Struct({
+  storageContract: Schema.Literal("native2-session-parts"),
+  baselineStatus: Schema.Literals(["available", "not-available"]),
   baselineWorktree: Schema.String,
   candidateWorktree: Schema.String,
   baselineCommit: Schema.String,
@@ -47,7 +49,8 @@ const QueryPlan = Schema.Struct({
   details: Schema.Array(Schema.Struct({ detail: Schema.String })),
 })
 export const BenchmarkSlotArtifact = Schema.Struct({
-  schemaVersion: Schema.Number,
+  schemaVersion: Schema.Literal(2),
+  storageContract: Schema.Literal("native2-session-parts"),
   slot: Schema.String,
   revision: Schema.String,
   commit: Schema.String,
@@ -146,7 +149,8 @@ export async function runBoundedCommand(cwd: string, args: readonly string[]) {
 }
 
 export async function runSlot(input: { readonly manifest: string; readonly slot: typeof BenchmarkSlot.Type; readonly output: string }) {
-  const manifest = Schema.decodeUnknownSync(BenchmarkManifest)(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(input.manifest).text()))
+  const manifest = Schema.decodeUnknownSync(Schema.fromJsonString(BenchmarkManifest))(await Bun.file(input.manifest).text())
+  if (manifest.baselineStatus !== "available") throw new BenchmarkContractError("Native comparison baseline is not available")
   if (manifest.fixedOrder.join(",") !== "B1,C1,B2,C2,B3,C3,B4,C4,B5,C5") throw new BenchmarkContractError("Benchmark manifest order is not frozen")
   const baseline = input.slot.startsWith("B")
   const expected = path.resolve(baseline ? manifest.baselineWorktree : manifest.candidateWorktree, "packages/core")
@@ -156,7 +160,8 @@ export async function runSlot(input: { readonly manifest: string; readonly slot:
   const read = await runReadProcess({ process: processIndex, warmups: 5, samples: 30 })
   const migration = await runMigrationProcess({ process: processIndex, warmups: 5, samples: 30 })
   const artifact = {
-    schemaVersion: 1,
+    schemaVersion: 2,
+    storageContract: manifest.storageContract,
     slot: input.slot,
     revision: baseline ? "baseline" : "candidate",
     commit: baseline ? manifest.baselineCommit : manifest.candidateCommit,

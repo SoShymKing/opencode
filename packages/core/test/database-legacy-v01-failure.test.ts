@@ -8,7 +8,7 @@ import { Effect, Schema } from "effect"
 import { assistantContent, assistantEnvelope, createCurrentDatabase } from "./fixture/database-transfer"
 import { tmpdir } from "./fixture/tmpdir"
 
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 describe("DatabaseLegacyV01 failures", () => {
   test.each([

@@ -1,47 +1,39 @@
 /** @jsxImportSource @opentui/solid */
 import { expect, test } from "bun:test"
-import type { GlobalEvent } from "@opencode-ai/sdk/v2"
-import { tmpdir } from "../../../fixture/fixture"
-import { createFetch, json, mount, wait } from "./sync-fixture"
-import { testRender } from "@opentui/solid"
-import { SDKProvider, useSDK } from "../../../../src/context/sdk"
-import { onMount } from "solid-js"
+import type { SessionMessageInfo } from "@opencode/client"
+import { For } from "solid-js"
+import { useData } from "../../../../src/context/data"
+import { json, mount, wait } from "./sync-fixture"
 
 const sessionID = "ses_hydration_race"
 const messageID = "msg_hydration_race"
-const partID = "prt_hydration_race"
-const session = {
-  id: sessionID,
-  title: "race",
-  time: { created: 0, updated: 0 },
-  version: "1.15.13",
-  directory: "/tmp/opencode/packages/opencode",
-}
 const assistant = {
   id: messageID,
-  sessionID,
-  role: "assistant" as const,
+  type: "assistant",
   agent: "build",
-  modelID: "model",
-  providerID: "test",
-  mode: "build",
-  parentID: "msg_user",
-  path: { cwd: session.directory, root: session.directory },
-  cost: 0,
-  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-  time: { created: 1, completed: 2 },
+  model: { id: "model", providerID: "test" },
+  content: [{ type: "text", text: "" }],
+  time: { created: 1 },
+} satisfies SessionMessageInfo
+
+function Messages() {
+  const data = useData()
+  return <For each={data.session.message.list(sessionID)}>{(message) => (
+    <text>{message.type === "assistant" ? message.content.flatMap((part) => part.type === "text" ? [part.text] : []).join("") : message.id}</text>
+  )}</For>
 }
 
-function global(payload: GlobalEvent["payload"]): GlobalEvent {
-  return { directory: "/tmp/other", project: "proj_test", payload }
-}
-
-test.each(["error", "EOF"])("SSE %s reconnects and cleanup cancels the final stream once", async (failure) => {
+test.each(["error", "EOF"])("SSE %s reconnects and cleanup cancels the final native stream once", async (failure) => {
   let requests = 0
-  let connected = 0
   let cancelled = 0
-  const calls = createFetch(() => {
-    requests += 1
+  const closed = Promise.withResolvers<void>()
+  const setup = await mount((url, request) => {
+    if (url.pathname !== "/api/event") return
+    requests++
+    if (requests === 2) request.signal.addEventListener("abort", () => {
+      cancelled++
+      closed.resolve()
+    }, { once: true })
     return new Response(new ReadableStream<Uint8Array>({
       start(controller) {
         if (requests === 1) {
@@ -49,380 +41,171 @@ test.each(["error", "EOF"])("SSE %s reconnects and cleanup cancels the final str
           if (failure === "EOF") controller.close()
           return
         }
-        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(global({
-          id: "evt_connected", type: "server.connected", properties: {},
-        }))}\n\n`))
+        controller.enqueue(new TextEncoder().encode('data: {"type":"server.connected","data":{}}\n\n'))
       },
-      cancel() { cancelled += 1 },
     }), { headers: { "content-type": "text/event-stream" } })
   })
-  function Probe() {
-    const sdk = useSDK()
-    onMount(() => sdk.event.on("event", (event) => {
-      if (event.payload.type === "server.connected") connected += 1
-    }))
-    return <box />
-  }
-  const app = await testRender(() => <SDKProvider url="http://test" fetch={calls.fetch}><Probe /></SDKProvider>)
   try {
-    await wait(() => connected === 1, 4000)
     expect(requests).toBe(2)
+    expect(setup.client.connection.status()).toBe("connected")
   } finally {
-    app.renderer.destroy()
+    setup[Symbol.dispose]()
   }
-  await wait(() => cancelled === 1)
+  await closed.promise
   expect(cancelled).toBe(1)
 })
 
-test.each([false, true])("late status snapshots cannot overwrite live activity with another reconnect=%s", async (reconnect) => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
+test.each([false, true])("late native active snapshots cannot overwrite live activity with another reconnect=%s", async (reconnect) => {
   const snapshot = Promise.withResolvers<Response>()
-  let statusRequests = 0
-  let historyRequests = 0
-  const setup = await mount((url) => {
-    if (url.pathname === "/session/status") {
-      statusRequests += 1
-      return statusRequests === 2 ? snapshot.promise : json({})
+  const requested = Promise.withResolvers<void>()
+  let reads = 0
+  using setup = await mount((url) => {
+    if (url.pathname !== "/api/session/active") return
+    if (++reads === 2) {
+      requested.resolve()
+      return snapshot.promise
     }
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      historyRequests += 1
-      return json([{ info: assistant, parts: [] }])
-    }
-    if ([`/session/${sessionID}/todo`, `/session/${sessionID}/diff`, "/permission", "/question"].includes(url.pathname)) return json([])
-    return undefined
-  }, tmp.path)
-  try {
-    await setup.sync.session.sync(sessionID)
-    setup.emit(global({ id: "evt_pending", type: "message.updated", properties: { sessionID, info: {
-      id: "msg_pending", sessionID, role: "user", agent: "build", model: { providerID: "test", modelID: "model" }, time: { created: 3 },
-    } } }))
-    await wait(() => setup.sync.data.message[sessionID]?.length === 2)
-    const restoring = setup.sync.bootstrap({ fatal: false })
-    await wait(() => statusRequests === 2)
-    if (reconnect) setup.emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
-    if (!reconnect) await setup.sync.session.sync(sessionID, { force: true })
-    await wait(() => statusRequests === (reconnect ? 3 : 2) && historyRequests === 2)
-    setup.emit(global({ id: "evt_live_status", type: "session.status", properties: { sessionID, status: {
-      type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 211 },
-    } } }))
-    await wait(() => setup.sync.data.session_status[sessionID]?.type === "busy")
-    snapshot.resolve(json({ [sessionID]: { type: "busy", activity: { model: "receiving", streamEventCount: 200 } } }))
-    await restoring
-    await setup.app.renderOnce()
-    expect(setup.sync.data.session_status[sessionID]).toMatchObject({ activity: { streamEventCount: 211 } })
-    expect(setup.sync.data.message[sessionID].map((message) => message.id)).toContain("msg_pending")
-  } finally {
-    setup.app.renderer.destroy()
-  }
+    return json({ data: {} })
+  })
+  await setup.emit({ id: "evt_reconnect", type: "server.connected", data: {} })
+  await requested.promise
+  if (reconnect) await setup.emit({ id: "evt_reconnect_again", type: "server.connected", data: {} })
+  await setup.emit({ id: "evt_status", created: 3, type: "session.status", data: {
+    sessionID, status: { type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 211 } },
+  } })
+  snapshot.resolve(json({ data: { [sessionID]: { type: "running", status: {
+    type: "busy", activity: { model: "receiving", streamEventCount: 200 },
+  } } } }))
+  await setup.frame()
+  expect(setup.data.session.current(sessionID)).toMatchObject({ activity: { streamEventCount: 211 } })
+  expect(setup.data.session.status(sessionID)).toBe("running")
 })
 
-test("forced hydration waits for older inflight work then fetches fresh history", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
+test("forced native hydration waits for older inflight work then fetches fresh history", async () => {
   const old = Promise.withResolvers<Response>()
-  let requests = 0
-  const setup = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requests += 1
-      if (requests === 1) return old.promise
-      return json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "fresh" }] }])
+  const requested = Promise.withResolvers<void>()
+  let reads = 0
+  using setup = await mount((url) => {
+    if (url.pathname !== `/api/session/${sessionID}/message`) return
+    if (++reads === 1) {
+      requested.resolve()
+      return old.promise
     }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-  try {
-    const initial = setup.sync.session.sync(sessionID)
-    await wait(() => requests === 1)
-    const forced = setup.sync.session.sync(sessionID, { force: true })
-    old.resolve(json([{ info: assistant, parts: [] }]))
-    await Promise.all([initial, forced])
-    expect(requests).toBe(2)
-    expect(setup.sync.data.part[messageID]?.[0]).toMatchObject({ text: "fresh" })
-  } finally {
-    setup.app.renderer.destroy()
-  }
+    return json({ data: [{ ...assistant, content: [{ type: "text", text: "fresh" }] }], cursor: {} })
+  }, Messages)
+  const initial = setup.data.session.message.sync(sessionID)
+  await requested.promise
+  setup.data.session.message.invalidate(sessionID)
+  const forced = setup.data.session.message.sync(sessionID)
+  old.resolve(json({ data: [assistant], cursor: {} }))
+  await Promise.all([initial, forced])
+  expect(reads).toBe(2)
+  expect(await setup.frame()).toContain("fresh")
 })
 
-test("reconnect forces cached history hydration and restores quiet activity", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-  let count = 0
+test("reconnect invalidates cached native history and restores quiet activity", async () => {
+  let reads = 0
   let connected = false
-  const setup = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      count += 1
-      return json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: String(count) }] }])
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    if (url.pathname === "/session/status") return json(connected ? {
-      [sessionID]: { type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 200 } },
-    } : {})
-    if (url.pathname === "/permission" || url.pathname === "/question") return json([])
-    return undefined
-  }, tmp.path)
-  try {
-    await setup.sync.session.sync(sessionID)
-    connected = true
-    setup.emit(global({ id: "evt_connected", type: "server.connected", properties: {} }))
-    await wait(() => count === 2 && setup.sync.data.part[messageID]?.[0]?.type === "text" &&
-      setup.sync.data.part[messageID][0].text === "2")
-    expect(setup.sync.data.session_status[sessionID]).toMatchObject({ activity: { streamEventCount: 200 } })
-  } finally {
-    setup.app.renderer.destroy()
-  }
+  using setup = await mount((url) => {
+    if (url.pathname === `/api/session/${sessionID}/message`)
+      return json({ data: [{ ...assistant, content: [{ type: "text", text: String(++reads) }] }], cursor: {} })
+    if (url.pathname === "/api/session/active") return json({ data: connected ? { [sessionID]: { type: "running", status: {
+      type: "busy", activity: { userMessageID: "msg_user", model: "receiving", streamEventCount: 200 },
+    } } } : {} })
+  }, Messages)
+  await setup.data.session.message.sync(sessionID)
+  connected = true
+  setup.client.connection.internal.resync("fixture reconnect")
+  await wait(() => setup.client.connection.status() !== "connected")
+  await wait(() => setup.client.connection.status() === "connected")
+  await setup.data.session.message.sync(sessionID)
+  await wait(() => setup.data.session.current(sessionID)?.type === "busy")
+  expect(reads).toBe(2)
+  expect(await setup.frame()).toContain("2")
+  expect(setup.data.session.current(sessionID)).toMatchObject({ activity: { streamEventCount: 200 } })
 })
 
-test("live messages use creation time with an ID tie-break", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-  const { app, emit, sync } = await mount(undefined, tmp.path)
-  const messages = [
-    { ...assistant, id: "msg_a", time: { created: 30, completed: 31 } },
-    { ...assistant, id: "msg_z", time: { created: 10, completed: 11 } },
-    { ...assistant, id: "msg_m", time: { created: 20, completed: 21 } },
-    { ...assistant, id: "msg_b", time: { created: 20, completed: 21 } },
-  ]
-
-  try {
-    for (const info of messages) {
-      emit(global({ id: `evt_${info.id}`, type: "message.updated", properties: { sessionID, info } }))
-    }
-    await wait(() => sync.data.message[sessionID]?.length === messages.length)
-
-    expect(sync.data.message[sessionID].map((message) => message.id)).toEqual(["msg_z", "msg_b", "msg_m", "msg_a"])
-  } finally {
-    app.renderer.destroy()
-  }
+test.each(["during", "before", "orphan"] as const)("native hydration preserves text streamed %s the read", async (timing) => {
+  const snapshot = Promise.withResolvers<Response>()
+  const requested = Promise.withResolvers<void>()
+  let reads = 0
+  using setup = await mount((url) => {
+    if (url.pathname !== `/api/session/${sessionID}/message`) return
+    if (++reads === 1) return json({ data: timing === "orphan" ? [] : [assistant], cursor: {} })
+    requested.resolve()
+    return snapshot.promise
+  }, Messages)
+  await setup.data.session.message.sync(sessionID)
+  if (timing === "before") await setup.emit({ id: "evt_before", created: 2, type: "session.text.delta", data: {
+    sessionID, assistantMessageID: messageID, ordinal: 0, delta: "visible streamed content",
+  } })
+  if (timing === "before") expect(await setup.frame()).toContain("visible streamed content")
+  setup.data.session.message.invalidate(sessionID)
+  const hydrate = setup.data.session.message.sync(sessionID)
+  await requested.promise
+  if (timing !== "before") await setup.emit({ id: "evt_during", created: 3, type: "session.text.delta", data: {
+    sessionID, assistantMessageID: messageID, ordinal: 0, delta: timing === "orphan" ? "ignored until part exists" : "visible live content",
+  } })
+  snapshot.resolve(json({ data: [{ ...assistant, content: [{ type: "text", text: timing === "orphan" ? "hydrated" : "" }] }], cursor: {} }))
+  await hydrate
+  expect(await setup.frame()).toContain(timing === "orphan" ? "hydrated" : timing === "before" ? "visible streamed content" : "visible live content")
 })
 
-test("stale session hydration does not overwrite live message parts", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
+test("native history retains server creation-time and ID order", async () => {
+  const ids = ["msg_z", "msg_b", "msg_m", "msg_a"]
+  using setup = await mount((url) => {
+    if (url.pathname.endsWith("/message")) return json({ data: ids.toReversed().map((id, index) => ({
+      ...assistant, id, time: { created: [30, 20, 20, 10][index] },
+    })), cursor: {} })
   })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
-  try {
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
-    emit(
-      global({
-        id: "evt_part",
-        type: "message.part.updated",
-        properties: {
-          sessionID,
-          time: 2,
-          part: { id: partID, sessionID, messageID, type: "text", text: "visible live content" },
-        },
-      }),
-    )
-    await wait(() => sync.data.part[messageID]?.[0]?.type === "text")
-
-    resolveMessages(
-      json([
-        {
-          info: assistant,
-          parts: [{ id: partID, sessionID, messageID, type: "text", text: "" }],
-        },
-      ]),
-    )
-    await hydrate
-
-    expect(sync.data.part[messageID][0]).toMatchObject({ text: "visible live content" })
-  } finally {
-    app.renderer.destroy()
-  }
+  await setup.data.session.message.sync(sessionID)
+  expect(setup.data.session.message.list(sessionID).map((message) => message.id)).toEqual(ids)
 })
 
-test("orphan live deltas do not suppress hydrated parts", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
+test("native bounded hydration retains live rows and the older-page cursor", async () => {
+  const snapshot = Promise.withResolvers<Response>()
+  const requested = Promise.withResolvers<void>()
+  const limits: Array<string | null> = []
+  using setup = await mount((url) => {
+    if (!url.pathname.endsWith("/message")) return
+    limits.push(url.searchParams.get("limit"))
+    requested.resolve()
+    return snapshot.promise
   })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
-  try {
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    emit(
-      global({
-        id: "evt_delta",
-        type: "message.part.delta",
-        properties: { sessionID, messageID, partID, field: "text", delta: "ignored until part exists" },
-      }),
-    )
-    resolveMessages(
-      json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "hydrated" }] }]),
-    )
-    await hydrate
-
-    expect(sync.data.part[messageID][0]).toMatchObject({ text: "hydrated" })
-  } finally {
-    app.renderer.destroy()
-  }
+  const hydrate = setup.data.session.message.sync(sessionID)
+  await requested.promise
+  await setup.emit({ id: "evt_live", created: 30, type: "session.step.started", durable: { aggregateID: sessionID, seq: 1, version: 1 },
+    data: { sessionID, assistantMessageID: "msg_live", started: 30, agent: "build", model: assistant.model } })
+  snapshot.resolve(json({ data: Array.from({ length: 20 }, (_, index) => ({
+    ...assistant, id: `msg_${20 - index}`, time: { created: 20 - index },
+  })), cursor: { next: "older" } }))
+  await hydrate
+  expect(limits).toEqual(["20"])
+  expect(setup.data.session.message.list(sessionID)).toHaveLength(21)
+  expect(setup.data.session.message.list(sessionID).at(-1)?.id).toBe("msg_live")
+  expect(setup.data.session.message.more(sessionID)).toBe(true)
 })
 
-test("hydration does not clear text streamed before it starts", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
+test.each(["message", "session"] as const)("native %s removed during hydration does not regain stale content", async (removed) => {
+  const snapshot = Promise.withResolvers<Response>()
+  const requested = Promise.withResolvers<void>()
+  let reads = 0
+  using setup = await mount((url) => {
+    if (!url.pathname.endsWith("/message")) return
+    if (++reads === 1) return json({ data: [assistant], cursor: {} })
+    requested.resolve()
+    return snapshot.promise
   })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
-  try {
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
-    emit(
-      global({
-        id: "evt_part",
-        type: "message.part.updated",
-        properties: {
-          sessionID,
-          time: 1,
-          part: { id: partID, sessionID, messageID, type: "text", text: "" },
-        },
-      }),
-    )
-    emit(
-      global({
-        id: "evt_delta",
-        type: "message.part.delta",
-        properties: { sessionID, messageID, partID, field: "text", delta: "visible streamed content" },
-      }),
-    )
-    await wait(() => sync.data.part[messageID]?.[0]?.type === "text" && sync.data.part[messageID][0].text !== "")
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    resolveMessages(json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "" }] }]))
-    await hydrate
-
-    expect(sync.data.part[messageID][0]).toMatchObject({ text: "visible streamed content" })
-  } finally {
-    app.renderer.destroy()
-  }
-})
-
-test("live messages merged during hydration retain the 100 message window", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
-  })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
-  try {
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    const live = { ...assistant, id: "msg_z_live" }
-    emit(global({ id: "evt_live", type: "message.updated", properties: { sessionID, info: live } }))
-    await wait(() => sync.data.message[sessionID]?.some((message) => message.id === live.id) ?? false)
-    resolveMessages(
-      json(
-        Array.from({ length: 100 }, (_, index) => {
-          const id = `msg_${String(index).padStart(3, "0")}`
-          return {
-            info: { ...assistant, id },
-            parts: [{ id: `prt_${id}`, sessionID, messageID: id, type: "text", text: id }],
-          }
-        }),
-      ),
-    )
-    await hydrate
-
-    expect(sync.data.message[sessionID]).toHaveLength(100)
-    expect(sync.data.message[sessionID].at(-1)?.id).toBe(live.id)
-    expect(sync.data.message[sessionID].some((message) => message.id === "msg_000")).toBe(false)
-    expect(sync.data.part.msg_000).toBeUndefined()
-  } finally {
-    app.renderer.destroy()
-  }
-})
-
-test("a message removed during hydration does not regain stale parts", async () => {
-  await using tmp = await tmpdir()
-  await Bun.write(`${tmp.path}/kv.json`, "{}")
-
-  let resolveMessages!: (response: Response) => void
-  const messages = new Promise<Response>((resolve) => {
-    resolveMessages = resolve
-  })
-  let requested = false
-  const { app, emit, sync } = await mount((url) => {
-    if (url.pathname === `/session/${sessionID}`) return json(session)
-    if (url.pathname === `/session/${sessionID}/message`) {
-      requested = true
-      return messages
-    }
-    if (url.pathname === `/session/${sessionID}/todo` || url.pathname === `/session/${sessionID}/diff`) return json([])
-    return undefined
-  }, tmp.path)
-
-  try {
-    emit(global({ id: "evt_message", type: "message.updated", properties: { sessionID, info: assistant } }))
-    await wait(() => sync.data.message[sessionID]?.length === 1)
-    const hydrate = sync.session.sync(sessionID)
-    await wait(() => requested)
-    emit(global({ id: "evt_removed", type: "message.removed", properties: { sessionID, messageID } }))
-    await wait(() => sync.data.message[sessionID]?.length === 0)
-    resolveMessages(
-      json([{ info: assistant, parts: [{ id: partID, sessionID, messageID, type: "text", text: "stale" }] }]),
-    )
-    await hydrate
-
-    expect(sync.data.message[sessionID]).toEqual([])
-    expect(sync.data.part[messageID]).toBeUndefined()
-  } finally {
-    app.renderer.destroy()
-  }
+  await setup.data.session.message.sync(sessionID)
+  setup.data.session.message.invalidate(sessionID)
+  const hydrate = setup.data.session.message.sync(sessionID)
+  await requested.promise
+  if (removed === "message") await setup.emit({ id: "evt_revert", created: 3, type: "session.revert.committed",
+    durable: { aggregateID: sessionID, seq: 1, version: 1 }, data: { sessionID, to: messageID } })
+  if (removed === "session") await setup.emit({ id: "evt_removed", created: 3, type: "session.deleted",
+    durable: { aggregateID: sessionID, seq: 1, version: 2 }, data: { sessionID } })
+  snapshot.resolve(json({ data: [assistant], cursor: {} }))
+  await hydrate
+  expect(setup.data.session.message.list(sessionID)).toEqual([])
+  expect(setup.data.session.message.get(sessionID, messageID)).toBeUndefined()
 })

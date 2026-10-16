@@ -122,7 +122,7 @@ function readMarker(filename: string) {
       catch: (cause) =>
         new DatabaseLegacyV01.DatabaseLegacyV01Error("pending replacement marker is unreadable", { cause }),
     })
-    const json = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(text)
+    const json = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(text)
     return yield* Schema.decodeUnknownEffect(DatabaseLegacyV01.PendingReplacement)(json, {
       onExcessProperty: "error",
     })

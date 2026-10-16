@@ -16,7 +16,7 @@ const Status = Schema.Literals(["PASS", "FAIL"])
 type Check = { readonly id: string; readonly status: typeof Status.Type; readonly detail: string }
 const pass = (id: string, detail: string): Check => ({ id, status: "PASS", detail })
 const fail = (id: string, detail: string): Check => ({ id, status: "FAIL", detail })
-const readJson = async (file: string) => Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(await Bun.file(file).text())
+const readJson = async (file: string) => Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(await Bun.file(file).text())
 const option = (argv: readonly string[], name: string) => {
   const index = argv.indexOf(name)
   return index < 0 ? undefined : argv[index + 1]
@@ -71,6 +71,7 @@ async function performance(root: string) {
   } catch (error) {
     return [fail("performance.manifest.schema", error instanceof Error ? error.message : String(error))]
   }
+  if (manifest.baselineStatus !== "available") return [fail("performance.baseline", "Native comparison baseline is not available")]
   checks.push(exact(manifest.fixedOrder, fixedOrder) ? pass("performance.order", "fixed B/C order") : fail("performance.order", "slot order differs"))
   checks.push(exact(manifest.harnessFiles, harnessFiles) ? pass("performance.harness.files", "frozen harness list") : fail("performance.harness.files", "harness list differs"))
   checks.push(path.resolve(manifest.evidenceRoot) === path.resolve(root) ? pass("performance.root", "evidence root pinned") : fail("performance.root", "evidence root differs"))
@@ -91,7 +92,7 @@ async function performance(root: string) {
     if (!(await Bun.file(file).exists())) continue
     try {
       const bytes = new Uint8Array(await Bun.file(file).arrayBuffer())
-      const slot = validateSlotEvidence(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(bytes)))
+      const slot = validateSlotEvidence(Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(new TextDecoder().decode(bytes)))
       const baseline = expected.startsWith("B")
       if (slot.slot !== expected || slot.revision !== (baseline ? "baseline" : "candidate") || slot.commit !== (baseline ? manifest.baselineCommit : manifest.candidateCommit) || slot.harnessSha256 !== manifest.harnessSha256) throw new BenchmarkContractError(`Slot ${expected} revision pin differs`)
       slotFileHashes[expected] = createHash("sha256").update(bytes).digest("hex")

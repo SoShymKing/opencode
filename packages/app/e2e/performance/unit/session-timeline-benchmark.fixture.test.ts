@@ -3,18 +3,22 @@ import {
   buildInitialStreamEvent,
   buildStreamDeltaEvents,
   createTimelineBenchmarkBackend,
-  textPartID,
 } from "../timeline/session-timeline-benchmark.fixture"
 
 test("reconnect REST history contains only delivered timeline events", () => {
   const backend = createTimelineBenchmarkBackend({ historyTurns: 1, eventBatch: 1 })
   const initial = buildInitialStreamEvent(2)
   const deltas = buildStreamDeltaEvents(2)
-  const assistant = () => backend.pageMessages().items.find((item) => item.info.id === "msg_assistant_regression")
-  const text = () => assistant()?.parts.find((part) => part.id === textPartID)?.text
-  backend.transport.enqueue([initial, ...deltas])
+  const assistant = () => backend.pageMessages().items.find((item) => item.id === "msg_assistant_regression")
+  const text = () => {
+    const message = assistant()
+    return message?.type === "assistant" ? message.content.find((part) => part.type === "text")?.text : undefined
+  }
+  backend.transport.enqueue([...initial, ...deltas])
   expect(text()).toBeUndefined()
-  expect(backend.events()).toEqual([initial])
+  expect(backend.events()).toEqual([initial[0]])
+  expect(text()).toBe("")
+  expect(backend.events()).toEqual([initial[1]])
   expect(text()).toBe(
     "Streaming\n\n## Implementation plan\n\nStreaming **bold analysis\n\n```ts\nconst initial = true\n```",
   )
@@ -27,40 +31,26 @@ test("reconnect REST history contains only delivered timeline events", () => {
   expect(String(text()).match(/ continues across three/g)).toHaveLength(1)
   const deliveredText = text()
   backend.transport.enqueue({
-    directory: initial.directory,
-    payload: {
-      type: "message.updated",
-      properties: {
-        info: {
-          id: "msg_assistant_regression",
-          role: "assistant",
-          time: { created: 1700000001000, completed: 1700000003000 },
-        },
-      },
+    id: "evt_benchmark_ended",
+    created: 1700000003000,
+    type: "session.step.ended",
+    durable: { aggregateID: "ses_timeline_state_regression", seq: 20, version: 1 },
+    data: {
+      sessionID: "ses_timeline_state_regression",
+      assistantMessageID: "msg_assistant_regression",
+      finish: "stop",
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      streamEventCount: 91,
     },
   })
   backend.events()
-  expect(assistant()?.info.time).toEqual({ created: 1700000001000, completed: 1700000003000 })
+  expect(assistant()?.time).toEqual({ created: 1700000001000, completed: 1700000003000 })
+  expect(assistant()).toMatchObject({ streamEventCount: 91 })
   expect(text()).toBe(deliveredText)
-  expect(assistant()?.parts.map((part) => part.id)).toEqual(["prt_0001_edit", textPartID])
-  backend.transport.enqueue({
-    directory: initial.directory,
-    payload: {
-      type: "message.updated",
-      properties: {
-        info: { id: "msg_user_regression", role: "user", summary: { diffs: [{ file: "src/regression.ts" }] } },
-      },
-    },
-  })
+  backend.transport.enqueue(initial[0]!)
   backend.events()
-  expect(backend.pageMessages().items.find((item) => item.info.id === "msg_user_regression")?.info.summary).toEqual({
-    diffs: [{ file: "src/regression.ts" }],
-  })
-  backend.transport.enqueue(initial)
-  backend.events()
-  expect(text()).not.toContain("benchmark-complete")
-  expect(assistant()?.parts.map((part) => part.id)).toEqual(["prt_0001_edit", textPartID])
-  expect(
-    createTimelineBenchmarkBackend({ historyTurns: 1, eventBatch: 1 }).pageMessages().items.at(-1)?.parts,
-  ).toHaveLength(1)
+  expect(text()).toBe(deliveredText)
+  const fresh = createTimelineBenchmarkBackend({ historyTurns: 1, eventBatch: 1 }).pageMessages().items.at(-1)
+  expect(fresh?.type === "assistant" && fresh.content).toHaveLength(1)
 })

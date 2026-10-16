@@ -1,12 +1,31 @@
 import { describe, expect, test } from "bun:test"
 import path from "node:path"
 import { mkdir } from "node:fs/promises"
-import { DatabaseArtifact } from "@opencode-ai/core/database/artifact"
-import { DatabaseLegacyV01 } from "@opencode-ai/core/database/legacy-v01"
+import { DatabaseArtifact } from "@opencode/core/database/artifact"
+import { DatabaseLegacyV01 } from "@opencode/core/database/legacy-v01"
 import { Effect } from "effect"
 import { tmpdir } from "./fixture/tmpdir"
+import { Database } from "bun:sqlite"
+import { EffectDrizzleSqlite } from "../src/database/drizzle.js"
+import { sqliteLayer } from "../src/database/sqlite.bun.js"
 
 describe("DatabaseArtifact", () => {
+  test("snapshot includes committed WAL rows and publishes a standalone database", async () => {
+    await using directory = await tmpdir()
+    const destination = path.join(directory.path, "backup.sqlite")
+    await Effect.runPromise(Effect.gen(function* () {
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* db.run("PRAGMA journal_mode = WAL")
+      yield* db.run("PRAGMA wal_autocheckpoint = 0")
+      yield* db.run("CREATE TABLE history (data TEXT)")
+      yield* db.run("INSERT INTO history VALUES ('committed-wal')")
+      yield* DatabaseArtifact.snapshot(db, destination)
+    }).pipe(Effect.provide(sqliteLayer({ filename: path.join(directory.path, "source.sqlite") })), Effect.scoped))
+    using backup = new Database(destination, { readonly: true })
+    expect(backup.query("SELECT data FROM history").all()).toEqual([{ data: "committed-wal" }])
+    expect(backup.query("PRAGMA quick_check").get()).toEqual({ quick_check: "ok" })
+  })
+
   test("reports marker publication as invisible when the destination link was not created", async () => {
     await using tmp = await tmpdir()
     const source = path.join(tmp.path, "source")

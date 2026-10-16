@@ -5,10 +5,12 @@ import path from "node:path"
 import { Database } from "@opencode-ai/core/database/database"
 import { DatabaseArtifact } from "@opencode-ai/core/database/artifact"
 import { DatabaseLegacyV01 } from "@opencode-ai/core/database/legacy-v01"
+import { DatabaseReplacement } from "@opencode/core/database/replacement"
 import { sql } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { createCurrentDatabase } from "./fixture/database-transfer"
 import { tmpdir } from "./fixture/tmpdir"
+import { tempGlobalLayer } from "./fixture/global"
 
 describe("Database pending replacement", () => {
   test("activates a prepared stage before opening SQLite and retains the old target backup", async () => {
@@ -28,7 +30,7 @@ describe("Database pending replacement", () => {
     const title = await Effect.runPromise(
       Effect.gen(function* () {
         return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session`)
-      }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.scoped),
+      }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped),
     )
 
     expect(title).toEqual({ title: "Session" })
@@ -145,7 +147,7 @@ describe("Database pending replacement", () => {
             discard: true,
           },
         )
-      }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.scoped),
+      }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped),
     )
     await DatabaseLegacyV01.exportDatabase({ source: current, destination: legacy }).pipe(Effect.runPromise)
     await DatabaseLegacyV01.stageImport({ source: legacy, target }).pipe(Effect.runPromise)
@@ -208,7 +210,52 @@ describe("Database pending replacement", () => {
   })
 })
 
-const decodeJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
+
+describe("Standalone ws replacement", () => {
+  test.each(["prepared", "backup_ready", "renamed"] as const)("preserves the backup at %s", async (phase) => {
+    await using tmp = await tmpdir()
+    const fixture = await stagedFixture(tmp.path)
+    const before = await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)
+    if (phase !== "prepared") {
+      const backup = `${fixture.target}.replacement-backup-interrupted.db`
+      await DatabaseLegacyV01.snapshotCurrentFile(fixture.target, backup).pipe(Effect.runPromise)
+      await Bun.write(fixture.marker, JSON.stringify({
+        ...(await preparedMarker(fixture.marker)),
+        phase: "backup_ready",
+        backup: { name: path.basename(backup), ...(await DatabaseArtifact.digest(backup).pipe(Effect.runPromise)) },
+      }))
+      if (phase === "renamed") await rename(fixture.staged, fixture.target)
+    }
+
+    await DatabaseReplacement.activate(fixture.target).pipe(Effect.runPromise)
+
+    expect(await Bun.file(fixture.marker).exists()).toBe(false)
+    expect(await Bun.file(fixture.staged).exists()).toBe(false)
+    const backups = (await readdir(tmp.path)).filter((name) => name.includes("replacement-backup-"))
+    expect(backups).toHaveLength(1)
+    using backup = new SqliteDatabase(path.join(tmp.path, backups[0] ?? ""), { readonly: true })
+    expect(backup.query("SELECT title FROM session").get()).toEqual({ title: "old target" })
+    using target = new SqliteDatabase(fixture.target, { readonly: true })
+    expect(target.query("SELECT title FROM session").get()).toEqual({ title: "Session" })
+    expect(await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)).not.toEqual(before)
+  })
+
+  test.each(["invalid marker", "corrupt stage", "sidecar"])("leaves the target unchanged for %s", async (state) => {
+    await using tmp = await tmpdir()
+    const fixture = await stagedFixture(tmp.path)
+    const before = await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)
+    if (state === "invalid marker") await Bun.write(fixture.marker, "{invalid")
+    if (state === "corrupt stage") await Bun.write(fixture.staged, "corrupt")
+    if (state === "sidecar") await Bun.write(`${fixture.staged}-wal`, "unauthenticated")
+
+    await expect(DatabaseReplacement.activate(fixture.target).pipe(Effect.runPromise)).rejects.toThrow()
+
+    expect(await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)).toEqual(before)
+    expect(await Bun.file(fixture.marker).exists()).toBe(true)
+    expect(await Bun.file(fixture.staged).exists()).toBe(true)
+  })
+})
 
 async function stagedFixture(root: string) {
   const current = path.join(root, "current.sqlite")
@@ -236,7 +283,7 @@ function openTitle(target: string) {
   return Effect.runPromise(
     Effect.gen(function* () {
       return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session`)
-    }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.scoped),
+    }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped),
   )
 }
 

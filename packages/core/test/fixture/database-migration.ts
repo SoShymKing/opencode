@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite"
 import { readdir } from "node:fs/promises"
 import path from "node:path"
-import { SqliteClient } from "@effect/sql-sqlite-bun"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
+import { sqliteLayer } from "../../src/database/sqlite.bun"
+import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
+import type { SqlClient } from "effect/sql"
+import type { Global } from "@opencode/util/global"
+import { tempGlobalLayer } from "./global"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { sql } from "drizzle-orm"
 import { Effect } from "effect"
@@ -41,11 +44,11 @@ type ExistingOptions = {
   readonly partComplete?: boolean
 }
 
-export function useDatabase<A, E>(filename: string, use: (db: MigrationDatabase) => Effect.Effect<A, E>) {
+export function useDatabase<A, E>(filename: string, use: (db: MigrationDatabase) => Effect.Effect<A, E, SqlClient.SqlClient | Global.Service>) {
   return Effect.runPromise(
     Effect.gen(function* () {
       return yield* use(yield* makeDb)
-    }).pipe(Effect.provide(SqliteClient.layer({ filename })), Effect.scoped),
+    }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.provide(tempGlobalLayer), Effect.scoped),
   )
 }
 

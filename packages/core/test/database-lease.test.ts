@@ -3,11 +3,13 @@ import { Database as SqliteDatabase } from "bun:sqlite"
 import path from "node:path"
 import { symlink } from "node:fs/promises"
 import { DatabaseLease } from "@opencode-ai/core/database/lease"
+import { Database } from "@opencode/core/database/database"
 import { DatabaseLegacyV01 } from "@opencode-ai/core/database/legacy-v01"
 import { DatabaseReplacement } from "@opencode-ai/core/database/replacement"
 import { Effect } from "effect"
 import { createCurrentDatabase } from "./fixture/database-transfer"
 import { tmpdir } from "./fixture/tmpdir"
+import { tempGlobalLayer } from "./fixture/global"
 
 const worker = path.join(import.meta.dir, "fixture", "database-lease-worker.ts")
 
@@ -16,7 +18,7 @@ describe("DatabaseLease", () => {
     await using tmp = await tmpdir()
     const target = path.join(tmp.path, "target.sqlite")
 
-    await createCurrentDatabase(target)
+    await Effect.runPromise(Database.Service.pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer)))
 
     using database = new SqliteDatabase(target, { readonly: true })
     expect(database.query<{ readonly journal_mode: string }, []>("PRAGMA journal_mode").get()).toEqual({
@@ -44,7 +46,7 @@ describe("DatabaseLease", () => {
   test("a file-backed database layer holds a shared lease for its whole scope", async () => {
     await using tmp = await tmpdir()
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(target)
+    await Effect.runPromise(Database.Service.pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer)))
     const child = spawn("database", target)
     await ready(child)
 

@@ -1,38 +1,35 @@
-import type { Session } from "@opencode-ai/sdk/v2"
+import type { SessionInfo } from "@opencode/client"
 import { createMemo, createResource, createSignal, onMount } from "solid-js"
 import { useDialog } from "../ui/dialog"
 import { DialogSelect, type DialogSelectOption } from "../ui/dialog-select"
-import { useSDK } from "../context/sdk"
-import { useSync } from "../context/sync"
+import { useClient } from "../context/client"
+import { useData } from "../context/data"
 import { useToast } from "../ui/toast"
 import { Locale } from "../util/locale"
 import { errorMessage } from "../util/error"
+import { listSessionPages } from "../util/session-list-window"
+import { withTimestampedFallback } from "@opencode/util/session-title-fallback"
 
 const archivedSessionLimit = 200
 
 export function DialogArchivedSessionList() {
   const dialog = useDialog()
-  const sdk = useSDK()
-  const sync = useSync()
+  const client = useClient()
+  const data = useData()
   const toast = useToast()
   const [restoring, setRestoring] = createSignal<string>()
 
   const [sessions, { refetch }] = createResource(async () => {
-    const archived: Session[] = []
-    let cursor: number | undefined
-    while (archived.length < archivedSessionLimit) {
-      const result = await sdk.client.experimental.session.list({
+    const archived = await listSessionPages(
+      client.api,
+      {
         archived: true,
-        roots: true,
+        parentID: null,
         limit: archivedSessionLimit,
-        cursor,
-      })
-      if (result.error) throw result.error
-      archived.push(...(result.data ?? []).filter((session) => session.time.archived !== undefined))
-      const next = result.response.headers.get("x-next-cursor")
-      if (!next) break
-      cursor = Number(next)
-    }
+        order: "desc",
+      },
+      archivedSessionLimit,
+    )
     return archived
       .toSorted((a, b) => (b.time.archived ?? b.time.updated) - (a.time.archived ?? a.time.updated))
       .slice(0, archivedSessionLimit)
@@ -62,9 +59,10 @@ export function DialogArchivedSessionList() {
   async function restore(sessionID: string) {
     if (restoring()) return
     setRestoring(sessionID)
-    const result = await sdk.client.session.update({ sessionID, time: { archived: null } }).catch((err) => ({
-      error: err,
-    }))
+    const result = await client.api.session.restore({ sessionID }).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    )
     if (result.error) {
       toast.show({
         variant: "error",
@@ -75,7 +73,8 @@ export function DialogArchivedSessionList() {
       return
     }
     toast.show({ variant: "info", message: "Session restored" })
-    const refreshed = await Promise.all([refetch(), sync.session.refresh()])
+    data.session.invalidate(sessionID)
+    const refreshed = await Promise.all([refetch(), data.session.sync(sessionID)])
       .then(() => ({ error: undefined }))
       .catch((err) => ({ error: err }))
     setRestoring(undefined)
@@ -105,10 +104,10 @@ export function DialogArchivedSessionList() {
   )
 }
 
-function option(session: Session, restoring: string | undefined): DialogSelectOption<string> {
+function option(session: SessionInfo, restoring: string | undefined): DialogSelectOption<string> {
   const archived = session.time.archived ?? session.time.updated
   return {
-    title: restoring === session.id ? "Restoring..." : session.title,
+    title: restoring === session.id ? "Restoring..." : withTimestampedFallback(session),
     value: session.id,
     category: new Date(archived).toDateString(),
     footer: Locale.time(archived),

@@ -1,17 +1,21 @@
 import { isDeepStrictEqual } from "node:util"
 import { and, asc, eq, gt, sql } from "drizzle-orm"
 import { DateTime, Effect, Schema } from "effect"
-import type { Database } from "@opencode-ai/core/database/database"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { Project } from "@opencode-ai/core/project"
-import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { ProviderV2 } from "@opencode-ai/core/provider"
-import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionHistory } from "@opencode-ai/core/session/history"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { Snapshot } from "@opencode-ai/core/snapshot"
+import type { Database } from "@opencode/core/database/database"
+import { Model } from "@opencode/schema/model"
+import { Agent } from "@opencode/schema/agent"
+import { Project } from "@opencode/schema/project"
+import { ProjectTable } from "@opencode/core/project/sql"
+import { Provider } from "@opencode/schema/provider"
+import { AbsolutePath, RelativePath } from "@opencode/schema/schema"
+import { Session } from "@opencode/schema/session"
+import { SessionHistory } from "@opencode/core/session/history"
+import { SessionMessage } from "@opencode/schema/session-message"
+import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
+import { Snapshot } from "@opencode/schema/snapshot"
+import { SessionStore } from "@opencode/core/session/store"
+import { replaceContent } from "@opencode/core/session/projector-content"
+import { InstructionState } from "@opencode/core/session/instruction-state"
 import { BenchmarkContractError, pragmas } from "./session-projector-performance-fixture"
 
 export { BenchmarkContractError, pragmas }
@@ -35,8 +39,8 @@ export type DatabaseService = Database.Interface["db"]
 export type ReadFixture = Effect.Success<ReturnType<typeof setupReadFixture>>
 
 const created = DateTime.makeUnsafe(0)
-const model = { id: ModelV2.ID.make("storage-read"), providerID: ProviderV2.ID.make("benchmark") }
-const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+const model = { id: Model.ID.make("storage-read"), providerID: Provider.ID.make("benchmark") }
+const encodeMessage = Schema.encodeSync(SessionMessage.Info)
 const decodeEnvelope = Schema.decodeUnknownSync(Schema.Struct({ snapshot: Schema.optional(SessionMessage.Assistant.fields.snapshot) }))
 
 function content(count: number, interrupted: boolean) {
@@ -48,27 +52,25 @@ function content(count: number, interrupted: boolean) {
         name: "read",
         state:
           index % 2 === 0
-            ? SessionMessage.ToolStatePending.make({ status: "pending", input: "{}" })
+            ? SessionMessage.ToolStateStreaming.make({ status: "streaming", input: "{}" })
             : SessionMessage.ToolStateRunning.make({
                 status: "running",
                 input: {},
-                structured: {},
-                content: [{ type: "text", text: "running" }],
+                metadata: {},
               }),
         time: { created },
       })
-    if (index % 3 === 0) return SessionMessage.AssistantText.make({ type: "text", id: `text-${index}`, text: `part-${index}` })
+    if (index % 3 === 0) return SessionMessage.AssistantText.make({ type: "text", text: `part-${index}` })
     if (index % 3 === 1)
       return SessionMessage.AssistantReasoning.make({
         type: "reasoning",
-        id: `reasoning-${index}`,
         text: `why-${index}`,
       })
     return SessionMessage.AssistantTool.make({
       type: "tool",
       id: `tool-${index}`,
       name: "read",
-      state: SessionMessage.ToolStateCompleted.make({ status: "completed", input: {}, structured: {}, content: [] }),
+      state: SessionMessage.ToolStateCompleted.make({ status: "completed", input: {}, content: [{ type: "text", text: "complete" }] }),
       time: { created, completed: created },
     })
   })
@@ -78,7 +80,7 @@ function assistant(id: string, count: number, interrupted = false, snapshot?: nu
   return SessionMessage.Assistant.make({
     id: SessionMessage.ID.make(id),
     type: "assistant",
-    agent: "build",
+    agent: Agent.ID.make("build"),
     model,
     content: content(count, interrupted),
     ...(snapshot === undefined
@@ -93,53 +95,23 @@ function assistant(id: string, count: number, interrupted = false, snapshot?: nu
   })
 }
 
-function row(sessionID: SessionV2.ID, seq: number, message: SessionMessage.Message) {
+function row(sessionID: Session.ID, seq: number, message: SessionMessage.Info) {
   const encoded = encodeMessage(message)
-  const { id: _id, type, ...data } = encoded
+  const { id: _id, type, ...data } = encoded.type === "assistant" ? (({ content: _content, ...envelope }) => envelope)(encoded) : encoded
   return { id: message.id, session_id: sessionID, type, seq, time_created: seq, data }
 }
 
-export function seedMessages(db: DatabaseService, sessionID: SessionV2.ID, messages: readonly SessionMessage.Message[]) {
+export function seedMessages(db: DatabaseService, sessionID: Session.ID, messages: readonly SessionMessage.Info[]) {
   return Effect.gen(function* () {
-    const normalized = yield* db
-      .get<{
-        readonly name: string
-      }>(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_message_part'`)
-      .pipe(Effect.orDie)
-    if (!normalized)
-      return yield* db
-        .insert(SessionMessageTable)
-        .values(messages.map((message, index) => row(sessionID, index, message)))
-        .run()
-        .pipe(Effect.orDie)
-    yield* Effect.forEach(
-      messages,
-      (message, seq) => {
-        const encoded = encodeMessage(message)
-        const type = encoded.type
-        const data = encoded.type === "assistant" ? (({ id: _id, type: _type, content: _content, ...envelope }) => envelope)(encoded) : (({ id: _id, type: _type, ...stored }) => stored)(encoded)
-        return Effect.gen(function* () {
-          yield* db.run(sql`INSERT INTO session_message(id, session_id, type, seq, time_created, time_updated, data) VALUES (${message.id}, ${sessionID}, ${type}, ${seq}, ${seq}, ${seq}, ${JSON.stringify(data)})`).pipe(Effect.orDie)
-          if (type !== "assistant") return
-          yield* Effect.forEach(
-            encoded.content,
-            (part, position) => {
-              const { id, type: partType, ...partData } = part
-              return db.run(sql`INSERT INTO session_message_part(message_id, position, id, type, data) VALUES (${message.id}, ${position}, ${id}, ${partType}, ${JSON.stringify(partData)})`).pipe(Effect.orDie)
-            },
-            { discard: true },
-          )
-        })
-      },
-      { discard: true },
-    )
+    yield* db.insert(SessionMessageTable).values(messages.map((message, index) => row(sessionID, index, message))).run().pipe(Effect.orDie)
+    yield* Effect.forEach(messages, (message) => message.type === "assistant" ? replaceContent(db, message) : Effect.void, { discard: true })
   })
 }
 
 export function setupReadFixture(db: DatabaseService, workload: ReadWorkload, label: string, malformed = false) {
   return Effect.gen(function* () {
-    const sessionID = SessionV2.ID.make(`ses_read_${workload.name}_${workload.size}_${label}`)
-    const messages: SessionMessage.Message[] = []
+    const sessionID = Session.ID.make(`ses_read_${workload.name}_${workload.size}_${label}`)
+    const messages: SessionMessage.Info[] = []
     if (workload.name === "page") for (let index = 0; index < workload.size; index++) messages.push(assistant(`msg_${label}_${index}`, index % 5 === 0 ? 32 : index % 3))
     if (workload.name === "single-message") messages.push(assistant(`msg_${label}_single`, workload.size))
     if (workload.name === "runner-context") {
@@ -152,9 +124,10 @@ export function setupReadFixture(db: DatabaseService, workload: ReadWorkload, la
         }),
       )
       messages.push(
-        SessionMessage.Compaction.make({
+        SessionMessage.CompactionCompleted.make({
           id: SessionMessage.ID.make(`msg_${label}_compact`),
           type: "compaction",
+          status: "completed",
           reason: "auto",
           summary: "summary",
           recent: "recent",
@@ -196,12 +169,13 @@ export function setupReadFixture(db: DatabaseService, workload: ReadWorkload, la
       .run()
       .pipe(Effect.orDie)
     yield* seedMessages(db, sessionID, messages)
+    yield* InstructionState.initialize(db, sessionID, -1, {})
     if (malformed) yield* db.run(sql`UPDATE session_message SET data = ${"{}"} WHERE id = ${messages[0]?.id}`).pipe(Effect.orDie)
     return { sessionID, messages, boundaryID: messages[0]?.id }
   })
 }
 
-export function executeRead(db: DatabaseService, sessions: SessionV2.Interface, fixture: ReadFixture, workload: ReadWorkload, invalidCursor = false) {
+export function executeRead(db: DatabaseService, sessions: SessionStore.Interface, fixture: ReadFixture, workload: ReadWorkload, invalidCursor = false) {
   if (workload.name === "page")
     return sessions.messages({
       sessionID: fixture.sessionID,
@@ -210,11 +184,8 @@ export function executeRead(db: DatabaseService, sessions: SessionV2.Interface, 
       cursor: invalidCursor ? { id: SessionMessage.ID.make("msg_missing_cursor"), direction: "next" } : undefined,
     })
   if (workload.name === "single-message")
-    return sessions.message({
-      sessionID: fixture.sessionID,
-      messageID: fixture.messages[0]?.id ?? SessionMessage.ID.make("msg_missing"),
-    })
-  if (workload.name === "runner-context") return SessionHistory.entriesForRunner(db, fixture.sessionID, -1)
+    return sessions.message(fixture.messages[0]?.id ?? SessionMessage.ID.make("msg_missing")).pipe(Effect.map((entry) => entry?.message))
+  if (workload.name === "runner-context") return SessionHistory.entriesForRunner(db, fixture.sessionID, [], "local")
   if (workload.name === "interrupted-tools") return SessionHistory.interruptedTools(db, fixture.sessionID)
   return Effect.gen(function* () {
     const boundary = yield* db
@@ -243,12 +214,12 @@ export function validateRead(result: unknown, fixture: ReadFixture, workload: Re
     workload.name === "runner-context" &&
     isDeepStrictEqual(
       result,
-      fixture.messages.map((message, seq) => ({ seq, message })),
+      { initial: "", entries: fixture.messages.map((message, seq) => ({ sessionID: fixture.sessionID, seq, message })).slice(1), rejectedAttachments: [] },
     )
   )
     return true
   if (workload.name === "interrupted-tools") {
-    const expected = fixture.messages.flatMap((message) => (message.type === "assistant" ? message.content.flatMap((part) => (part.type === "tool" && (part.state.status === "pending" || part.state.status === "running") ? [{ assistantMessageID: message.id, tool: part }] : [])) : []))
+    const expected = fixture.messages.flatMap((message) => (message.type === "assistant" ? message.content.flatMap((part) => (part.type === "tool" && (part.state.status === "streaming" || part.state.status === "running") ? [{ assistantMessageID: message.id, tool: part }] : [])) : []))
     if (isDeepStrictEqual(result, expected)) return true
   }
   if (workload.name === "revert-envelope-scan") {

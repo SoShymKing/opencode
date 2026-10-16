@@ -1,8 +1,8 @@
 import { describe, expect } from "bun:test"
 import { Effect } from "effect"
-import { MessageDecodeError } from "@opencode-ai/core/session/error"
-import { SessionEvent } from "@opencode-ai/core/session/event"
-import { at, contentBase, it, setup } from "./session-projector-content.fixture"
+import { MessageDecodeError } from "@opencode/core/session/error"
+import { SessionEvent } from "@opencode/core/session/event"
+import { contentBase, it, setup } from "./session-projector-content.fixture"
 
 describe("SessionProjector content row failures", () => {
   it.effect("rolls back the event and child append when the assistant envelope is malformed", () =>
@@ -14,8 +14,7 @@ describe("SessionProjector content row failures", () => {
       const exit = yield* fixture.events
         .publish(SessionEvent.Text.Started, {
           ...contentBase(fixture),
-          textID: "text",
-          timestamp: at(1),
+          ordinal: 0,
         })
         .pipe(Effect.exit)
 
@@ -30,12 +29,12 @@ describe("SessionProjector content row failures", () => {
     Effect.gen(function* () {
       const fixture = yield* setup("bad_target")
       const base = contentBase(fixture)
-      yield* fixture.events.publish(SessionEvent.Text.Started, { ...base, textID: "text", timestamp: at(1) })
+      yield* fixture.events.publish(SessionEvent.Text.Started, { ...base, ordinal: 0 })
       yield* fixture.corruptChild(0, JSON.stringify({ text: 42 }))
       const beforeEvents = yield* fixture.storedEvents
 
       const exit = yield* fixture.events
-        .publish(SessionEvent.Text.Ended, { ...base, textID: "text", text: "blocked", timestamp: at(2) })
+        .publish(SessionEvent.Text.Ended, { ...base, ordinal: 0, text: "blocked" })
         .pipe(Effect.exit)
 
       expect(exit._tag).toBe("Failure")
@@ -48,19 +47,17 @@ describe("SessionProjector content row failures", () => {
     Effect.gen(function* () {
       const fixture = yield* setup("bad_sibling")
       const base = contentBase(fixture)
-      yield* fixture.events.publish(SessionEvent.Text.Started, { ...base, textID: "target", timestamp: at(1) })
+      yield* fixture.events.publish(SessionEvent.Text.Started, { ...base, ordinal: 0 })
       yield* fixture.events.publish(SessionEvent.Reasoning.Started, {
         ...base,
-        reasoningID: "broken",
-        timestamp: at(2),
+        ordinal: 0,
       })
       yield* fixture.corruptChild(1, JSON.stringify({ text: 42 }))
 
       yield* fixture.events.publish(SessionEvent.Text.Ended, {
         ...base,
-        textID: "target",
+        ordinal: 0,
         text: "updated",
-        timestamp: at(3),
       })
       const afterUpdate = yield* fixture.children
       expect(afterUpdate[0]?.dataText).toBe(JSON.stringify({ text: "updated" }))
@@ -68,9 +65,8 @@ describe("SessionProjector content row failures", () => {
 
       yield* fixture.events.publish(SessionEvent.Text.Ended, {
         ...base,
-        textID: "target",
+        ordinal: 0,
         text: "updated",
-        timestamp: at(4),
       })
       expect(yield* fixture.children).toEqual(afterUpdate)
 

@@ -5,24 +5,25 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { EffectCache } from "drizzle-orm/cache/core/cache-effect"
 import { EffectLogger } from "drizzle-orm/effect-core"
-import { and, asc, desc, eq, gt, lt, sql } from "drizzle-orm"
+import { and, eq, gt, lt, sql } from "drizzle-orm"
 import { Deferred, Effect, Fiber, Layer, Schema } from "effect"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Database } from "@opencode-ai/core/database/database"
-import { DatabaseMigration } from "@opencode-ai/core/database/migration"
-import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { MessageDecodeError } from "@opencode-ai/core/session/error"
-import { decodeChild, decodeEnvelope, hydrateSelection } from "@opencode-ai/core/session/message-storage"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionSchema } from "@opencode-ai/core/session/schema"
-import { SessionMessagePartTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
-import { SessionStore } from "@opencode-ai/core/session/store"
-import { ProjectV2 } from "@opencode-ai/core/project"
-import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { layer as sqliteLayer } from "../src/database/sqlite.bun"
-import { testEffect } from "./lib/effect"
+import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
+import { Database } from "@opencode/core/database/database"
+import { DatabaseMigration } from "@opencode/core/database/migration"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { AbsolutePath } from "@opencode/schema/schema"
+import { MessageDecodeError } from "@opencode/core/session/error"
+import { decodeChild, decodeEnvelope, encodeStoredMessage, insertMessageChildren, hydrateSelection } from "@opencode/core/session/message-storage"
+import { SessionMessage } from "@opencode/core/session/message"
+import { SessionSchema } from "@opencode/core/session/schema"
+import { SessionMessagePartTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
+import { SessionStore } from "@opencode/core/session/store"
+import { Project } from "@opencode/schema/project"
+import { ProjectTable } from "@opencode/core/project/sql"
+import { sqliteLayer } from "../src/database/sqlite.bun.js"
+import { tempGlobalLayer } from "./fixture/global.js"
+import { testEffect } from "./lib/effect.js"
 
 type LoggedQuery = {
   readonly query: string
@@ -63,7 +64,7 @@ const logger = Layer.succeed(
 const database = Layer.effect(
   Database.Service,
   Effect.gen(function* () {
-    const db = yield* EffectDrizzleSqlite.make()
+    const db: Database.Interface["db"] = yield* EffectDrizzleSqlite.make()
     yield* Effect.forEach(
       [
         "PRAGMA journal_mode = WAL",
@@ -76,14 +77,19 @@ const database = Layer.effect(
     )
     yield* DatabaseMigration.apply(db, filename)
     return Database.Service.of({ db })
-  }),
-).pipe(Layer.provide(sqliteLayer({ filename })), Layer.provide(EffectCache.Default), Layer.provide(logger))
+  }).pipe(Effect.orDie),
+).pipe(
+  Layer.provide(sqliteLayer({ filename })),
+  Layer.provide(EffectCache.Default),
+  Layer.provide(logger),
+  Layer.provide(tempGlobalLayer),
+)
 
 const it = testEffect(database)
 const storeIt = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Database.node, SessionStore.node]), [[Database.node, database]]),
+  AppNodeBuilder.build(LayerNode.group([Database.node, SessionStore.node]), [Database.node.replace(database)]),
 )
-const projectID = ProjectV2.ID.make("project-message-storage")
+const projectID = Project.ID.make("project-message-storage")
 const directory = AbsolutePath.make("/message-storage")
 const assistantEnvelope = JSON.stringify({
   agent: "build",
@@ -161,6 +167,42 @@ afterAll(async () => {
 })
 
 describe("Session message storage", () => {
+  it.effect("round trips mixed content with per-kind ordinals and global positions", () =>
+    Effect.gen(function* () {
+      const db = (yield* Database.Service).db
+      const sessionID = SessionSchema.ID.make("ses_mixed_storage")
+      const message = yield* Schema.decodeUnknownEffect(SessionMessage.Info)({
+        agent: "build",
+        model: { providerID: "test", id: "model" },
+        time: { created: 1 },
+        id: "msg_mixed_storage",
+        type: "assistant",
+        content: [
+          { type: "text", text: "first" },
+          { type: "reasoning", text: "reason" },
+          { type: "tool", id: "call_1", name: "read", state: { status: "streaming", input: "" }, time: { created: 1 } },
+          { type: "text", text: "second" },
+        ],
+      })
+      yield* setupSession(sessionID)
+      const stored = yield* encodeStoredMessage(message)
+      yield* db.transaction((tx) => Effect.gen(function* () {
+        yield* tx.insert(SessionMessageTable).values({ ...stored.envelope, session_id: sessionID, seq: 1 }).run()
+        yield* insertMessageChildren(tx, stored.parts)
+      }))
+
+      const rows = yield* hydrateSelection({ db, where: eq(SessionMessageTable.id, message.id) })
+
+      expect(stored.parts.map((part) => [part.position, part.type, part.id])).toEqual([
+        [0, "text", "0"], [1, "reasoning", "0"], [2, "tool", "call_1"], [3, "text", "1"],
+      ])
+      expect(stored.envelope.data).not.toHaveProperty("content")
+      expect(stored.envelope.data).not.toHaveProperty("id")
+      expect(stored.envelope.data).not.toHaveProperty("type")
+      expect(rows.map((row) => row.message)).toEqual([message])
+    }),
+  )
+
   it.effect("decodes normalized envelopes and children from relational ownership", () =>
     Effect.gen(function* () {
       const sessionID = SessionSchema.ID.make("ses_decode_complete")
@@ -177,7 +219,7 @@ describe("Session message storage", () => {
       })
 
       expect(envelope).toMatchObject({ id: messageID, type: "assistant", content: [] })
-      expect(child).toEqual({ id: "text-1", type: "text", text: "hello" })
+      expect(child).toEqual({ type: "text", text: "hello" })
     }),
   )
 
@@ -267,8 +309,8 @@ describe("Session message storage", () => {
       })
 
       expect(ascending.map((row) => row.message)).toMatchObject([
-        { id: firstID, content: [{ id: "first-only", text: "first owner" }] },
-        { id: secondID, content: [{ id: "first", text: "first" }, { id: "second", text: "second" }] },
+        { id: firstID, content: [{ text: "first owner" }] },
+        { id: secondID, content: [{ text: "first" }, { text: "second" }] },
       ])
       expect(descending.map((row) => row.message.id)).toEqual([secondID, firstID])
     }),
@@ -445,7 +487,7 @@ describe("Session message storage", () => {
           Deferred.succeed(childReached, undefined).pipe(Effect.andThen(Deferred.await(writerCommitted))),
         )
       probe.active = true
-      const fiber = yield* hydrateSelection({ db, where: eq(SessionMessageTable.id, messageID) }).pipe(Effect.forkChild)
+      const fiber = yield* hydrateSelection({ db, where: eq(SessionMessageTable.id, messageID) }).pipe(Effect.forkChild({ startImmediately: true }))
       yield* Deferred.await(childReached)
 
       const writer = new NativeDatabase(filename)
@@ -461,7 +503,7 @@ describe("Session message storage", () => {
       const after = yield* hydrateSelection({ db, where: eq(SessionMessageTable.id, messageID) })
 
       expect(before[0]?.message).toMatchObject({ content: [] })
-      expect(after[0]?.message).toMatchObject({ content: [{ id: "committed", text: "after" }] })
+      expect(after[0]?.message).toMatchObject({ content: [{ text: "after" }] })
     }),
   )
 

@@ -4,9 +4,10 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { sql } from "drizzle-orm"
-import { SqliteClient } from "@effect/sql-sqlite-bun"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
+import { sqliteLayer } from "../src/database/sqlite.bun.js"
+import { EffectDrizzleSqlite } from "../src/database/drizzle.js"
 import { Effect, Schema } from "effect"
+import { Global } from "@opencode/util/global"
 import { centralSummary, removeTemporary, summarizeSamples } from "./session-projector-performance-fixture"
 import { applyBenchmarkMigration, BenchmarkContractError, growthInputs, migrationRows, pragmas, requireBenchmarkArguments, runBenchmarkWorkers, setupPredecessor, validateMigration, type MigrationRows } from "./session-storage-migration-performance-fixture"
 
@@ -39,14 +40,15 @@ const decodeProcessBoundary = Schema.decodeUnknownSync(
 )
 const bytes = async (file: string) => ((await Bun.file(file).exists()) ? Bun.file(file).size : 0)
 
-async function useDatabase<A, E>(prefix: string, run: (db: Effect.Success<typeof makeDb>, file: string) => Effect.Effect<A, E>) {
+async function useDatabase<A, E>(prefix: string, run: (db: Effect.Success<typeof makeDb>, file: string) => Effect.Effect<A, E, Global.Service>) {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), prefix))
   const file = path.join(temporary, "benchmark.sqlite")
   try {
     return await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* run(yield* makeDb, file)
-      }).pipe(Effect.provide(SqliteClient.layer({ filename: file })), Effect.scoped),
+        const db = yield* makeDb
+        return yield* run(db, file)
+      }).pipe(Effect.provide(sqliteLayer({ filename: file })), Effect.provideService(Global.Service, Global.make({ data: temporary })), Effect.scoped),
     )
   } finally {
     await removeTemporary(temporary)
@@ -131,12 +133,7 @@ async function accounting() {
       const walBytesAfterCheckpoint = yield* Effect.promise(() => bytes(`${file}-wal`))
       const page = decodePage(yield* db.get(sql`PRAGMA page_count`).pipe(Effect.orDie))
       const free = decodeFree(yield* db.get(sql`PRAGMA freelist_count`).pipe(Effect.orDie))
-      const partsTable = yield* db
-        .get<{
-          name: string
-        }>(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_message_part'`)
-        .pipe(Effect.orDie)
-      const parts = partsTable ? decodeCount(yield* db.get(sql`SELECT count(*) AS count FROM session_message_part`).pipe(Effect.orDie)).count : 0
+      const parts = decodeCount(yield* db.get(sql`SELECT count(*) AS count FROM session_message_part`).pipe(Effect.orDie)).count
       return {
         dbBytesBefore,
         walBytesBefore,

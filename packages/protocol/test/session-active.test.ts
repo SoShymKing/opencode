@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { Schema } from "effect"
-import { SessionActive } from "../src/groups/session"
+import { SessionActive } from "../src/groups/session.js"
 
 test("SessionActive preserves running without status and includes exact optional status", () => {
   const decode = Schema.decodeUnknownSync(SessionActive)

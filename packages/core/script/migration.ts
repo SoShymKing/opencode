@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 
-import { $ } from "bun"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
@@ -16,6 +15,7 @@ const args = parseArgs({
   args: process.argv.slice(2),
   options: {
     check: { type: "boolean" },
+    refresh: { type: "boolean" },
     name: { type: "string" },
   },
 })
@@ -32,6 +32,7 @@ async function generate() {
   const incremental = path.join(temporary, "incremental")
   const full = path.join(temporary, "full")
   try {
+    if (!args.values.refresh) {
     await fs.mkdir(incremental)
     await fs.mkdir(path.join(incremental, "baseline"))
     await fs.copyFile(snapshot, path.join(incremental, "baseline/snapshot.json"))
@@ -49,11 +50,17 @@ async function generate() {
           renderMigration(name, await Bun.file(path.join(incremental, name, "migration.sql")).text()),
         ),
       )
-      await fs.copyFile(path.join(incremental, name, "snapshot.json"), snapshot)
+      await Bun.write(snapshot, await formatJson(await Bun.file(path.join(incremental, name, "snapshot.json")).text()))
+    }
     }
 
     await fs.mkdir(full)
     await drizzle(temporary, full, "schema")
+    if (args.values.refresh) {
+      const generated = await generatedMigrations(full)
+      if (generated.length !== 1) throw new Error("Expected one full schema snapshot")
+      await Bun.write(snapshot, await formatJson(await Bun.file(path.join(full, generated[0], "snapshot.json")).text()))
+    }
     await Bun.write(schema, await formatTypescript(renderSchema(await generatedSql(full))))
     await Bun.write(registry, await formatTypescript(renderRegistry(await typescriptMigrations())))
   } finally {
@@ -100,15 +107,19 @@ async function drizzle(temporary: string, output: string, name?: string) {
 export default { ...config, out: ${JSON.stringify(output)} }
 `,
   )
-  await $`bun drizzle-kit generate --config ${config} ${name ? ["--name", name] : []}`.cwd(
-    path.join(root, "packages/core"),
-  )
+  const child = Bun.spawn(["bun", "drizzle-kit", "generate", "--config", config, ...(name ? ["--name", name] : [])], {
+    cwd: path.join(root, "packages/core"),
+    stdin: "inherit",
+    stdout: "inherit",
+    stderr: "inherit",
+  })
+  const exit = await child.exited
+  if (exit !== 0) throw new Error(`Drizzle generation failed with exit code ${exit}.`)
 }
 
 async function generatedMigrations(directory: string) {
   return (await Array.fromAsync(new Bun.Glob("*/migration.sql").scan({ cwd: directory })))
-    .map((file) => file.split("/")[0])
-    .filter((name): name is string => name !== undefined)
+    .map((file) => path.dirname(file))
     .sort()
 }
 
@@ -119,37 +130,41 @@ async function generatedSql(directory: string) {
 }
 
 async function typescriptMigrations() {
-  return (await Array.fromAsync(new Bun.Glob("*.ts").scan({ cwd: tsDir })))
+  return (await Array.fromAsync(new Bun.Glob("[0-9]*.ts").scan({ cwd: tsDir })))
     .map((file) => path.basename(file, ".ts"))
     .sort()
 }
 
 function renderMigration(name: string, sql: string) {
   return `import { Effect } from "effect"
-import type { DatabaseMigration } from "../migration"
+import type { DatabaseMigration } from "../migration.js"
 
-export default {
+const migration: DatabaseMigration.Migration = {
   id: ${JSON.stringify(name)},
   up(tx) {
     return Effect.gen(function* () {
 ${renderStatements(sql)}
     })
   },
-} satisfies DatabaseMigration.Migration
+}
+
+export default migration
 `
 }
 
 function renderSchema(sql: string) {
   return `import { Effect } from "effect"
-import type { DatabaseMigration } from "./migration"
+import type { DatabaseMigration } from "./migration.js"
 
-export default {
+const schema: Omit<DatabaseMigration.Migration, "id"> = {
   up(tx) {
     return Effect.gen(function* () {
 ${renderStatements(sql)}
     })
   },
-} satisfies Omit<DatabaseMigration.Migration, "id">
+}
+
+export default schema
 `
 }
 
@@ -184,13 +199,25 @@ async function formatTypescript(input: string) {
   })
 }
 
-function renderRegistry(names: string[]) {
-  return `import type { DatabaseMigration } from "./migration"
+// Drizzle emits every array multi-line; format the snapshot so regeneration
+// diffs stay minimal against the prettier-styled checked-in copy.
+async function formatJson(input: string) {
+  const prettier = await import("prettier")
+  const babel = await import("prettier/plugins/babel")
+  const estree = await import("prettier/plugins/estree")
+  return prettier.format(input, {
+    parser: "json",
+    plugins: [babel.default, estree.default],
+    printWidth: 120,
+  })
+}
 
-export const migrations = (
-  await Promise.all([
-${names.map((name) => `    import("./migration/${name}"),`).join("\n")}
-  ])
-).map((module) => module.default) satisfies DatabaseMigration.Migration[]
+function renderRegistry(names: string[]) {
+  return `import type { DatabaseMigration } from "./migration.js"
+${names.map((name, index) => `import m${index.toString().padStart(2, "0")} from "./migration/${name}.js"`).join("\n")}
+
+export const migrations = [
+${names.map((_, index) => `  m${index.toString().padStart(2, "0")},`).join("\n")}
+] satisfies DatabaseMigration.Migration[]
 `
 }

@@ -1,3 +1,5 @@
+import type { OpenCodeClient, SessionInfo, SessionListInput } from "@opencode/client"
+
 export const SESSION_LIST_REQUEST_WINDOW_KEY = "session_list_request_window_days"
 
 const DAY = 24 * 60 * 60 * 1000
@@ -38,4 +40,15 @@ export function sessionListRequestStart(value: unknown, now = Date.now()) {
 
 function isValidSessionListRequestWindowDays(value: number) {
   return Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(value * DAY)
+}
+
+export async function listSessionPages(api: OpenCodeClient, input: SessionListInput, maximum = Infinity) {
+  const sessions: SessionInfo[] = []
+  let cursor = input.cursor
+  do {
+    const page = await api.session.list({ ...input, cursor })
+    sessions.push(...page.data)
+    cursor = page.cursor.next ?? undefined
+  } while (cursor && sessions.length < maximum)
+  return sessions.slice(0, maximum)
 }

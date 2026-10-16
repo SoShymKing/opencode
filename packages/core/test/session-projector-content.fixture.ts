@@ -1,35 +1,40 @@
 import { asc, eq, sql } from "drizzle-orm"
 import { DateTime, Effect } from "effect"
-import { Database } from "@opencode-ai/core/database/database"
-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventV2 } from "@opencode-ai/core/event"
-import { EventTable } from "@opencode-ai/core/event/sql"
-import { ModelV2 } from "@opencode-ai/core/model"
-import { Project } from "@opencode-ai/core/project"
-import { ProjectTable } from "@opencode-ai/core/project/sql"
-import { ProviderV2 } from "@opencode-ai/core/provider"
-import { AbsolutePath } from "@opencode-ai/core/schema"
-import { SessionV2 } from "@opencode-ai/core/session"
-import { SessionEvent } from "@opencode-ai/core/session/event"
-import { hydrateSelection } from "@opencode-ai/core/session/message-storage"
-import { SessionMessage } from "@opencode-ai/core/session/message"
-import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionMessagePartTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { Database } from "@opencode/core/database/database"
+import { LayerNode } from "@opencode/util/effect/layer-node"
+import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { Bus } from "@opencode/core/bus"
+import { EventTable } from "@opencode/core/event/sql"
+import { Agent } from "@opencode/schema/agent"
+import { Model } from "@opencode/schema/model"
+import { Project } from "@opencode/schema/project"
+import { ProjectTable } from "@opencode/core/project/sql"
+import { Provider } from "@opencode/schema/provider"
+import { AbsolutePath } from "@opencode/core/schema"
+import { Session } from "@opencode/schema/session"
+import { SessionEvent } from "@opencode/core/session/event"
+import { hydrateSelection } from "@opencode/core/session/message-storage"
+import { SessionMessage } from "@opencode/core/session/message"
+import { SessionProjector } from "@opencode/core/session/projector"
+import { SessionMessagePartTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { testEffect } from "./lib/effect"
 
-export const it = testEffect(LayerNode.compile(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
+export const it = testEffect(AppNodeBuilder.build(
+  LayerNode.group([Database.node, Bus.node, SessionProjector.node]),
+  [Bus.node.replace(Bus.configured({ persist: true }))],
+))
 export const at = (millis: number) => DateTime.makeUnsafe(millis)
-export const text = (value: string) => [{ type: "text" as const, text: value }]
+export const text = (value: string): [{ type: "text"; text: string }] => [{ type: "text", text: value }]
 export const model = {
-  id: ModelV2.ID.make("projector-content"),
-  providerID: ProviderV2.ID.make("projector-content"),
+  id: Model.ID.make("projector-content"),
+  providerID: Provider.ID.make("projector-content"),
 }
 
 export function setup(label: string) {
   return Effect.gen(function* () {
     const { db } = yield* Database.Service
-    const events = yield* EventV2.Service
-    const sessionID = SessionV2.ID.make(`ses_projector_content_${label}`)
+    const events = yield* Bus.Service
+    const sessionID = Session.ID.make(`ses_projector_content_${label}`)
     const assistantMessageID = SessionMessage.ID.make(`msg_projector_content_${label}`)
     yield* db
       .insert(ProjectTable)
@@ -52,8 +57,8 @@ export function setup(label: string) {
     yield* events.publish(SessionEvent.Step.Started, {
       sessionID,
       assistantMessageID,
-      timestamp: at(0),
-      agent: "build",
+      started: 0,
+      agent: Agent.ID.make("build"),
       model,
     })
 
@@ -128,7 +133,7 @@ export function setup(label: string) {
 }
 
 export const contentBase = (fixture: {
-  readonly sessionID: SessionV2.ID
+  readonly sessionID: Session.ID
   readonly assistantMessageID: SessionMessage.ID
 }) => ({
   sessionID: fixture.sessionID,

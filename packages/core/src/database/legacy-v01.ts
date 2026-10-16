@@ -3,8 +3,8 @@ export * as DatabaseLegacyV01 from "./legacy-v01"
 import { randomUUID } from "node:crypto"
 import { lstat, readFile } from "node:fs/promises"
 import { basename, dirname, resolve } from "node:path"
-import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { layer as sqliteLayer } from "#sqlite"
+import { EffectDrizzleSqlite } from "./drizzle.js"
+import { sqliteLayer } from "#sqlite"
 import { Effect, Exit, Schema } from "effect"
 import { DatabaseArtifact } from "./artifact"
 import { DatabaseLease } from "./lease"
@@ -202,7 +202,7 @@ function readManifest(filename: string) {
       try: () => readFile(filename, "utf8"),
       catch: (cause) => new DatabaseLegacyV01Error("legacy manifest is missing", { cause }),
     })
-    const json = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(text)
+    const json = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(text)
     return yield* Schema.decodeUnknownEffect(Manifest)(json, { onExcessProperty: "error" })
   }).pipe(
     Effect.mapError((cause) =>

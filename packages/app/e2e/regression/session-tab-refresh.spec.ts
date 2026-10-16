@@ -1,4 +1,4 @@
-import { base64Encode } from "@opencode-ai/core/util/encode"
+import { base64Encode } from "@opencode/util/encode"
 import { expect, test } from "@playwright/test"
 import {
   assistantMessage,
@@ -14,11 +14,12 @@ import {
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { installSseTransport } from "../utils/sse-transport"
 import { expectSessionTitle } from "../utils/waits"
+import { seed } from "../utils/app"
 
 test.use({ viewport: { width: 646, height: 1385 } })
 
 test("refreshes only the recent tail when revisiting a stale tab with loaded history", async ({ page }) => {
-  const assistants = Array.from({ length: 219 }, (_, index) =>
+  const assistants = Array.from({ length: 59 }, (_, index) =>
     assistantMessage([textPart(`prt_refresh_${index}`, `Response ${index}`)], {
       id: `msg_${String(index + 1001).padStart(4, "0")}_refresh_assistant`,
       parentID: userID,
@@ -31,7 +32,7 @@ test("refreshes only the recent tail when revisiting a stale tab with loaded his
   const href = (id: string) => `/server/${base64Encode(server)}/session/${id}`
   const pages: { limit: number; before?: string; count: number }[] = []
   const roots: string[] = []
-  await test.step("Given a cached tab expanded by real 20 and 200 message pages", async () => {
+  await test.step("Given a cached tab expanded by native message pages", async () => {
     await page.clock.install()
     await page.route(/https?:\/\/(?:127\.0\.0\.1|localhost):4096\//, (route) => route.abort())
     const transport = await installSseTransport(page, { server, retry: 20 })
@@ -44,50 +45,46 @@ test("refreshes only the recent tail when revisiting a stale tab with loaded his
         default: { providerID: "opencode", modelID: "claude-opus-4-6" },
       },
       sessions: [session(), session({ id: awayID, title: "Refresh away" })],
-      message: (id, messageID) => id === sessionID ? messages.find((item) => item.info.id === messageID) : undefined,
+      message: (id, messageID) => id === sessionID ? messages.find((item) => item.id === messageID) : undefined,
       onMessage: (request) => roots.push(request.messageID),
       pageMessages: (id, limit, before) => {
         if (id !== sessionID) return { items: [] }
-        const end = before ? messages.findIndex((message) => message.info.id === before) : messages.length
+        const end = before ? messages.findIndex((message) => message.id === before) : messages.length
         const start = Math.max(0, end - limit)
         const items = messages.slice(start, end).map((item) =>
-          !before && pages.length > 0 && item.info.id === "msg_1219_refresh_assistant"
-            ? { ...item, parts: [...item.parts, { ...textPart("prt_refresh_confirmed", "Refreshed"), sessionID, messageID: item.info.id }] }
+          !before && pages.length > 1 && item.id === "msg_1059_refresh_assistant" && item.type === "assistant"
+            ? { ...item, content: [...item.content, { type: "text" as const, text: "Refreshed" }] }
             : item,
         )
         pages.push({ limit, before, count: items.length })
-        return { items, cursor: start > 0 ? messages[start]?.info.id : undefined }
+        return { items, cursor: start > 0 ? messages[start]?.id : undefined }
       },
     })
-    await page.addInitScript(({ server, directory, sessionID, awayID }) => {
-      localStorage.setItem("opencode.global.dat:server", JSON.stringify({
-        list: [server],
-        projects: { [server]: [{ worktree: directory, expanded: true }] },
-        lastProject: { [server]: directory },
-      }))
-      localStorage.setItem("opencode.window.browser.dat:tabs", JSON.stringify(
-        [sessionID, awayID].map((sessionId) => ({ type: "session", server, sessionId })),
-      ))
-    }, { server, directory, sessionID, awayID })
+    await seed(page, {
+      servers: [server],
+      projects: { [server]: [{ worktree: directory, expanded: true }] },
+      lastProject: { [server]: directory },
+      tabs: [sessionID, awayID].map((session) => ({ session, server })),
+    })
     await page.goto(href(sessionID))
     await transport.waitForConnection()
     await expectSessionTitle(page, title)
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_218"]')).toBeVisible()
+    await expect(page.locator('[data-timeline-part-id="msg_1059_refresh_assistant:text:0"]')).toBeVisible()
     const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-virtual-content]") })
     const history = page.waitForResponse((response) => {
       const url = new URL(response.url())
-      return url.pathname === `/session/${sessionID}/message` && url.searchParams.has("before")
+      return url.pathname === `/api/session/${sessionID}/message` && url.searchParams.has("cursor")
     })
     await scroller.hover()
     await page.mouse.wheel(0, -100_000)
     await history
-    await expect.poll(() => pages.map((page) => page.limit)).toEqual([20, 200])
-    expect(pages.map((page) => page.count)).toEqual([20, 200])
-    expect(roots).toEqual([userID])
+    await expect.poll(() => pages.map((page) => page.limit)).toEqual([40, 20])
+    expect(pages.map((page) => page.count)).toEqual([40, 20])
+    expect(roots).toEqual([])
     await scroller.evaluate((element) => { element.scrollTop = 250 })
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_10"]')).toBeInViewport()
+    await expect(page.locator('[data-timeline-part-id="msg_1011_refresh_assistant:text:0"]')).toBeInViewport()
     await page.getByRole("button", { name: "Jump to latest" }).click()
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_218"]')).toBeInViewport()
+    await expect(page.locator('[data-timeline-part-id="msg_1059_refresh_assistant:text:0"]')).toBeInViewport()
     await page.locator(`[data-slot="titlebar-tabs"] a[href="${href(awayID)}"]`).click()
     await expectSessionTitle(page, "Refresh away")
     await page.clock.setSystemTime(await page.evaluate(() => Date.now() + 16_000))
@@ -95,7 +92,7 @@ test("refreshes only the recent tail when revisiting a stale tab with loaded his
 
   const refreshed = page.waitForResponse((response) => {
     const url = new URL(response.url())
-    return response.request().method() === "GET" && url.pathname === `/session/${sessionID}/message` && !url.searchParams.has("before")
+    return response.request().method() === "GET" && url.pathname === `/api/session/${sessionID}/message` && !url.searchParams.has("cursor")
   })
   await test.step("When the stale cached titlebar tab is clicked", async () => {
     await page.locator(`[data-slot="titlebar-tabs"] a[href="${href(sessionID)}"]`).click()
@@ -109,15 +106,15 @@ test("refreshes only the recent tail when revisiting a stale tab with loaded his
       serializedBytes: body.byteLength,
       pages,
     }))
-    expect.soft(Number(new URL(response.url()).searchParams.get("limit")), "routine stale revisit must request only 20 messages").toBe(20)
+    expect(Number(new URL(response.url()).searchParams.get("limit")), "routine stale revisit must request only 20 messages").toBe(20)
     await expectSessionTitle(page, title)
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_confirmed"]')).toBeVisible()
+    await expect(page.locator('[data-timeline-part-id="msg_1059_refresh_assistant:text:1"]')).toHaveText("Refreshed")
     const historyRequests = pages.filter((page) => page.before).length
     await page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-virtual-content]") }).hover()
     await page.mouse.wheel(0, -100_000)
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_10"]')).toBeInViewport()
-    await expect(page.locator(`[data-timeline-part-id="prt_${userID}_text"]`)).toBeVisible()
-    await expect(page.locator('[data-timeline-part-id="prt_refresh_10"]').locator('xpath=ancestor::*[@data-timeline-row="AssistantPart"]')).toHaveCount(1)
+    await expect(page.locator('[data-timeline-part-id="msg_1011_refresh_assistant:text:0"]')).toBeInViewport()
+    await expect(page.locator(`[data-timeline-row="UserMessage"][data-message-id="${userID}"]`)).toBeVisible()
+    await expect(page.locator('[data-timeline-part-id="msg_1011_refresh_assistant:text:0"]').locator('xpath=ancestor::*[@data-timeline-row="AssistantPart"]')).toHaveAttribute("data-message-id", userID)
     expect(pages.filter((page) => page.before)).toHaveLength(historyRequests)
   })
 })

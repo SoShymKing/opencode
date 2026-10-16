@@ -1,5 +1,5 @@
 import { Effect, Fiber, Scope, Semaphore } from "effect"
-import type { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import type { SessionStatusEvent } from "@opencode/schema/session-status-event"
 
 export const make = Effect.fnUntraced(function* (publish: (status: SessionStatusEvent.Info) => Effect.Effect<void>) {
   const scope = yield* Scope.Scope
@@ -79,4 +79,4 @@ function increasing(previous: SessionStatusEvent.Info, next: SessionStatusEvent.
   return after.streamEventCount > before.streamEventCount || after.lastStreamEventAt !== before.lastStreamEventAt
 }
 
-export * as SessionStatusCoalescer from "./status-coalescer"
+export * as SessionStatusCoalescer from "./status-coalescer.js"

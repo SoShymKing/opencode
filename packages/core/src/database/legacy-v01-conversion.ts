@@ -1,10 +1,10 @@
-import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { SessionMessage } from "@opencode-ai/schema/session-message"
+import type { EffectDrizzleSqlite } from "./drizzle.js"
+import { WsMessageCodec } from "./ws-message-codec.js"
 import { sql } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { DatabaseLegacyV01Json } from "./legacy-v01-json"
 import { DatabaseMigration } from "./migration"
-import sessionMessagePartMigration from "./migration/v02_session_message_part"
+import sessionMessagePartMigration from "./ws-message-parts.js"
 import { DatabaseLegacyV01Error } from "./legacy-v01"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
@@ -27,7 +27,7 @@ type StoredMessage = {
   readonly content?: readonly Content[]
 }
 
-const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
+const decodeMessage = Schema.decodeUnknownEffect(WsMessageCodec.Message)
 
 export function downgrade(db: Database) {
   return Effect.gen(function* () {
@@ -106,7 +106,9 @@ function validateDatabase(db: Database, format: "current" | "legacy") {
       return yield* readLegacy(db)
     }
     if (!tables.has("session_message_part")) return yield* failure("current part storage is missing")
-    if (history.some((id) => !DatabaseMigration.currentMigrationIDs.has(id)))
+    const known = new Set<string>([...DatabaseMigration.legacyBaselineMigrationIDs, DatabaseMigration.legacySessionMetadataAlias,
+      DatabaseMigration.legacyPartMigrationID, "v01_baseline", "v02_session_message_part"])
+    if (history.some((id) => !known.has(id)))
       return yield* failure("current migration history contains an unknown migration")
     if (!history.includes("v01_baseline") || !history.includes("v02_session_message_part"))
       return yield* failure("current migration history is invalid")

@@ -1,64 +1,82 @@
 /** @jsxImportSource @opentui/solid */
-import { expect, mock, test } from "bun:test"
-import { mkdir } from "node:fs/promises"
-import path from "node:path"
-import { testRender } from "@opentui/solid"
-import { TuiConfigProvider } from "../../src/config"
-import { KVProvider } from "../../src/context/kv"
+import { expect, jest, test } from "bun:test"
+import { RGBA } from "@opentui/core"
+import { getComponentCatalogue, testRender } from "@opentui/solid"
+import { ConfigProvider } from "../../src/config"
 import { ThemeProvider } from "../../src/context/theme"
-import { TestTuiContexts } from "../fixture/tui-environment"
-import { tmpdir } from "../fixture/fixture"
+import { Spinner, SpinnerIcon, SPINNER_FRAMES } from "../../src/component/spinner"
+import { emptyThemeSource } from "../fixture/fixture"
 import { createTuiResolvedConfig } from "../fixture/tui-runtime"
 
 test("spinner renders when the opentui-spinner solid extension is unavailable", async () => {
-  await using tmp = await tmpdir()
-  const state = path.join(tmp.path, "state")
-  await mkdir(state, { recursive: true })
-  await Bun.write(path.join(state, "kv.json"), JSON.stringify({ animations_enabled: true }))
-  mock.module("opentui-spinner/solid", () => ({}))
-
+  const catalogue = getComponentCatalogue()
+  const registered = catalogue.spinner
+  delete catalogue.spinner
   try {
-    const { Spinner } = await import("../../src/component/spinner")
-    const app = await testRender(
-      () => (
-        <TestTuiContexts directory={tmp.path} paths={{ home: tmp.path, state, worktree: tmp.path }}>
-          <TuiConfigProvider config={createTuiResolvedConfig()}>
-            <KVProvider>
-              <ThemeProvider mode="dark">
-                <Spinner>Loading</Spinner>
-              </ThemeProvider>
-            </KVProvider>
-          </TuiConfigProvider>
-        </TestTuiContexts>
-      ),
-      { width: 24, height: 3 },
-    )
-
+    const app = await testRender(() => (
+      <ConfigProvider config={createTuiResolvedConfig({ animations: true })}>
+        <ThemeProvider mode="dark" source={emptyThemeSource}>
+          <Spinner>Loading</Spinner>
+        </ThemeProvider>
+      </ConfigProvider>
+    ), { width: 24, height: 3 })
     try {
-      expect(await captureSettledFrame(app)).toContain("Loading")
+      await app.renderOnce()
+      await app.renderOnce()
+      expect(app.captureCharFrame()).toContain("Loading")
+      expect(SPINNER_FRAMES.some((glyph) => app.captureCharFrame().includes(glyph))).toBe(true)
     } finally {
       app.renderer.destroy()
     }
   } finally {
-    mock.restore()
+    if (registered) catalogue.spinner = registered
   }
 })
 
-test("prompt running status spinner uses one-cell frames", async () => {
-  const source = await Bun.file(new URL("../../src/component/prompt/index.tsx", import.meta.url)).text()
-
-  expect(source).toContain("frames={SPINNER_FRAMES}")
-  expect(source).not.toContain("createFrames")
-  expect(source).not.toContain("createColors")
-  expect(source).not.toContain('style: "blocks"')
+test.each([24, 80])("spinner renders native text at %i columns without an extension renderable", async (width) => {
+  for (const animations of [false, true]) {
+    for (const shimmer of [false, true]) {
+      const app = await testRender(
+        () => (
+          <ConfigProvider config={createTuiResolvedConfig({ animations })}>
+            <ThemeProvider mode="dark" source={emptyThemeSource}>
+              <Spinner shimmer={shimmer ? RGBA.fromHex("#ffffff") : undefined}>Loading</Spinner>
+            </ThemeProvider>
+          </ConfigProvider>
+        ),
+        { width, height: 3 },
+      )
+      try {
+        await app.renderOnce()
+        await app.renderOnce()
+        const frame = app.captureCharFrame()
+        expect(frame).toContain("Loading")
+        expect(animations ? SPINNER_FRAMES.some((glyph) => frame.includes(glyph)) : frame.includes("⋯")).toBe(true)
+        expect(frame).not.toMatch(/[■⬝]/)
+      } finally {
+        app.renderer.destroy()
+      }
+    }
+  }
 })
 
-async function captureSettledFrame(app: Awaited<ReturnType<typeof testRender>>) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    await app.renderOnce()
-    const frame = app.captureCharFrame()
-    if (frame.trim().length > 0) return frame
-    await Bun.sleep(25)
+test("prompt spinner frames stay one cell wide across animation and cleanup", async () => {
+  jest.useFakeTimers()
+  const app = await testRender(() => <SpinnerIcon frames={SPINNER_FRAMES} interval={80} />, { width: 4, height: 1 })
+  try {
+    const glyphs = new Set<string>()
+    for (const expected of SPINNER_FRAMES) {
+      await app.renderOnce()
+      await app.renderOnce()
+      const glyph = app.captureCharFrame().trim()
+      expect(glyph).toBe(expected)
+      expect(Array.from(glyph)).toHaveLength(1)
+      glyphs.add(glyph)
+      jest.advanceTimersByTime(80)
+    }
+    expect(glyphs.size).toBe(SPINNER_FRAMES.length)
+  } finally {
+    app.renderer.destroy()
+    jest.useRealTimers()
   }
-  return app.captureCharFrame()
-}
+})

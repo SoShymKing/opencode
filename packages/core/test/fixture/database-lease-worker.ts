@@ -1,6 +1,7 @@
 import { Database } from "@opencode-ai/core/database/database"
 import { DatabaseLease } from "@opencode-ai/core/database/lease"
 import { Effect } from "effect"
+import { tempGlobalLayer } from "./global"
 
 const mode = process.argv[2]
 const target = process.argv[3]
@@ -16,7 +17,7 @@ const hold =
     ? Effect.gen(function* () {
         yield* Database.Service
         yield* wait
-      }).pipe(Effect.provide(Database.layerFromPath(target)))
+      }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer))
     : Effect.gen(function* () {
         yield* mode === "shared" ? DatabaseLease.shared(target) : DatabaseLease.exclusive(target)
         yield* wait
