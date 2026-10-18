@@ -3,6 +3,7 @@ import {
   Message,
   ReasoningEfforts,
   ToolCallPart,
+  ToolOutput,
   ToolResultPart,
   type ContentPart,
   type ProviderMetadata,
@@ -162,7 +163,7 @@ const toolResult = (
       const ref = { source: "tool", messageID: origin.messageID,
         partIndex: NonNegativeInt.make(origin.partIndex), contentIndex: NonNegativeInt.make(contentIndex) } as const
       if (rejected(ref, origin.options)) {
-        if (providerMetadata !== undefined)
+        if (providerMetadata !== undefined || (tool.executed === true && tool.recorded !== undefined && Object.hasOwn(tool.recorded, "result")))
           throw new AttachmentQuarantine.Unavailable({ message: "A rejected attachment has opaque provider result state" })
         origin.options.onRejectedAttachment?.()
         return false
@@ -170,19 +171,18 @@ const toolResult = (
       references.push(ref)
       return true
     })
-    return result.length > 0 ? result : [{ type: "text" as const, text: "[Rejected attachment omitted.]" }]
+    return result.length > 0 || content.length === 0 ? result : [{ type: "text" as const, text: "[Rejected attachment omitted.]" }]
   }
   if (tool.state.status === "completed") {
     // TODO: Materialize remote and managed URIs before provider-history lowering.
     const content = filtered(tool.state.content)
-    const single = content.length === 1 ? content[0] : undefined
     const result = ToolResultPart.make({
       id: tool.id,
       name: tool.name,
       result:
-        single?.type === "text"
-          ? { type: "text" as const, value: single.text }
-          : { type: "content" as const, value: content },
+        tool.executed === true && tool.recorded !== undefined && Object.hasOwn(tool.recorded, "result")
+          ? tool.recorded.result
+          : ToolOutput.toResultValue({ structured: tool.state.metadata, content }),
       providerExecuted: tool.executed,
       providerMetadata,
     })
@@ -193,10 +193,20 @@ const toolResult = (
     return result
   }
   if (tool.state.status === "error") {
+    const content = tool.state.content ? filtered(tool.state.content) : []
     return ToolResultPart.make({
       id: tool.id,
       name: tool.name,
-      result: { error: tool.state.error, content: tool.state.content ? filtered(tool.state.content) : [] },
+      result: tool.executed === true && tool.recorded !== undefined && Object.hasOwn(tool.recorded, "result")
+        ? tool.recorded.result
+        : {
+          error: tool.state.error,
+          content,
+          ...(tool.recorded === undefined ? {} : {
+            structured: tool.state.metadata,
+            ...(Object.hasOwn(tool.recorded, "result") ? { result: tool.recorded.result } : {}),
+          }),
+        },
       resultType: "error",
       providerExecuted: tool.executed,
       providerMetadata,
@@ -231,7 +241,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
             {
               type: "reasoning",
               text: item.text,
-              providerMetadata: providerMetadata(providerMetadataKey, item.state),
+              providerMetadata: item.recordedProviderMetadata ?? providerMetadata(providerMetadataKey, item.state),
             },
           ]
         : item.text.length > 0
@@ -245,7 +255,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       (sameModel && item.executed === true && (item.state.status === "completed" || item.state.status === "error"))
     const call = toolCall(
       item,
-      reuseToolProviderMetadata ? providerMetadata(providerMetadataKey, item.providerState) : undefined,
+      reuseToolProviderMetadata ? item.recorded?.providerMetadata ?? providerMetadata(providerMetadataKey, item.providerState) : undefined,
     )
     if (item.executed !== true) return [call]
     // Hosted tools (e.g. google_search) run inside the provider, so their
@@ -257,9 +267,9 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
     const result = toolResult(
       item,
       reuseToolProviderMetadata
-        ? providerMetadata(providerMetadataKey, item.providerResultState ?? item.providerState)
-        : sameProvider && item.providerResultState !== undefined
-          ? providerMetadata(providerMetadataKey, item.providerResultState)
+        ? item.recorded?.providerResultMetadata ?? item.recorded?.providerMetadata ?? providerMetadata(providerMetadataKey, item.providerResultState ?? item.providerState)
+        : sameProvider
+          ? item.recorded?.providerResultMetadata ?? providerMetadata(providerMetadataKey, item.providerResultState)
           : undefined,
       { messageID: message.id, partIndex, options: toolOptions },
     )
@@ -275,7 +285,7 @@ const assistant = (message: SessionMessage.Assistant, model: Model.Ref, provider
       toolResult(
         item,
         reuseProviderMetadata
-          ? providerMetadata(providerMetadataKey, item.providerResultState ?? item.providerState)
+          ? item.recorded?.providerResultMetadata ?? item.recorded?.providerMetadata ?? providerMetadata(providerMetadataKey, item.providerResultState ?? item.providerState)
           : undefined,
         { messageID: message.id, partIndex, options: toolOptions },
       ),
@@ -338,6 +348,9 @@ function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMe
         ...(message.skills ?? []).flatMap((skill) => (skill.text === undefined ? [] : [Message.text(skill.text)])),
         ...(message.text === "" ? [] : [Message.text(message.text)]),
         ...userAttachmentContent(message, options),
+        ...(message.recordedFiles ?? []).map((file) => Message.text(
+          `Recorded file reference (content unavailable):\n${JSON.stringify(file)}`,
+        )),
       ]
       if (content.length === 0) return []
       return [
@@ -368,6 +381,13 @@ function toLLMMessage(message: SessionMessage.Info, model: Model.Ref, providerMe
           metadata: message.metadata,
         }),
       ]
+    case "shell-recorded":
+      return [Message.make({
+        id: message.id,
+        role: "user",
+        content: `Historical shell record:\n\nCommand:\n${message.command}\n\nOutput:\n${message.output}`,
+        metadata: message.metadata,
+      })]
     case "assistant":
       return assistant(message, model, providerMetadataKey, options)
     case "compaction":

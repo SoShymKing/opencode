@@ -1,0 +1,295 @@
+export * as WsNative from "./ws-native.js"
+
+import { sql } from "drizzle-orm"
+import { Effect, Schema } from "effect"
+import type { EffectDrizzleSqlite } from "./drizzle.js"
+import { DatabaseLineage } from "./lineage.js"
+import { DatabaseMigration } from "./migration.js"
+import { DatabaseWsArchive } from "./ws-archive.js"
+import { WsNativeMessage } from "./ws-native-message.js"
+import { WsNativeWorkspace } from "./ws-native-workspace.js"
+import { WsNativeSource } from "./ws-native-source.js"
+import { WsNativePrevious } from "./ws-native-previous.js"
+import { WsNativeJson } from "./ws-native-json.js"
+import { Instructions } from "../instructions/index.js"
+import { SessionTable } from "../session/sql.js"
+import { SessionMessage } from "../session/message.js"
+import azureCredential from "./migration/20261007190000_azure_cli_external_credential.js"
+import type { V1Migration } from "./v1-migration.js"
+import { encodeStoredMessage, hydrateSelection, insertMessageChildren } from "../session/message-storage.js"
+import schema from "./schema.gen.js"
+
+type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
+type Reader = Pick<Database, "all" | "get">
+const identifier = DatabaseWsArchive.identifier
+const required = {
+  account: "id email url access_token refresh_token token_expiry time_created time_updated",
+  account_state: "id active_account_id active_org_id",
+  control_account: "email url access_token refresh_token token_expiry active time_created time_updated",
+  credential: "id integration_id label value connector_id method_id active time_created time_updated",
+  project: "id worktree vcs name icon_url icon_url_override icon_color time_created time_updated time_initialized sandboxes commands",
+  project_directory: "project_id directory type strategy time_created",
+  permission: "id project_id action resource time_created time_updated",
+  event_sequence: "aggregate_id seq owner_id",
+  event: "id aggregate_id seq type data",
+  session: "id project_id workspace_id parent_id slug directory path title version share_url summary_additions summary_deletions summary_files summary_diffs metadata cost tokens_input tokens_output tokens_reasoning tokens_cache_read tokens_cache_write revert permission agent model time_created time_updated time_compacting time_archived",
+  session_message: "id session_id type seq time_created time_updated data",
+  workspace: "id type directory time_used",
+  session_context_epoch: "session_id baseline snapshot baseline_seq",
+  session_input: "id session_id prompt delivery admitted_seq promoted_seq time_created",
+  message: "id session_id time_created time_updated data",
+  part: "id message_id session_id time_created time_updated data",
+}
+const compatible = ["account", "account_state", "control_account", "credential", "project", "project_directory", "permission", "event_sequence"]
+const previousSession = "fork_session_id fork_boundary time_suspended"
+const layouts: Readonly<Record<string, string>> = { ...required, ...WsNativePrevious.columns }
+
+export class WsNativeError extends Schema.TaggedError<WsNativeError>()("WsNativeError", {
+  message: Schema.String,
+}) {}
+const fail = (message: string) => new WsNativeError({ message })
+
+export function validateSource(db: Reader) {
+  return Effect.gen(function* () {
+    const state = yield* DatabaseLineage.inspect(db, [...DatabaseMigration.currentMigrationIDs])
+    if ((!state.ws && !state.previousNative) || !state.baselineComplete)
+      return yield* fail("Source is not a complete supported WS or previous-native lineage")
+    const requirements = state.previousNative
+      ? { ...Object.fromEntries(Object.entries(required).filter(([name]) => name !== "session_context_epoch" && name !== "session_input")),
+        ...WsNativePrevious.columns, session: `${required.session} ${previousSession}`, event: `${required.event} created` }
+      : required
+    for (const [table, names] of Object.entries(requirements)) {
+      const columns = yield* db.all<{ name: string }>(sql`SELECT name FROM pragma_table_info(${table})`)
+      for (const name of names.split(" ")) {
+        if (!columns.some((column) => column.name === name)) return yield* fail(`Missing source column ${table}.${name}`)
+      }
+    }
+    for (const [table, column, target] of [
+      ["session", "project_id", "project"], ["session_message", "session_id", "session"],
+      ["event", "aggregate_id", "event_sequence"], ["project_directory", "project_id", "project"],
+      ["permission", "project_id", "project"], ["workspace", "project_id", "project"],
+    ]) {
+      const references = yield* db.all<{ table: string; from: string; to: string }>(sql`SELECT "table", "from", "to" FROM pragma_foreign_key_list(${table})`)
+      if (!references.some((reference) => reference.table === target && reference.from === column && reference.to === (target === "event_sequence" ? "aggregate_id" : "id")))
+        return yield* fail(`Missing source foreign key ${table}.${column}`)
+    }
+    for (const table of state.previousNative ? ["session_input", "session_context_epoch", "session_inbox"] : ["session_pending", "session_inbox", "instruction_state", "instruction_entry", "instruction_blob"]) {
+      if (state.tables.has(table) && (yield* db.get(sql`SELECT 1 FROM ${identifier(table)} LIMIT 1`)))
+        return yield* fail(`Populated ${table} is not supported by the minimal WS bridge`)
+    }
+    yield* integrity(db)
+    for (const [table, columns] of Object.entries({
+      session: ["summary_diffs", "metadata", "revert", "permission", "model"],
+      project: ["sandboxes", "commands"], credential: ["value"], event: ["data"],
+    })) {
+      for (const column of columns) {
+        if (yield* db.get(sql`SELECT 1 FROM ${identifier(table)} WHERE ${identifier(column)} IS NOT NULL AND NOT json_valid(${identifier(column)}) LIMIT 1`))
+          return yield* fail(`Invalid JSON in ${table}.${column}`)
+      }
+    }
+    if (yield* db.get(sql`SELECT 1 FROM workspace WHERE type NOT IN ('worktree', 'folder') OR directory IS NULL OR directory = '' LIMIT 1`))
+      return yield* fail("Unsupported workspace type or missing local directory")
+    if (yield* db.get(sql`SELECT 1 FROM session s LEFT JOIN workspace w ON w.id = s.workspace_id WHERE s.workspace_id IS NOT NULL AND w.id IS NULL LIMIT 1`))
+      return yield* fail("Missing session workspace")
+    yield* watermark(db, "session", "session_message", "event")
+    yield* messages(db, "session_message", !state.previousNative && state.tables.has("session_message_part") ? "session_message_part" : undefined, state.previousNative)
+    yield* WsNativeSource.read(db, undefined, state.previousNative)
+    if (state.previousNative) yield* WsNativePrevious.read(db)
+    return state
+  })
+}
+
+export function convert(db: Database) {
+  return db.transaction((tx) => Effect.gen(function* () {
+    const state = yield* DatabaseLineage.inspect(tx, [...DatabaseMigration.currentMigrationIDs])
+    if (state.tables.has("session_v2") && !state.ws && !state.previousNative) {
+      if (state.completed.size !== DatabaseMigration.currentMigrationIDs.size || ![...DatabaseMigration.currentMigrationIDs].every((id) => state.completed.has(id)))
+        return yield* fail("Native database does not have the complete current ledger")
+      yield* validate(db)
+      return
+    }
+    const source = yield* validateSource(tx)
+    yield* tx.run("PRAGMA defer_foreign_keys = ON")
+    const archive = yield* DatabaseWsArchive.capture(tx, [...source.completed])
+    yield* schema.up(tx)
+    yield* DatabaseWsArchive.persist(tx, archive)
+    yield* restore(tx, archive)
+    yield* validate(db)
+    yield* tx.run("CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)")
+    for (const id of DatabaseMigration.currentMigrationIDs)
+      yield* tx.run(sql`INSERT INTO migration VALUES (${id}, ${Date.now()})`)
+  }), { behavior: "immediate" }).pipe(Effect.mapError((error) => error instanceof WsNativeError ? error : fail(String(error))))
+}
+
+export function restore(db: Database, archive: DatabaseWsArchive.Archive) {
+  return Effect.gen(function* () {
+    const previousNative = DatabaseLineage.previousNativeMigrationIDs.every((id) => archive.lineage_ids.includes(id))
+    const rich = yield* WsNativeSource.read(db, archive, previousNative)
+    for (const target of [...compatible, ...(previousNative ? ["kv", "instruction_blob"] : [])]) {
+      const source = DatabaseWsArchive.sourceTable(archive, target)
+      if (!source) return yield* fail(`Archive is missing ${target}`)
+      const proven = layouts[target].split(" ")
+      const targetColumns = yield* db.all<{ name: string }>(sql`SELECT name FROM pragma_table_info(${target})`)
+      const columns = sql.join(targetColumns.filter((column) => proven.includes(column.name)).map((column) => identifier(column.name)), sql`, `)
+      yield* db.run(sql`INSERT INTO ${identifier(target)} (${columns}) SELECT ${columns} FROM ${identifier(source)}`)
+    }
+    yield* db.run("UPDATE project SET time_active = time_updated")
+    for (const grant of rich.grants)
+      yield* db.run(sql`UPDATE permission SET action = ${grant.action} WHERE id = ${grant.id}`)
+    yield* db.transaction(azureCredential.up)
+    yield* db.run(`INSERT INTO worktree SELECT project_id, directory, CASE WHEN strategy = 'git_worktree' THEN 'git' WHEN strategy IS NOT NULL THEN strategy WHEN type = 'git_worktree' THEN 'git' END, time_created FROM project_directory`)
+    const workspace = DatabaseWsArchive.sourceTable(archive, "workspace")
+    if (!workspace) return yield* fail("Archive is missing workspace")
+    yield* db.run(sql`INSERT INTO workspace (id, provider, binding, created_at, last_used_at)
+      SELECT id, ${WsNativeWorkspace.Provider}, json_object('directory', directory), time_used, time_used FROM ${identifier(workspace)}`)
+    for (const epoch of rich.epochs) {
+      for (const entry of Object.values(epoch.snapshot)) yield* db.run(sql`INSERT INTO instruction_blob (hash, value)
+        VALUES (${Instructions.hash(entry.value)}, ${entry.value === null ? null : JSON.stringify(entry.value)}) ON CONFLICT DO NOTHING`)
+    }
+    yield* restoreSessions(db, archive)
+    if (previousNative) {
+      const entries = DatabaseWsArchive.sourceTable(archive, "instruction_entry")
+      if (!entries) return yield* fail("Archive is missing instruction_entry")
+      const columns = sql.join(WsNativePrevious.columns.instruction_entry.split(" ").map(identifier), sql`, `)
+      yield* db.run(sql`INSERT INTO instruction_entry (${columns}) SELECT ${columns} FROM ${identifier(entries)}`)
+    }
+    yield* db.transaction((tx) => Effect.gen(function* () {
+      for (const row of yield* tx.all<{ aggregate_id: string; seq: number }>(sql`SELECT aggregate_id, seq FROM event_sequence`))
+        yield* DatabaseWsArchive.persistRoot(tx, { aggregate_id: row.aggregate_id, archive_id: archive.id, through_seq: row.seq, codec_version: previousNative ? 2 : 1 })
+    }))
+  })
+}
+
+export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive, sessionIDs?: readonly string[]) {
+  return Effect.gen(function* () {
+    const previousNative = DatabaseLineage.previousNativeMigrationIDs.every((id) => archive.lineage_ids.includes(id))
+    const rich = yield* WsNativeSource.read(db, archive, previousNative)
+    const pending = previousNative ? yield* WsNativePrevious.read(db, archive) : []
+    const owns = (id: string) => sessionIDs === undefined || sessionIDs.includes(id)
+    const selected = (column: string) => sessionIDs === undefined ? sql`1` : sql`${sql.raw(column)} IN (${sql.join(sessionIDs.map((id) => sql`${id}`), sql`, `)})`
+    for (const target of ["session_v2", "event_sequence", ...(previousNative ? ["instruction_state"] : [])]) {
+      const sourceName = target === "session_v2" ? "session" : target
+      const source = DatabaseWsArchive.sourceTable(archive, sourceName)
+      if (!source) return yield* fail(`Archive is missing ${target}`)
+      const proven = `${layouts[sourceName]} ${previousNative && sourceName === "session" ? previousSession : ""}`.split(" ")
+      const targetColumns = yield* db.all<{ name: string }>(sql`SELECT name FROM pragma_table_info(${target})`)
+      const columns = sql.join(targetColumns.filter((column) => proven.includes(column.name)).map((column) => identifier(column.name)), sql`, `)
+      yield* db.run(sql`INSERT INTO ${identifier(target)} (${columns}) SELECT ${columns} FROM ${identifier(source)}
+        WHERE ${selected(target === "session_v2" ? "id" : target === "event_sequence" ? "aggregate_id" : "session_id")}
+        ${target === "event_sequence" ? sql`ON CONFLICT (aggregate_id) DO NOTHING` : sql``}`)
+    }
+    for (const permission of rich.permissions.filter((item) => owns(item.id)))
+      yield* db.run(sql`UPDATE session_v2 SET permission = ${JSON.stringify(permission.rules)} WHERE id = ${permission.id}`)
+    const parent = DatabaseWsArchive.sourceTable(archive, "session_message")
+    if (!parent) return yield* fail("Archive is missing session_message")
+    for (const item of yield* messages(db, parent, previousNative ? undefined : DatabaseWsArchive.sourceTable(archive, "session_message_part"), previousNative)) {
+      if (!owns(item.row.session_id)) continue
+      const stored = yield* encodeStoredMessage(item.converted.message)
+      yield* db.run(sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+        VALUES (${item.row.id}, ${item.row.session_id}, ${stored.envelope.type}, ${item.row.seq}, ${item.row.time_created}, ${item.row.time_updated}, ${WsNativeJson.preserve(item.row.data, stored.envelope.data)})`)
+      yield* insertMessageChildren(db, stored.parts)
+      for (const part of stored.parts) {
+        const original = item.sourceParts[part.position]
+        if (original === undefined) continue
+        yield* db.run(sql`UPDATE session_message_part SET data = ${WsNativeJson.preserve(original, part.data)} WHERE message_id = ${part.message_id} AND position = ${part.position}`)
+      }
+    }
+    const legacyMessages = DatabaseWsArchive.sourceTable(archive, "message")
+    const legacyParts = DatabaseWsArchive.sourceTable(archive, "part")
+    if (!legacyMessages || !legacyParts) return yield* fail("Archive is missing legacy message or part tables")
+    const legacySessions = yield* db.select().from(SessionTable).where(sql`
+       ${selected("id")} AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_id = session_v2.id)
+      AND EXISTS (SELECT 1 FROM ${identifier(legacyMessages)} WHERE session_id = session_v2.id)`)
+    if (legacySessions.length) {
+      const { V1Migration } = yield* Effect.promise(() => import("./v1-migration.js"))
+      for (const session of legacySessions) {
+        const sourceMessages = yield* db.all<V1Migration.SourceMessage>(sql`SELECT * FROM ${identifier(legacyMessages)} WHERE session_id = ${session.id}`)
+        const sourceParts = yield* db.all<V1Migration.SourcePart>(sql`SELECT * FROM ${identifier(legacyParts)} WHERE session_id = ${session.id}`)
+        const transformed = V1Migration.transformSession({ session, messages: sourceMessages, parts: sourceParts })
+        if (transformed.warnings.length || sourceMessages.some((row) => !transformed.messages.some((message) => message.id === row.id)))
+          return yield* fail(`Legacy transform would skip source rows for ${session.id}: ${JSON.stringify(transformed.warnings)}`)
+        for (const row of transformed.messages) {
+          const message = yield* Schema.decodeUnknownEffect(SessionMessage.Info)({ ...row.data, id: row.id, type: row.type })
+          const stored = yield* encodeStoredMessage(message)
+          yield* db.run(sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+            VALUES (${row.id}, ${row.session_id}, ${row.type}, ${row.seq}, ${row.time_created}, ${row.time_updated}, ${JSON.stringify(stored.envelope.data)})`)
+          yield* insertMessageChildren(db, stored.parts)
+        }
+      }
+    }
+    yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq, owner_id)
+      SELECT s.id, coalesce(max(m.seq), -1), NULL FROM session_v2 s LEFT JOIN session_message m ON m.session_id = s.id
+      WHERE ${selected("s.id")} AND NOT EXISTS (SELECT 1 FROM event_sequence e WHERE e.aggregate_id = s.id) GROUP BY s.id`)
+    for (const epoch of rich.epochs.filter((item) => owns(item.sessionID))) yield* db.run(sql`INSERT INTO instruction_state
+      (session_id, epoch_start, through_seq, frozen_baseline, initial_values, current_values, imported_removals)
+      VALUES (${epoch.sessionID}, ${epoch.baselineSeq}, ${epoch.throughSeq}, ${epoch.baseline}, '{}',
+        ${JSON.stringify(Object.fromEntries(Object.entries(epoch.snapshot).map(([key, entry]) => [key, Instructions.hash(entry.value)])))},
+        ${JSON.stringify(Object.fromEntries(Object.entries(epoch.snapshot).flatMap(([key, entry]) => entry.removed === undefined ? [] : [[key, entry.removed]])))})`)
+    for (const input of rich.inputs) {
+      if (!owns(input.row.session_id)) continue
+      if (input.row.promoted_seq !== null) continue
+      yield* db.run(sql`INSERT INTO session_inbox (id, session_id, type, payload, delivery, enqueued_seq, time_created)
+        VALUES (${input.row.id}, ${input.row.session_id}, 'user', ${JSON.stringify(input.payload)}, ${input.delivery}, ${input.row.admitted_seq}, ${input.row.time_created})`)
+    }
+    for (const item of pending.filter((item) => owns(item.row.session_id))) yield* db.run(sql`INSERT INTO session_inbox (id, session_id, type, payload, delivery, enqueued_seq, time_created)
+      VALUES (${item.row.id}, ${item.row.session_id}, ${item.row.type}, ${item.row.data}, ${item.delivery}, ${item.row.admitted_seq}, ${item.row.time_created})`)
+  })
+}
+
+export function validate(db: Database) {
+  return Effect.gen(function* () {
+    yield* integrity(db)
+    yield* watermark(db, "session_v2", "session_message", "event")
+    yield* hydrateSelection({ db })
+    if (yield* db.get(sql`SELECT 1 FROM _ws_import_root r LEFT JOIN event_sequence s ON s.aggregate_id = r.aggregate_id WHERE s.aggregate_id IS NULL OR s.seq < r.through_seq OR r.through_seq < -1 OR r.codec_version NOT IN (1, 2) LIMIT 1`))
+      return yield* fail("Invalid WS import watermark")
+    if (yield* db.get(sql`SELECT 1 FROM event e JOIN _ws_import_root r ON r.aggregate_id = e.aggregate_id WHERE e.seq <= r.through_seq LIMIT 1`))
+      return yield* fail("Imported prefix must not contain native events")
+    for (const root of yield* db.all<{ archive_id: string; codec_version: number }>(sql`SELECT DISTINCT archive_id, codec_version FROM _ws_import_root`)) {
+      const archive = yield* DatabaseWsArchive.read(db, root.archive_id)
+      if (!archive) return yield* fail("Missing import archive")
+      const previousNative = DatabaseLineage.previousNativeMigrationIDs.every((id) => archive.lineage_ids.includes(id))
+      const ws = archive.lineage_ids.includes("v01_baseline") || DatabaseLineage.legacyBaselineMigrationIDs.every((id) =>
+        archive.lineage_ids.includes(id) || (id === DatabaseLineage.legacySessionMetadataMigrationID && archive.lineage_ids.includes(DatabaseLineage.legacySessionMetadataAlias)))
+      if (!previousNative && !ws) return yield* fail("Import archive has unsupported source lineage")
+      if (root.codec_version !== (previousNative ? 2 : 1)) return yield* fail("Import codec does not match source lineage")
+    }
+  })
+}
+
+function integrity(db: Reader) {
+  return Effect.gen(function* () {
+    const rows = yield* db.all<{ integrity_check: string }>(sql`PRAGMA integrity_check`)
+    if (rows.some((row) => row.integrity_check !== "ok")) return yield* fail("Database integrity check failed")
+    if ((yield* db.all(sql`PRAGMA foreign_key_check`)).length) return yield* fail("Database foreign key check failed")
+  })
+}
+
+function watermark(db: Reader, sessions: string, parent: string, events: string) {
+  return Effect.gen(function* () {
+    if (yield* db.get(sql`SELECT 1 FROM event_sequence WHERE typeof(seq) != 'integer' OR seq < -1 OR seq > 9007199254740991 LIMIT 1`))
+      return yield* fail("Invalid event_sequence watermark")
+    if (sessions !== "session" && (yield* db.get(sql`SELECT 1 FROM ${identifier(sessions)} s LEFT JOIN event_sequence e ON e.aggregate_id = s.id WHERE e.aggregate_id IS NULL LIMIT 1`)))
+      return yield* fail("Session is missing event_sequence watermark")
+    for (const table of [parent, events]) {
+      const owner = table === parent ? "session_id" : "aggregate_id"
+      if (yield* db.get(sql`SELECT 1 FROM ${identifier(table)} m LEFT JOIN event_sequence e ON e.aggregate_id = m.${identifier(owner)} WHERE e.aggregate_id IS NULL OR m.seq > e.seq OR m.seq < 0 OR typeof(m.seq) != 'integer' LIMIT 1`))
+        return yield* fail(`Invalid ${table} sequence watermark`)
+    }
+  })
+}
+
+function messages(db: Reader, parent: string, child: string | undefined, previousNative = false) {
+  return Effect.gen(function* () {
+    const rows = yield* db.all<{ id: string; session_id: string; type: string; seq: number; time_created: number; time_updated: number; data: string }>(sql`SELECT * FROM ${identifier(parent)} ORDER BY session_id, seq`)
+    return yield* Effect.forEach(rows, (row) => Effect.gen(function* () {
+      const parts = child ? yield* db.all<{ position: number; id: string; type: string; data: string }>(sql`SELECT position, id, type, data FROM ${identifier(child)} WHERE message_id = ${row.id} ORDER BY position`) : undefined
+      const converted = previousNative ? { message: yield* WsNativePrevious.message(row) }
+        : yield* WsNativeMessage.convert({ id: row.id, sessionID: row.session_id, type: row.type, data: row.data, parts })
+      const sourceParts = parts?.map((part) => part.data) ?? (yield* Effect.try({
+        try: () => WsNativeJson.children(row.data), catch: (cause) => fail(`Invalid message JSON ${row.id}: ${String(cause)}`),
+      }))
+      return { row, converted, sourceParts }
+    }))
+  })
+}

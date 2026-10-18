@@ -18,6 +18,12 @@ export function currentToolMetadata(tool: SessionMessageAssistantTool): Record<s
 }
 
 export function currentToolOutput(tool: SessionMessageAssistantTool) {
+  if (tool.recorded?.content) {
+    const text = tool.recorded.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
+
+    if (text) return text
+  }
+
   if (tool.state.status === "running") {
     const output = tool.state.metadata.output
 
@@ -83,6 +89,7 @@ export function readImagePath(input: Record<string, unknown>) {
 // Plain file reads render as one comma-separated row; images and loaded instructions keep their own rows.
 export function currentToolGroupedRead(tool: SessionMessageAssistantTool) {
   return (
+    !tool.recorded &&
     tool.name === "read" &&
     tool.state.status !== "error" &&
     !readImagePath(currentToolInput(tool)) &&

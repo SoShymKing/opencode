@@ -201,6 +201,7 @@ export const Forked = Event.durable({
     parentID: SessionID,
     boundary: SessionFork.Boundary,
     instructions: Instruction.Values.pipe(optional),
+    instructionSourceSeq: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)).pipe(optional),
     instructionEntries: InstructionEntry.Snapshot.pipe(optional),
   },
 })

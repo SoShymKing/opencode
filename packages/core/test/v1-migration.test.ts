@@ -16,6 +16,7 @@ import { eq, sql } from "drizzle-orm"
 import type { SqlClient } from "effect/sql/SqlClient"
 import { tmpdir } from "./fixture/tmpdir"
 import path from "path"
+import { setupPreviousNative } from "./fixture/database-ws"
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 const run = <A, E>(effect: Effect.Effect<A, E, SqlClient | Scope.Scope | Global.Service>) =>
@@ -929,44 +930,24 @@ describe("V1Migration database workflow", () => {
   test("imports previous V2 sessions and messages containing apostrophes", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "opencode-next.db")
-    const sqlite = await import("bun:sqlite")
-    const source = new sqlite.Database(filename)
-    source.run(`
-      CREATE TABLE project (
-        id text PRIMARY KEY, worktree text NOT NULL, vcs text, name text, icon_url text, icon_url_override text,
-        icon_color text, time_created integer NOT NULL, time_updated integer NOT NULL, time_initialized integer,
-        sandboxes text NOT NULL, commands text
-      );
-      CREATE TABLE session (
-        id text PRIMARY KEY, project_id text NOT NULL, workspace_id text, parent_id text, fork_session_id text,
-        fork_boundary text, slug text NOT NULL, directory text NOT NULL, path text, title text, version text NOT NULL,
-        share_url text, summary_additions integer, summary_deletions integer, summary_files integer, summary_diffs text,
-        metadata text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL,
-        tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL,
-        tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, revert text,
-        permission text, agent text, model text, time_created integer NOT NULL, time_updated integer NOT NULL,
-        time_compacting integer, time_archived integer, time_suspended integer
-      );
-      CREATE TABLE session_message (
-        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
-        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
-      );
-      INSERT INTO project VALUES (
-        'next-project', 'C:/Users/sewer', 'git', 'Source project', NULL, NULL, NULL, 1, 2, NULL, '[]', NULL
-      );
-      INSERT INTO session (
+    await Effect.runPromise(Effect.gen(function* () {
+      const source = yield* makeDb
+      yield* setupPreviousNative(source, { directory: tmp.path })
+      yield* source.run(sql`INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+        VALUES ('global', '/tmp/orphan', 1, 2, '[]')`)
+      yield* source.run(sql`INSERT INTO session (
         id, project_id, slug, directory, title, version, agent, model, time_created, time_updated
       ) VALUES
-        ('ses_next', 'next-project', 'next', 'C:/Users/sewer', 'Imported', '2', 'build',
+        ('ses_next', 'project', 'next', 'C:/Users/sewer', 'Imported', '2', 'build',
           '{"id":"model","providerID":"provider"}', 10, 20),
-        ('ses_existing', 'next-project', 'source-existing', '/tmp/next', 'Source existing', '2', NULL, NULL, 11, 21),
-        ('ses_orphan', 'missing-project', 'orphan', '/tmp/orphan', 'Orphan', '2', NULL, NULL, 12, 22);
-      INSERT INTO session_message VALUES
+        ('ses_source_existing', 'project', 'source-existing', '/tmp/next', 'Source existing', '2', NULL, NULL, 11, 21),
+        ('ses_orphan', 'global', 'orphan', '/tmp/orphan', 'Orphan', '2', NULL, NULL, 12, 22)`)
+      yield* source.run(sql`INSERT INTO session_message VALUES
         ('msg_next', 'ses_next', 'user', 4, 12, 13, '{"text":"from next''s history","time":{"created":12}}'),
-        ('msg_source_existing', 'ses_existing', 'user', 2, 12, 13, '{"text":"source","time":{"created":12}}'),
-        ('msg_orphan', 'ses_orphan', 'user', 0, 12, 13, '{"text":"orphan","time":{"created":12}}');
-    `)
-    source.close()
+        ('msg_source_existing', 'ses_source_existing', 'user', 2, 12, 13, '{"text":"source","time":{"created":12}}'),
+        ('msg_orphan', 'ses_orphan', 'user', 0, 12, 13, '{"text":"orphan","time":{"created":12}}')`)
+      yield* source.run(sql`INSERT INTO event_sequence VALUES ('ses_next', 4, NULL), ('ses_source_existing', 2, NULL), ('ses_orphan', 0, NULL)`)
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped))
 
     await database(
       Effect.gen(function* () {
@@ -1044,39 +1025,18 @@ describe("V1Migration database workflow", () => {
     )
   })
 
-  test("imports previous V2 databases missing newer nullable columns", async () => {
+  test("imports previous V2 databases with nullable source values", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "opencode-next.db")
-    const sqlite = await import("bun:sqlite")
-    const source = new sqlite.Database(filename)
-    source.run(`
-      CREATE TABLE project (
-        id text PRIMARY KEY, worktree text NOT NULL, vcs text, name text, icon_url text,
-        time_created integer NOT NULL, time_updated integer NOT NULL, time_initialized integer,
-        sandboxes text NOT NULL
-      );
-      CREATE TABLE session (
-        id text PRIMARY KEY, project_id text NOT NULL, workspace_id text, parent_id text, fork_session_id text,
-        slug text NOT NULL, directory text NOT NULL, path text, title text, version text NOT NULL,
-        share_url text, summary_additions integer, summary_deletions integer, summary_files integer, summary_diffs text,
-        metadata text, cost real DEFAULT 0 NOT NULL, tokens_input integer DEFAULT 0 NOT NULL,
-        tokens_output integer DEFAULT 0 NOT NULL, tokens_reasoning integer DEFAULT 0 NOT NULL,
-        tokens_cache_read integer DEFAULT 0 NOT NULL, tokens_cache_write integer DEFAULT 0 NOT NULL, revert text,
-        permission text, agent text, model text, time_created integer NOT NULL, time_updated integer NOT NULL,
-        time_compacting integer, time_archived integer
-      );
-      CREATE TABLE session_message (
-        id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL, seq integer NOT NULL,
-        time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL
-      );
-      INSERT INTO project VALUES (
-        'next-project', '/tmp/next', 'git', 'Source project', 'https://example.com/icon.png', 1, 2, NULL, '[]'
-      );
-      INSERT INTO session (
+    await Effect.runPromise(Effect.gen(function* () {
+      const source = yield* makeDb
+      yield* setupPreviousNative(source, { directory: tmp.path })
+      yield* source.run(sql`INSERT INTO project (id, worktree, vcs, name, icon_url, icon_url_override, time_created, time_updated, sandboxes)
+        VALUES ('next-project', '/tmp/next', 'git', 'Source project', 'https://example.com/icon.png', 'https://example.com/icon.png', 1, 2, '[]')`)
+      yield* source.run(sql`INSERT INTO session (
         id, project_id, slug, directory, title, version, time_created, time_updated
-      ) VALUES ('ses_next', 'next-project', 'next', '/tmp/next', 'Imported', '2', 10, 20);
-    `)
-    source.close()
+      ) VALUES ('ses_next', 'next-project', 'next', '/tmp/next', 'Imported', '2', 10, 20)`)
+    }).pipe(Effect.provide(SqliteClient.layer({ filename, disableWAL: true })), Effect.scoped))
 
     await database(
       Effect.gen(function* () {

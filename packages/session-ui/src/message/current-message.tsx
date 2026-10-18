@@ -12,7 +12,7 @@ import { currentToolError, currentToolInput, currentToolMetadata, currentToolOut
 
 export type { SessionUserActions, SessionUserAttachmentReference, SessionUserComment } from "../actions"
 
-export { SessionShellMessage } from "../tools/tool-renderer"
+export { SessionShellMessage, SessionRecordedShellMessage } from "../tools/tool-renderer"
 
 export { currentContentDefaultOpen } from "./current-tool-state"
 
@@ -85,6 +85,7 @@ export function SessionAssistantContent(props: {
           <ToolDisplay
             id={props.contentID}
             tool={tool().name}
+            recorded={tool().recorded}
             input={currentToolInput(tool())}
             metadata={currentToolMetadata(tool())}
             output={currentToolOutput(tool())}

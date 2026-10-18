@@ -96,6 +96,12 @@ export type ShellID = string
 
 export type SessionMessageProviderState = { [x: string]: JsonValue }
 
+export type SessionMessageRecordedProviderMetadata = { [x: string]: { [x: string]: JsonValue } }
+
+export type ToolTextContent = { type: "text"; text: string }
+
+export type ToolFileContent = { type: "file"; uri: string; mime: string; name?: string | null }
+
 export type SessionMessageToolStateStreaming = { status: "streaming"; input: string }
 
 export type SessionMessageToolStateRunning = {
@@ -103,10 +109,6 @@ export type SessionMessageToolStateRunning = {
   input: { [x: string]: JsonValue }
   metadata: { [x: string]: JsonValue }
 }
-
-export type ToolTextContent = { type: "text"; text: string }
-
-export type ToolFileContent = { type: "file"; uri: string; mime: string; name?: string | null }
 
 export type SessionInboxDelivery = "steer" | "queue"
 
@@ -372,6 +374,16 @@ export type SessionMessageSystem = {
   description?: string
 }
 
+export type SessionMessageRecordedShell = {
+  id: SessionMessageID
+  metadata?: { [x: string]: JsonValue }
+  time: { created: number; completed?: number }
+  type: "shell-recorded"
+  callID: string
+  command: string
+  output: string
+}
+
 export type SessionRejectedAttachment =
   | { source: "user"; messageID: SessionMessageID; fileIndex: number }
   | { source: "tool"; messageID: SessionMessageID; partIndex: number; contentIndex: number }
@@ -421,6 +433,14 @@ export type PromptFileAttachment = {
   name?: string
   description?: string
   mention?: PromptMention
+}
+
+export type SessionMessageRecordedFile = {
+  uri: string
+  mime: string
+  name?: string
+  description?: string
+  source?: PromptMention
 }
 
 export type PromptAgentAttachment = { name: string; mention?: PromptMention }
@@ -492,6 +512,7 @@ export type SessionMessageAssistantReasoning = {
   type: "reasoning"
   text: string
   state?: SessionMessageProviderState
+  recordedProviderMetadata?: SessionMessageRecordedProviderMetadata
   time?: { created: number; completed?: number }
 }
 
@@ -529,6 +550,7 @@ export type SessionMessageAssistantReasoning1 = {
   type: "reasoning"
   text: string
   state?: SessionMessageProviderState1
+  recordedProviderMetadata?: SessionMessageRecordedProviderMetadata
   time?: { created: number; completed?: number }
 }
 
@@ -913,6 +935,7 @@ export type SessionMessageUser = {
   time: { created: number }
   text: string
   files?: Array<PromptFileAttachment>
+  recordedFiles?: Array<SessionMessageRecordedFile>
   agents?: Array<PromptAgentAttachment>
   skills?: Array<PromptSkillAttachment>
   type: "user"
@@ -923,6 +946,7 @@ export type SessionInboxUserPayload = {
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
   skills?: Array<PromptSkillAttachment>
+  recordedFiles?: Array<SessionMessageRecordedFile>
   metadata?: { [x: string]: JsonValue }
 }
 
@@ -931,13 +955,24 @@ export type SessionInboxUserPayload1 = {
   files?: Array<PromptFileAttachment>
   agents?: Array<PromptAgentAttachment>
   skills?: Array<PromptSkillAttachment>
+  recordedFiles?: Array<SessionMessageRecordedFile>
   metadata?: { [x: string]: any }
+}
+
+export type SessionMessageRecordedTool = {
+  providerMetadata?: SessionMessageRecordedProviderMetadata
+  providerResultMetadata?: SessionMessageRecordedProviderMetadata
+  result?: JsonValue
+  content?: Array<ToolContent>
+  attachments?: Array<SessionMessageRecordedFile>
+  outputPaths?: Array<string>
+  pruned?: number
 }
 
 export type SessionMessageToolStateCompleted = {
   status: "completed"
   input: { [x: string]: JsonValue }
-  content: [ToolContent, ...Array<ToolContent>]
+  content: Array<ToolContent>
   metadata?: { [x: string]: JsonValue }
 }
 
@@ -1043,6 +1078,7 @@ export type SessionForked = {
     parentID: SessionID
     boundary: SessionForkBoundary
     instructions?: { [x: InstructionKey]: InstructionHash }
+    instructionSourceSeq?: number
     instructionEntries?: InstructionEntrySnapshot
   }
 }
@@ -1803,10 +1839,20 @@ export type SessionToolSuccess = {
   }
 }
 
+export type SessionMessageRecordedTool1 = {
+  providerMetadata?: SessionMessageRecordedProviderMetadata
+  providerResultMetadata?: SessionMessageRecordedProviderMetadata
+  result?: JsonValue
+  content?: Array<ToolContent1>
+  attachments?: Array<SessionMessageRecordedFile>
+  outputPaths?: Array<string>
+  pruned?: number
+}
+
 export type SessionMessageToolStateCompleted1 = {
   status: "completed"
   input: { [x: string]: any }
-  content: [ToolContent1, ...Array<ToolContent1>]
+  content: Array<ToolContent1>
   metadata?: { [x: string]: JsonValue }
 }
 
@@ -2234,7 +2280,7 @@ export type SessionMessageToolStateError = {
   status: "error"
   input: { [x: string]: JsonValue }
   error: SessionStructuredError
-  content?: [ToolContent, ...Array<ToolContent>]
+  content?: Array<ToolContent>
   metadata?: { [x: string]: JsonValue }
 }
 
@@ -2349,7 +2395,7 @@ export type SessionMessageToolStateError1 = {
   status: "error"
   input: { [x: string]: any }
   error: SessionStructuredError
-  content?: [ToolContent1, ...Array<ToolContent1>]
+  content?: Array<ToolContent1>
   metadata?: { [x: string]: JsonValue }
 }
 
@@ -2397,6 +2443,7 @@ export type SessionMessageAssistantTool = {
   executed?: boolean
   providerState?: SessionMessageProviderState
   providerResultState?: SessionMessageProviderState
+  recorded?: SessionMessageRecordedTool
   state:
     | SessionMessageToolStateStreaming
     | SessionMessageToolStateRunning
@@ -2417,6 +2464,7 @@ export type SessionMessageAssistantTool1 = {
   executed?: boolean
   providerState?: SessionMessageProviderState1
   providerResultState?: SessionMessageProviderState1
+  recorded?: SessionMessageRecordedTool1
   state:
     | SessionMessageToolStateStreaming
     | SessionMessageToolStateRunning1
@@ -2513,6 +2561,7 @@ export type SessionMessageInfo =
   | SessionMessageSystem
   | SessionMessageSkill
   | SessionMessageShell
+  | SessionMessageRecordedShell
   | SessionMessageAssistant
   | SessionMessageCompaction
   | SessionMessageIdle
@@ -3386,6 +3435,13 @@ export type SessionImportInput = {
             readonly description?: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
           }>
+          readonly recordedFiles?: ReadonlyArray<{
+            readonly uri: string
+            readonly mime: string
+            readonly name?: string
+            readonly description?: string
+            readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+          }>
           readonly agents?: ReadonlyArray<{
             readonly name: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
@@ -3442,6 +3498,15 @@ export type SessionImportInput = {
       | {
           readonly id: string
           readonly metadata?: { readonly [x: string]: JsonValue }
+          readonly time: { readonly created: number; readonly completed?: number }
+          readonly type: "shell-recorded"
+          readonly callID: string
+          readonly command: string
+          readonly output: string
+        }
+      | {
+          readonly id: string
+          readonly metadata?: { readonly [x: string]: JsonValue }
           readonly time: { readonly created: number; readonly streamed?: number; readonly completed?: number }
           readonly type: "assistant"
           readonly agent: string
@@ -3452,6 +3517,7 @@ export type SessionImportInput = {
                 readonly type: "reasoning"
                 readonly text: string
                 readonly state?: { readonly [x: string]: JsonValue }
+                readonly recordedProviderMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
                 readonly time?: { readonly created: number; readonly completed?: number }
               }
             | {
@@ -3461,6 +3527,29 @@ export type SessionImportInput = {
                 readonly executed?: boolean
                 readonly providerState?: { readonly [x: string]: JsonValue }
                 readonly providerResultState?: { readonly [x: string]: JsonValue }
+                readonly recorded?: {
+                  readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly providerResultMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly result?: JsonValue
+                  readonly content?: ReadonlyArray<
+                    | { readonly type: "text"; readonly text: string }
+                    | {
+                        readonly type: "file"
+                        readonly uri: string
+                        readonly mime: string
+                        readonly name?: string | null
+                      }
+                  >
+                  readonly attachments?: ReadonlyArray<{
+                    readonly uri: string
+                    readonly mime: string
+                    readonly name?: string
+                    readonly description?: string
+                    readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+                  }>
+                  readonly outputPaths?: ReadonlyArray<string>
+                  readonly pruned?: number
+                }
                 readonly state:
                   | { readonly status: "streaming"; readonly input: string }
                   | {
@@ -3471,26 +3560,15 @@ export type SessionImportInput = {
                   | {
                       readonly status: "completed"
                       readonly input: { readonly [x: string]: JsonValue }
-                      readonly content: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                   | {
@@ -3511,26 +3589,15 @@ export type SessionImportInput = {
                             }
                         >
                       }
-                      readonly content?: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content?: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                 readonly time: { readonly created: number; readonly ran?: number; readonly completed?: number }
@@ -3775,6 +3842,13 @@ export type SessionImportInput = {
             readonly description?: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
           }>
+          readonly recordedFiles?: ReadonlyArray<{
+            readonly uri: string
+            readonly mime: string
+            readonly name?: string
+            readonly description?: string
+            readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+          }>
           readonly agents?: ReadonlyArray<{
             readonly name: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
@@ -3831,6 +3905,15 @@ export type SessionImportInput = {
       | {
           readonly id: string
           readonly metadata?: { readonly [x: string]: JsonValue }
+          readonly time: { readonly created: number; readonly completed?: number }
+          readonly type: "shell-recorded"
+          readonly callID: string
+          readonly command: string
+          readonly output: string
+        }
+      | {
+          readonly id: string
+          readonly metadata?: { readonly [x: string]: JsonValue }
           readonly time: { readonly created: number; readonly streamed?: number; readonly completed?: number }
           readonly type: "assistant"
           readonly agent: string
@@ -3841,6 +3924,7 @@ export type SessionImportInput = {
                 readonly type: "reasoning"
                 readonly text: string
                 readonly state?: { readonly [x: string]: JsonValue }
+                readonly recordedProviderMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
                 readonly time?: { readonly created: number; readonly completed?: number }
               }
             | {
@@ -3850,6 +3934,29 @@ export type SessionImportInput = {
                 readonly executed?: boolean
                 readonly providerState?: { readonly [x: string]: JsonValue }
                 readonly providerResultState?: { readonly [x: string]: JsonValue }
+                readonly recorded?: {
+                  readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly providerResultMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly result?: JsonValue
+                  readonly content?: ReadonlyArray<
+                    | { readonly type: "text"; readonly text: string }
+                    | {
+                        readonly type: "file"
+                        readonly uri: string
+                        readonly mime: string
+                        readonly name?: string | null
+                      }
+                  >
+                  readonly attachments?: ReadonlyArray<{
+                    readonly uri: string
+                    readonly mime: string
+                    readonly name?: string
+                    readonly description?: string
+                    readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+                  }>
+                  readonly outputPaths?: ReadonlyArray<string>
+                  readonly pruned?: number
+                }
                 readonly state:
                   | { readonly status: "streaming"; readonly input: string }
                   | {
@@ -3860,26 +3967,15 @@ export type SessionImportInput = {
                   | {
                       readonly status: "completed"
                       readonly input: { readonly [x: string]: JsonValue }
-                      readonly content: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                   | {
@@ -3900,26 +3996,15 @@ export type SessionImportInput = {
                             }
                         >
                       }
-                      readonly content?: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content?: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                 readonly time: { readonly created: number; readonly ran?: number; readonly completed?: number }
@@ -4164,6 +4249,13 @@ export type SessionImportInput = {
             readonly description?: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
           }>
+          readonly recordedFiles?: ReadonlyArray<{
+            readonly uri: string
+            readonly mime: string
+            readonly name?: string
+            readonly description?: string
+            readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+          }>
           readonly agents?: ReadonlyArray<{
             readonly name: string
             readonly mention?: { readonly start: number; readonly end: number; readonly text: string }
@@ -4220,6 +4312,15 @@ export type SessionImportInput = {
       | {
           readonly id: string
           readonly metadata?: { readonly [x: string]: JsonValue }
+          readonly time: { readonly created: number; readonly completed?: number }
+          readonly type: "shell-recorded"
+          readonly callID: string
+          readonly command: string
+          readonly output: string
+        }
+      | {
+          readonly id: string
+          readonly metadata?: { readonly [x: string]: JsonValue }
           readonly time: { readonly created: number; readonly streamed?: number; readonly completed?: number }
           readonly type: "assistant"
           readonly agent: string
@@ -4230,6 +4331,7 @@ export type SessionImportInput = {
                 readonly type: "reasoning"
                 readonly text: string
                 readonly state?: { readonly [x: string]: JsonValue }
+                readonly recordedProviderMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
                 readonly time?: { readonly created: number; readonly completed?: number }
               }
             | {
@@ -4239,6 +4341,29 @@ export type SessionImportInput = {
                 readonly executed?: boolean
                 readonly providerState?: { readonly [x: string]: JsonValue }
                 readonly providerResultState?: { readonly [x: string]: JsonValue }
+                readonly recorded?: {
+                  readonly providerMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly providerResultMetadata?: { readonly [x: string]: { readonly [x: string]: JsonValue } }
+                  readonly result?: JsonValue
+                  readonly content?: ReadonlyArray<
+                    | { readonly type: "text"; readonly text: string }
+                    | {
+                        readonly type: "file"
+                        readonly uri: string
+                        readonly mime: string
+                        readonly name?: string | null
+                      }
+                  >
+                  readonly attachments?: ReadonlyArray<{
+                    readonly uri: string
+                    readonly mime: string
+                    readonly name?: string
+                    readonly description?: string
+                    readonly source?: { readonly start: number; readonly end: number; readonly text: string }
+                  }>
+                  readonly outputPaths?: ReadonlyArray<string>
+                  readonly pruned?: number
+                }
                 readonly state:
                   | { readonly status: "streaming"; readonly input: string }
                   | {
@@ -4249,26 +4374,15 @@ export type SessionImportInput = {
                   | {
                       readonly status: "completed"
                       readonly input: { readonly [x: string]: JsonValue }
-                      readonly content: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                   | {
@@ -4289,26 +4403,15 @@ export type SessionImportInput = {
                             }
                         >
                       }
-                      readonly content?: readonly [
-                        (
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        ),
-                        ...Array<
-                          | { readonly type: "text"; readonly text: string }
-                          | {
-                              readonly type: "file"
-                              readonly uri: string
-                              readonly mime: string
-                              readonly name?: string | null
-                            }
-                        >,
-                      ]
+                      readonly content?: ReadonlyArray<
+                        | { readonly type: "text"; readonly text: string }
+                        | {
+                            readonly type: "file"
+                            readonly uri: string
+                            readonly mime: string
+                            readonly name?: string | null
+                          }
+                      >
                       readonly metadata?: { readonly [x: string]: JsonValue }
                     }
                 readonly time: { readonly created: number; readonly ran?: number; readonly completed?: number }
@@ -5945,6 +6048,7 @@ export type MessageListInput = {
       | "system"
       | "skill"
       | "shell"
+      | "shell-recorded"
       | "assistant"
       | "compaction"
       | undefined
@@ -5962,6 +6066,7 @@ export type MessageListInput = {
       | "system"
       | "skill"
       | "shell"
+      | "shell-recorded"
       | "assistant"
       | "compaction"
       | undefined
@@ -5979,6 +6084,7 @@ export type MessageListInput = {
       | "system"
       | "skill"
       | "shell"
+      | "shell-recorded"
       | "assistant"
       | "compaction"
       | undefined
@@ -5996,6 +6102,7 @@ export type MessageListInput = {
       | "system"
       | "skill"
       | "shell"
+      | "shell-recorded"
       | "assistant"
       | "compaction"
       | undefined

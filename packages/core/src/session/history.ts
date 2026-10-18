@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, or, sql } from "drizzle-orm"
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, ne, or, sql } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { AttachmentQuarantine } from "./attachment-quarantine.js"
@@ -10,7 +10,7 @@ import { SessionSchema } from "./schema.js"
 import { Instructions } from "../instructions/index.js"
 import { InstructionState } from "./instruction-state.js"
 import { SessionProviderContext } from "./provider-context.js"
-import { SessionMessagePartTable, SessionMessageTable } from "./sql.js"
+import { InstructionStateTable, SessionMessagePartTable, SessionMessageTable } from "./sql.js"
 
 type DatabaseService = Database.Interface["db"]
 
@@ -155,11 +155,22 @@ const messageEntries = Effect.fnUntraced(function* (
   boundary: Boundary,
 ) {
   const compaction = yield* latestCompaction(db, sessionID, boundary)
+  const imported = yield* db
+    .select({ epochStart: InstructionStateTable.epoch_start })
+    .from(InstructionStateTable)
+    .where(and(eq(InstructionStateTable.session_id, sessionID), isNotNull(InstructionStateTable.frozen_baseline)))
+    .get()
+    .pipe(Effect.orDie)
   const entries = yield* hydrateMessages({
     db,
     where: and(
       eq(SessionMessageTable.session_id, sessionID),
-      compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
+      imported
+        ? or(
+            and(eq(SessionMessageTable.type, "system"), gt(SessionMessageTable.seq, imported.epochStart)),
+            and(ne(SessionMessageTable.type, "system"), compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined),
+          )
+        : compaction ? gte(SessionMessageTable.seq, compaction.seq) : undefined,
     ),
     order: "asc",
   })
@@ -170,7 +181,7 @@ const messageEntries = Effect.fnUntraced(function* (
   // Skipped native checkpoints are not textual summaries. Their original transcript remains available.
   return entries.filter(
     (entry) =>
-      !(entry.message.type === "system" && native && entry.seq < native.seq) && replayable(entry.message, boundary),
+      !(entry.message.type === "system" && !imported && native && entry.seq < native.seq) && replayable(entry.message, boundary),
   )
 })
 

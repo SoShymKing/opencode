@@ -19,6 +19,7 @@ import { messagePrompt } from "./session.shared"
 import { createSubagentTracker, toolCommit, toolFinalPhase } from "./stream-v2.subagent"
 import { normalizeTool, toolOutputText } from "./tool"
 import { toolDisplayContent } from "../util/tool-display"
+import { recordedFileText, recordedShellText, recordedToolText } from "../util/recorded-history"
 import type {
   FooterApi,
   FooterPatch,
@@ -712,6 +713,23 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
   }
 
   const renderTool = (messageID: string, item: SessionMessageAssistantTool, render = true) => {
+    const recording = `${messageID}:recorded-tool:${item.id}`
+    if (state.messageIDs.has(recording)) return
+    if (item.recorded !== undefined) {
+      state.messageIDs.add(recording)
+      if (render && showTools())
+        write([
+          {
+            kind: "system",
+            source: "system",
+            text: recordedToolText(item),
+            phase: "start",
+            messageID,
+            partID: `recorded-tool:${item.id}`,
+          },
+        ])
+      return
+    }
     if (!showTools()) {
       rememberToolMessage(messageID)
       render = false
@@ -770,6 +788,22 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
       if (state.pending.delete(message.id)) syncPending()
       state.promotedMessages.add(message.id)
       renderUser(message.id, message.text, message.files, message.skills, render)
+      for (const [index, file] of (message.recordedFiles ?? []).entries()) {
+        const id = `${message.id}:recorded-file:${index}`
+        const visible = state.messageIDs.has(id)
+        state.messageIDs.add(id)
+        if (render && !visible)
+          write([
+            {
+              kind: "system",
+              source: "system",
+              text: recordedFileText(file),
+              phase: "start",
+              messageID: message.id,
+              partID: `recorded-file:${index}`,
+            },
+          ])
+      }
       return
     }
     if (message.type === "skill") {
@@ -780,6 +814,22 @@ export async function createSessionTransport(input: StreamInput): Promise<Sessio
       }
       state.skillMessages.add(message.id)
       write([skillCommit(message.id, message.name)])
+      return
+    }
+    if (message.type === "shell-recorded") {
+      const visible = state.messageIDs.has(message.id)
+      state.messageIDs.add(message.id)
+      if (render && !visible)
+        write([
+          {
+            kind: "system",
+            source: "system",
+            text: recordedShellText(message),
+            phase: "start",
+            messageID: message.id,
+            partID: "shell-recorded",
+          },
+        ])
       return
     }
     if (message.type === "shell") {

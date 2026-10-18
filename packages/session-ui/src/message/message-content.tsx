@@ -18,6 +18,7 @@ import { Markdown } from "../components/markdown"
 import { ImagePreview } from "@opencode/ui/image-preview"
 import { getFilename } from "@opencode/util/path"
 import { AttachmentCard } from "./attachment-card"
+import { RecordedFiles } from "./recorded-files"
 import { CommentCard } from "./comment-card"
 import { TimelineSeparator } from "../components/timeline-separator"
 import { Tooltip } from "@opencode/ui/tooltip"
@@ -328,8 +329,9 @@ export function CurrentUserMessageDisplay(props: {
   }
 
   const renderAttachments = () => (
-    <Show when={attachments().length > 0 || references().length > 0}>
+    <Show when={attachments().length > 0 || references().length > 0 || props.message.recordedFiles?.length}>
       <div data-slot="user-message-attachments">
+        <RecordedFiles files={props.message.recordedFiles} />
         <For each={references()}>
           {(file) => (
             <AttachmentCard title={file.name} hover={file.path}>

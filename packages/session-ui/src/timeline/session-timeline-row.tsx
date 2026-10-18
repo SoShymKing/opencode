@@ -18,6 +18,7 @@ import {
   SessionFileToolGroup,
   SessionReadToolGroup,
   SessionShellMessage,
+  SessionRecordedShellMessage,
   SessionUserMessage,
   currentContentDefaultOpen,
 } from "../message/current-message"
@@ -209,7 +210,7 @@ export function createSessionTimelineRowRenderer(input: {
 
           if (ref.messageID !== ref.partID || !message) return []
 
-          if (message.type === "shell")
+          if (message.type === "shell" || message.type === "shell-recorded")
             return [{ type: "shell", id: ref.partID, render: () => <Shell messageID={ref.messageID} grouped /> }]
 
           if (message.type !== "assistant" && message.type !== "user")
@@ -683,7 +684,19 @@ export function createSessionTimelineRowRenderer(input: {
     const message = createMemo(() => {
       const value = input.projection.messageByID().get(props.messageID)
 
+      return value?.type === "shell" || value?.type === "shell-recorded" ? value : undefined
+    })
+
+    const native = createMemo(() => {
+      const value = message()
+
       return value?.type === "shell" ? value : undefined
+    })
+
+    const recorded = createMemo(() => {
+      const value = message()
+
+      return value?.type === "shell-recorded" ? value : undefined
     })
 
     const defaultOpen = createMemo(() => {
@@ -693,7 +706,8 @@ export function createSessionTimelineRowRenderer(input: {
       return (
         input.timelineDetail().shell.details === "expanded" ||
         (input.timelineDetail().shell.placement === "hidden" &&
-          (value?.status === "timeout" || (value?.status === "exited" && value.exit !== undefined && value.exit !== 0)))
+          value?.type === "shell" &&
+          (value.status === "timeout" || (value.status === "exited" && value.exit !== undefined && value.exit !== 0)))
       )
     })
 
@@ -701,12 +715,30 @@ export function createSessionTimelineRowRenderer(input: {
       <Show when={message()}>
         {(message) => (
           <div data-slot="session-turn-message-container" class={`w-full ${props.grouped ? "" : padding()}`}>
-            <SessionShellMessage
-              message={message()}
-              defaultOpen={defaultOpen()}
-              open={input.disclosure.value(message().id) ?? (input.timelineDetail ? defaultOpen() : undefined)}
-              onOpenChange={(open) => input.disclosure.set(message().id, open)}
-            />
+            <Show
+              when={recorded()}
+              fallback={
+                <Show when={native()}>
+                  {(native) => (
+                    <SessionShellMessage
+                      message={native()}
+                      defaultOpen={defaultOpen()}
+                      open={input.disclosure.value(native().id) ?? (input.timelineDetail ? defaultOpen() : undefined)}
+                      onOpenChange={(open) => input.disclosure.set(native().id, open)}
+                    />
+                  )}
+                </Show>
+              }
+            >
+              {(recorded) => (
+                <SessionRecordedShellMessage
+                  message={recorded()}
+                  defaultOpen={defaultOpen()}
+                  open={input.disclosure.value(message().id) ?? (input.timelineDetail ? defaultOpen() : undefined)}
+                  onOpenChange={(open) => input.disclosure.set(message().id, open)}
+                />
+              )}
+            </Show>
           </div>
         )}
       </Show>

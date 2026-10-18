@@ -15,8 +15,8 @@ import path from "node:path"
 import type { Database as SQLiteDatabase } from "bun:sqlite"
 import { Project } from "@opencode/schema/project"
 import { DatabaseMigration } from "./migration.js"
-import { DatabaseLineage } from "./lineage.js"
 import { normalizeMessages } from "./native-message-parts.js"
+import { WsNativeProfile } from "./ws-native-profile.js"
 
 export type SourceMessage = {
   readonly id: string
@@ -496,10 +496,10 @@ export function transformSession(input: TransformInput): TransformResult {
 export function status(): Effect.Effect<Status, never, Database.Service> {
   return Effect.gen(function* () {
     const db = (yield* Database.Service).db
-    if (!(yield* hasLegacySessions(db))) return { status: "completed" as const }
-    const state = yield* readState(db)
     if (runtimeState.status === "running") return runtimeState
     if (runtimeState.status === "error") return runtimeState
+    if (!(yield* hasLegacySessions(db))) return { status: "completed" as const }
+    const state = yield* readState(db)
     if (state?.phase === "completed") return { status: "completed" as const }
     return { status: "required" as const }
   })
@@ -540,10 +540,18 @@ export function run(options: Options = {}): Effect.Effect<RunResult, never, Data
       const db = (yield* Database.Service).db
       const global = yield* Global.Service
       yield* DatabaseMigration.preflight(db)
-      yield* countNextSessions(nextPath(options, global.data))
+      const profile = yield* WsNativeProfile.run(db, nextPath(options, global.data))
+      const sourcePath = profile ? undefined : nextPath(options, global.data)
+      yield* countNextSessions(sourcePath)
       const state = yield* readState(db)
       if (state?.phase === "completed") return { status: "completed" as const }
       if (!(yield* hasLegacySessions(db))) return { status: "completed" as const }
+      const roots = yield* db.get(sql`SELECT name FROM sqlite_schema WHERE name = '_ws_import_root'`)
+      const protectedIDs = sql`SELECT aggregate_id FROM event_sequence WHERE owner_id IS NOT NULL
+        AND (aggregate_id IN (SELECT id FROM session_v2) OR aggregate_id NOT IN (SELECT id FROM session))
+        ${roots ? sql`UNION SELECT aggregate_id FROM _ws_import_root` : sql``}`
+      const unprotected = sql`aggregate_id NOT IN (${protectedIDs})`
+      const legacy = sql`id NOT IN (${protectedIDs})`
       const now = Date.now()
       yield* db.run(sql`
           INSERT OR IGNORE INTO project (id, worktree, time_created, time_updated, time_active, sandboxes)
@@ -556,7 +564,12 @@ export function run(options: Options = {}): Effect.Effect<RunResult, never, Data
               while (true) {
                 yield* tx.run(sql`
                     DELETE FROM event
-                    WHERE rowid IN (SELECT rowid FROM event LIMIT ${EVENT_DELETE_BATCH_SIZE})
+                    WHERE rowid IN (
+                      SELECT rowid FROM event WHERE ${unprotected} AND (
+                        aggregate_id IN (SELECT id FROM session)
+                        OR aggregate_id NOT IN (SELECT id FROM session_v2)
+                      ) LIMIT ${EVENT_DELETE_BATCH_SIZE}
+                    )
                   `)
                 const deleted = (yield* tx.get<{ value: number }>(sql`SELECT changes() AS value`))?.value ?? 0
                 if (deleted < EVENT_DELETE_BATCH_SIZE) break
@@ -569,7 +582,7 @@ export function run(options: Options = {}): Effect.Effect<RunResult, never, Data
             }),
           )
           .pipe(Effect.orDie)
-      const sourceTotal = yield* countNextSessions(nextPath(options, global.data))
+      const sourceTotal = yield* countNextSessions(sourcePath)
       const legacyTotal = (yield* db.get<{ value: number }>(sql`SELECT COUNT(*) AS value FROM session`))?.value ?? 0
       const cursor = state?.phase === "sessions" ? state.cursor : undefined
       const migrated =
@@ -579,7 +592,7 @@ export function run(options: Options = {}): Effect.Effect<RunResult, never, Data
           : 0
       const denominator = sourceTotal + legacyTotal
       updateProgress({ label: "Migrating sessions", numerator: migrated, denominator })
-      yield* importNextDatabase(db, nextPath(options, global.data), (completed) => {
+      yield* importNextDatabase(db, sourcePath, (completed) => {
         updateProgress({ label: "Migrating sessions", numerator: migrated + completed, denominator })
       })
       updateProgress({ label: "Migrating sessions", numerator: migrated + sourceTotal, denominator })
@@ -591,8 +604,8 @@ export function run(options: Options = {}): Effect.Effect<RunResult, never, Data
         const cursorValue = state?.phase === "sessions" ? state.cursor : undefined
         const nextID = yield* db.get<{ id: string; project_id: string }>(
           cursorValue === undefined
-            ? sql`SELECT id, project_id FROM session ORDER BY id DESC LIMIT 1`
-            : sql`SELECT id, project_id FROM session WHERE id < ${cursorValue} ORDER BY id DESC LIMIT 1`,
+            ? sql`SELECT id, project_id FROM session WHERE ${legacy} ORDER BY id DESC LIMIT 1`
+            : sql`SELECT id, project_id FROM session WHERE ${legacy} AND id < ${cursorValue} ORDER BY id DESC LIMIT 1`,
         )
         if (!nextID) break
         yield* db
@@ -850,35 +863,6 @@ function isNextDatabase(source: SQLiteDatabase) {
       .all()
       .map((table) => table.name),
   )
-  if (tables.has("session") && tables.has("session_message")) {
-    const history = new Set(tables.has("migration")
-      ? source.query<{ id: string }, []>("SELECT id FROM migration").all().map((row) => row.id)
-      : [])
-    const known = new Set([...DatabaseMigration.currentMigrationIDs, DatabaseLineage.legacySessionMetadataAlias,
-      DatabaseLineage.legacyPartMigrationID, "v01_baseline", "v02_session_message_part", "20260730195856_optional_session_title"])
-    if (tables.has("__drizzle_migrations")) {
-      const columns = new Set(source.query<{ name: string }, []>("SELECT name FROM pragma_table_info('__drizzle_migrations')").all().map((row) => row.name))
-      if (columns.has("name"))
-        source.query<{ id: string }, []>("SELECT name AS id FROM __drizzle_migrations WHERE name IS NOT NULL").all().forEach((row) => history.add(row.id))
-      if (columns.has("created_at")) {
-        for (const row of source.query<{ created_at: number; prefix: string | null }, []>(
-          "SELECT created_at, strftime('%Y%m%d%H%M%S', created_at / 1000, 'unixepoch') AS prefix FROM __drizzle_migrations WHERE created_at IS NOT NULL",
-        ).all()) {
-          const matches = [...known].filter((id) => id.startsWith(`${row.prefix}_`))
-          if (!Number.isSafeInteger(row.created_at) || row.created_at % 1000 !== 0 || matches.length !== 1)
-            throw new DatabaseLineage.UnsafeMigrationHistoryError([...history], `unknown source timestamp ${row.created_at}`)
-          history.add(matches[0])
-        }
-      }
-      if (!columns.has("name") && !columns.has("created_at"))
-        throw new DatabaseLineage.UnsafeMigrationHistoryError([...history], "unreadable source Drizzle ledger")
-    }
-    if ([...history].some((id) => !known.has(id)))
-      throw new DatabaseLineage.UnsafeMigrationHistoryError([...history])
-    if (!history.has("20260730195856_optional_session_title") || !tables.has("instruction_state") ||
-      history.has("v01_baseline") || history.has("v02_session_message_part") || history.has(DatabaseLineage.legacyPartMigrationID))
-      throw new DatabaseLineage.WsUpgradeRequiredError([...history], false)
-  }
   return tables.has("project") && tables.has("session") && tables.has("session_message")
 }
 

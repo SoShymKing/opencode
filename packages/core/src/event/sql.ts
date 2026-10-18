@@ -1,6 +1,18 @@
 import { sqliteTable, text, integer, index, uniqueIndex } from "drizzle-orm/sqlite-core"
 import { Event } from "@opencode/schema/event"
 
+export const WsArchiveTable = sqliteTable("_ws_archive", {
+  id: text().primaryKey().notNull(),
+  manifest: text().notNull(),
+})
+
+export const WsImportRootTable = sqliteTable("_ws_import_root", {
+  aggregate_id: text().primaryKey().notNull(),
+  archive_id: text().notNull().references(() => WsArchiveTable.id),
+  through_seq: integer().notNull(),
+  codec_version: integer().notNull(),
+})
+
 export const EventSequenceTable = sqliteTable("event_sequence", {
   aggregate_id: text().notNull().primaryKey(),
   seq: integer().notNull(),

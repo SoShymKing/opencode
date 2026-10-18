@@ -344,7 +344,7 @@ const layer = Layer.effect(
         const inherited = yield* db
           .transaction(() =>
             Effect.all({
-              instructions: InstructionState.current(db, parent.id),
+              instructions: InstructionState.captureFork(db, parent.id),
               instructionEntries: InstructionEntry.snapshot(db, parent.id),
             }),
           )
@@ -356,7 +356,8 @@ const layer = Layer.effect(
           sessionID,
           parentID: parent.id,
           boundary: { type: input.before ? "before" : "through", messageID: boundary.id },
-          ...inherited,
+          ...inherited.instructions,
+          instructionEntries: inherited.instructionEntries,
         })
         return yield* result.get(sessionID).pipe(Effect.orDie)
       }),

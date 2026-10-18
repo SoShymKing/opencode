@@ -209,6 +209,27 @@ export function configured(options?: Options) {
         const isSessionEvent = (event: Event.Payload): event is SessionEvent.Event =>
           Object.hasOwn(SessionEvent.All.cases, event.type)
 
+        const imported = Effect.fnUntraced(function* (aggregateID: string, event?: Event.Payload) {
+          const archive = yield* db.get<{ name: string }>(
+            sql`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = '_ws_import_root'`,
+          ).pipe(Effect.orDie)
+          if (!archive) return false
+          const parent = event && isSessionEvent(event)
+            ? event.type === "session.forked" || event.type === "session.created" ? event.data.parentID : undefined
+            : undefined
+          const root = yield* db.get<{ aggregate_id: string }>(sql`
+            WITH RECURSIVE ancestors(id) AS (
+              SELECT ${aggregateID} UNION SELECT ${parent ?? aggregateID}
+              UNION SELECT ${SessionTable.parent_id} FROM ${SessionTable} JOIN ancestors ON ${SessionTable.id} = ancestors.id
+              UNION SELECT ${SessionTable.fork_session_id} FROM ${SessionTable} JOIN ancestors ON ${SessionTable.id} = ancestors.id
+              UNION SELECT json_extract(${EventTable.data}, '$.parentID') FROM ${EventTable}
+                JOIN ancestors ON ${EventTable.aggregate_id} = ancestors.id
+                WHERE ${EventTable.type} IN ('session.created.1', 'session.forked.2')
+            ) SELECT aggregate_id FROM _ws_import_root JOIN ancestors ON aggregate_id = ancestors.id LIMIT 1
+          `).pipe(Effect.orDie)
+          return root !== undefined
+        })
+
         const prepareRoutes = Effect.fnUntraced(function* (events: readonly Event.Payload[]) {
           const updates = new Map<SessionID, Location.Ref | undefined>()
           const resolved = new Map<Event.Payload, readonly Location.Ref[]>()
@@ -325,6 +346,7 @@ export function configured(options?: Options) {
                           .get()
                           .pipe(Effect.orDie)
                         const latest = row?.seq ?? -1
+                        const retain = persist || (yield* imported(aggregateID, event))
                         const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<string, unknown>
                         if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
                           yield* Effect.die(
@@ -335,7 +357,7 @@ export function configured(options?: Options) {
                           )
                         }
                         if (input && input.seq <= latest) {
-                          if (!persist) return
+                          if (!retain) return
                           const stored = yield* db
                             .select()
                             .from(EventTable)
@@ -377,7 +399,7 @@ export function configured(options?: Options) {
                             }),
                           )
                         }
-                        if (persist) {
+                        if (retain) {
                           const stored = yield* db
                             .select({ aggregateID: EventTable.aggregate_id, seq: EventTable.seq })
                             .from(EventTable)
@@ -413,7 +435,7 @@ export function configured(options?: Options) {
                           })
                           .run()
                           .pipe(Effect.orDie)
-                        if (persist)
+                        if (retain)
                           yield* db
                             .insert(EventTable)
                             .values([
@@ -586,6 +608,7 @@ export function configured(options?: Options) {
                             .get()
                             .pipe(Effect.orDie)
                           const firstSeq = (row?.seq ?? -1) + 1
+                          const retain = persist || (yield* imported(aggregateID, payloads[0].event))
                           const finalSeq = firstSeq + payloads.length - 1
                           const queued = payloads.map((item, index) => ({
                             ...item.event,
@@ -600,7 +623,7 @@ export function configured(options?: Options) {
                               string,
                               unknown
                             >
-                            if (persist) {
+                            if (retain) {
                               if (ids.has(item.event.id))
                                 yield* Effect.die(
                                   new InvalidDurableEventError({
@@ -630,7 +653,7 @@ export function configured(options?: Options) {
                               yield* projector(event)
                             }
                             if (item.commit) yield* item.commit(seq)
-                            if (persist)
+                            if (retain)
                               rows.push({
                                 id: event.id,
                                 aggregate_id: aggregateID,
@@ -646,7 +669,7 @@ export function configured(options?: Options) {
                             .onConflictDoUpdate({ target: EventSequenceTable.aggregate_id, set: { seq: finalSeq } })
                             .run()
                             .pipe(Effect.orDie)
-                          if (persist) yield* db.insert(EventTable).values(rows).run().pipe(Effect.orDie)
+                          if (retain) yield* db.insert(EventTable).values(rows).run().pipe(Effect.orDie)
                           return { events: queued, route }
                         }),
                       { behavior: "immediate" },
@@ -704,6 +727,7 @@ export function configured(options?: Options) {
           return db
             .transaction(() =>
               Effect.gen(function* () {
+                if (yield* imported(aggregateID)) return
                 yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
                 yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
               }),

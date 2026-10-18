@@ -31,10 +31,19 @@ const ReplacementBase = {
   version: Schema.Literal(1),
   staged: Artifact,
 }
+const NativeReplacementBase = {
+  format: ReplacementBase.format,
+  version: Schema.Literal(2),
+  stageFormat: Schema.Literal("native"),
+  staged: Artifact,
+  targetPreimage: Schema.NullOr(Schema.Struct({ sha256: Manifest.fields.sha256, bytes: Manifest.fields.bytes })),
+}
 export const PendingReplacement = Schema.Union([
   Schema.Struct({ ...ReplacementBase, phase: Schema.Literal("prepared") }),
   Schema.Struct({ ...ReplacementBase, phase: Schema.Literal("backup_ready"), backup: Schema.optional(Artifact) }),
-]).pipe(Schema.toTaggedUnion("phase"))
+  Schema.Struct({ ...NativeReplacementBase, phase: Schema.Literal("prepared") }),
+  Schema.Struct({ ...NativeReplacementBase, phase: Schema.Literal("backup_ready"), backup: Schema.optional(Artifact) }),
+])
 export type PendingReplacement = Schema.Schema.Type<typeof PendingReplacement>
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
@@ -151,13 +160,14 @@ export function snapshotCurrentFile(source: string, destination: string) {
   return useDatabase(source, false, (db) =>
     Effect.gen(function* () {
       yield* validateCurrent(db)
-      yield* db.run("PRAGMA wal_checkpoint(TRUNCATE)")
+      const checkpoint = yield* db.all<{ busy: number }>("PRAGMA wal_checkpoint(TRUNCATE)")
+      if (checkpoint.length !== 1 || checkpoint[0]?.busy !== 0) return yield* failure("database checkpoint is busy")
       yield* DatabaseArtifact.snapshot(db, destination)
     }),
   ).pipe(Effect.andThen(requireNoSidecars(source)))
 }
 
-function useDatabase<A, E, R>(
+export function useDatabase<A, E, R>(
   filename: string,
   readonly: boolean,
   use: (db: Effect.Success<typeof makeDatabase>) => Effect.Effect<A, E, R>,

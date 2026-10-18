@@ -1,8 +1,8 @@
 import { Effect } from "effect"
 import type { DatabaseMigration } from "./migration.js"
 
-const schema: Omit<DatabaseMigration.Migration, "id"> = {
-  up(tx) {
+const schema = {
+  up(tx: Parameters<DatabaseMigration.Migration["up"]>[0]) {
     return Effect.gen(function* () {
       yield* tx.run(`
         CREATE TABLE \`account_state\` (
@@ -66,6 +66,21 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`type\` text NOT NULL,
           \`data\` text NOT NULL,
           CONSTRAINT \`fk_event_aggregate_id_event_sequence_aggregate_id_fk\` FOREIGN KEY (\`aggregate_id\`) REFERENCES \`event_sequence\`(\`aggregate_id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`_ws_archive\` (
+          \`id\` text PRIMARY KEY,
+          \`manifest\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`_ws_import_root\` (
+          \`aggregate_id\` text PRIMARY KEY,
+          \`archive_id\` text NOT NULL,
+          \`through_seq\` integer NOT NULL,
+          \`codec_version\` integer NOT NULL,
+          CONSTRAINT \`fk__ws_import_root_archive_id__ws_archive_id_fk\` FOREIGN KEY (\`archive_id\`) REFERENCES \`_ws_archive\`(\`id\`)
         );
       `)
       yield* tx.run(`
@@ -141,6 +156,8 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
           \`through_seq\` integer NOT NULL,
           \`initial_values\` text NOT NULL,
           \`current_values\` text NOT NULL,
+          \`frozen_baseline\` text,
+          \`imported_removals\` text,
           CONSTRAINT \`fk_instruction_state_session_id_session_v2_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session_v2\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -293,6 +310,6 @@ const schema: Omit<DatabaseMigration.Migration, "id"> = {
       )
     })
   },
-}
+} satisfies Omit<DatabaseMigration.Migration, "id">
 
 export default schema

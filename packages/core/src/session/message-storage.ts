@@ -23,7 +23,7 @@ type ChildRow = {
 }
 
 type HydrateInput = {
-  readonly db: Database.Interface["db"]
+  readonly db: Pick<Database.Interface["db"], "transaction">
   readonly where?: SQL
   readonly order?: "asc" | "desc"
   readonly limit?: number

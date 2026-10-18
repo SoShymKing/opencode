@@ -9,7 +9,40 @@ import { SessionEvent } from "./event.js"
 import { SessionSchema } from "./schema.js"
 import { InstructionBlobTable, InstructionStateTable } from "./sql.js"
 
-type DatabaseService = Database.Interface["db"]
+type DatabaseService = Pick<Database.Interface["db"], "select" | "insert" | "update" | "delete" | "transaction">
+
+export const importWS = Effect.fn("InstructionState.importWS")(function* (
+  db: DatabaseService,
+  input: {
+    readonly sessionID: SessionSchema.ID
+    readonly baseline: string
+    readonly baselineSeq: number
+    readonly snapshot: Readonly<Record<string, { readonly value: Schema.Json; readonly removed?: string }>>
+    readonly throughSeq: number
+  },
+) {
+  const entries = Object.entries(input.snapshot)
+  const admission = yield* Instructions.diff(
+    entries.map(([key, entry]) => ({ key: Instructions.Key.make(key), value: entry.value })),
+  )
+  yield* db.transaction(() => Effect.gen(function* () {
+    yield* insertBlobs(db, admission.blobs)
+    yield* db.insert(InstructionStateTable)
+      .values({
+        session_id: input.sessionID,
+        epoch_start: input.baselineSeq,
+        through_seq: input.throughSeq,
+        frozen_baseline: input.baseline,
+        initial_values: {},
+        current_values: Instructions.applyHashDelta({}, admission.delta),
+        imported_removals: Object.fromEntries(
+          entries.flatMap(([key, entry]) => entry.removed === undefined ? [] : [[key, entry.removed]]),
+        ),
+      })
+      .run()
+      .pipe(Effect.orDie)
+  })).pipe(Effect.orDie)
+})
 
 export interface Observation extends Instructions.Admission {
   readonly sessionID: SessionSchema.ID
@@ -26,7 +59,7 @@ export const observe = Effect.fn("InstructionState.observe")(function* (
   const [observed, stored] = yield* Effect.all([Instructions.read(instructions), find(db, sessionID)], {
     concurrency: "unbounded",
   })
-  const result = yield* observeAgainst(observed, stored?.current_values)
+  const result = yield* observeAgainst(withImportedRemovals(observed, stored), stored?.current_values)
   return {
     sessionID,
     initial: !stored,
@@ -74,7 +107,8 @@ const renderUpdateText = Effect.fnUntraced(function* (
   const admitted = new Map(
     Object.entries(observation.blobs).map(([hash, value]) => [Instructions.Hash.make(hash), value]),
   )
-  return Instructions.renderUpdate(instructions, previous, dereferenceDelta(observation.delta, admitted))
+  const state = yield* find(db, observation.sessionID)
+  return renderUpdate(instructions, previous, dereferenceDelta(observation.delta, admitted), state)
 })
 
 export const prepare = Effect.fn("InstructionState.prepare")(function* (
@@ -110,7 +144,13 @@ export const apply = Effect.fn("InstructionState.apply")(function* (
   }
   yield* db
     .update(InstructionStateTable)
-    .set({ through_seq: seq, current_values: current })
+    .set({
+      through_seq: seq,
+      current_values: current,
+      imported_removals: stored.imported_removals === null ? null : Object.fromEntries(
+        Object.entries(stored.imported_removals).filter(([key]) => !Object.hasOwn(delta, key)),
+      ),
+    })
     .where(eq(InstructionStateTable.session_id, sessionID))
     .run()
     .pipe(Effect.orDie)
@@ -147,6 +187,7 @@ export const advanceEpoch = Effect.fn("InstructionState.advanceEpoch")(function*
       epoch_start: epochStart,
       through_seq: epochStart,
       initial_values: sql`${InstructionStateTable.current_values}`,
+      frozen_baseline: null,
     })
     .where(eq(InstructionStateTable.session_id, sessionID))
     .run()
@@ -169,6 +210,7 @@ export const initial = Effect.fn("InstructionState.initial")(function* (
 ) {
   const state = yield* find(db, sessionID)
   if (!state) return yield* Effect.die(new Error(`Instruction state not found during assembly: ${sessionID}`))
+  if (state.frozen_baseline !== null) return state.frozen_baseline
   const blobs = yield* loadBlobs(db, Object.values(state.initial_values))
   return Instructions.renderInitial(instructions, dereference(state.initial_values, blobs))
 })
@@ -181,6 +223,17 @@ export const current = Effect.fn("InstructionState.current")(function* (
   return (yield* find(db, sessionID))?.current_values
 })
 
+export const captureFork = Effect.fn("InstructionState.captureFork")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+) {
+  const state = yield* find(db, sessionID)
+  return {
+    instructions: state?.current_values,
+    ...(state && state.frozen_baseline !== null ? { instructionSourceSeq: state.through_seq } : {}),
+  }
+})
+
 export const preview = Effect.fn("InstructionState.preview")(function* (
   db: DatabaseService,
   sessionID: SessionSchema.ID,
@@ -188,7 +241,7 @@ export const preview = Effect.fn("InstructionState.preview")(function* (
   observed: Instructions.ReadResult,
 ) {
   const state = yield* find(db, sessionID)
-  const result = yield* observeAgainst(observed, state?.current_values)
+  const result = yield* observeAgainst(withImportedRemovals(observed, state), state?.current_values)
   const observedBlobs = new Map<Instructions.Hash, Schema.Json>(
     Object.entries(result.blobs).map(([hash, value]) => [Instructions.Hash.make(hash), value]),
   )
@@ -198,14 +251,44 @@ export const preview = Effect.fn("InstructionState.preview")(function* (
   }
   const stored = yield* loadBlobs(db, [...Object.values(state.initial_values), ...Object.values(state.current_values)])
   return {
-    initial: Instructions.renderInitial(instructions, dereference(state.initial_values, stored)),
-    update: Instructions.renderUpdate(
+    initial: state.frozen_baseline ?? Instructions.renderInitial(instructions, dereference(state.initial_values, stored)),
+    update: renderUpdate(
       instructions,
       dereference(state.current_values, stored),
       dereferenceDelta(result.delta, observedBlobs),
+      state,
     ),
   }
 })
+
+function withImportedRemovals(
+  observed: Instructions.ReadResult,
+  state: typeof InstructionStateTable.$inferSelect | undefined,
+): Instructions.ReadResult {
+  const keys = new Set(observed.map((entry) => entry.key))
+  return [
+    ...observed,
+    ...Object.keys(state?.imported_removals ?? {}).sort().flatMap((key) =>
+      keys.has(Instructions.Key.make(key)) ? [] : [{ key: Instructions.Key.make(key), value: Instructions.removed }],
+    ),
+  ]
+}
+
+function renderUpdate(
+  instructions: Instructions.List,
+  previous: Readonly<Record<string, Schema.Json>>,
+  delta: Readonly<Record<string, Option.Option<Schema.Json>>>,
+  state: typeof InstructionStateTable.$inferSelect | undefined,
+) {
+  const sources = new Map(instructions.map((source) => [source.key, source]))
+  const removed = Object.keys(state?.imported_removals ?? {}).sort().flatMap((key) => {
+      const change = delta[key]
+      if (!change || Option.isSome(change) || !Object.hasOwn(previous, key)) return []
+      const text = state?.imported_removals?.[key]
+      return text !== undefined && sources.get(Instructions.Key.make(key))?.removed(previous[key]) === undefined ? [text] : []
+    })
+  return [Instructions.renderUpdate(instructions, previous, delta), ...removed].filter((text) => text.length > 0).join("\n\n")
+}
 
 const observeAgainst = Effect.fnUntraced(function* (observed: Instructions.ReadResult, previous?: Instructions.Values) {
   const admission = yield* Instructions.diff(observed, previous)

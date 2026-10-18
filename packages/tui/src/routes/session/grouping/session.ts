@@ -1,4 +1,4 @@
-import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode/client"
+import type { SessionMessageAssistant, SessionMessageAssistantTool, SessionMessageInfo } from "@opencode/client"
 import { groupEntries, mergeGroups, splitGroups, type GroupNode } from "./tree"
 
 export type PartRef = {
@@ -36,7 +36,7 @@ export type SessionRow = SessionEntry | SessionGroup
 export type AppendPart =
   | { type: "text" }
   | { type: "reasoning"; time?: { completed?: number } }
-  | { type: "tool"; name: string }
+  | Pick<SessionMessageAssistantTool, "type" | "name" | "recorded">
 
 export type ProjectionEntry = {
   entry: SessionEntry
@@ -83,6 +83,7 @@ const explorationTools = new Set(["read", "glob", "grep", "webfetch", "websearch
  * Questions always stand alone.
  */
 export function partPath(part: AppendPart, verbosity: Verbosity): readonly GroupKind[] {
+  if (part.type === "tool" && part.recorded !== undefined) return []
   if (part.type === "tool" && part.name.toLowerCase() === "question") return []
   const activity: GroupKind[] = verbosity === "low" && part.type !== "text" ? ["activity"] : []
   if (part.type === "reasoning") return [...activity, "reasoning"]

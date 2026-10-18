@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "4d6fd2ee-e335-45cb-859d-ffac5c42edf1",
-  "prevIds": ["00000000-0000-0000-0000-000000000000"],
+  "id": "92db47c8-7f46-4874-add1-2b9af0741d7f",
+  "prevIds": ["4d6fd2ee-e335-45cb-859d-ffac5c42edf1"],
   "ddl": [
     {
       "name": "account_state",
@@ -26,6 +26,14 @@
     },
     {
       "name": "event",
+      "entityType": "tables"
+    },
+    {
+      "name": "_ws_archive",
+      "entityType": "tables"
+    },
+    {
+      "name": "_ws_import_root",
       "entityType": "tables"
     },
     {
@@ -460,6 +468,66 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "_ws_archive"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "manifest",
+      "entityType": "columns",
+      "table": "_ws_archive"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "aggregate_id",
+      "entityType": "columns",
+      "table": "_ws_import_root"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "archive_id",
+      "entityType": "columns",
+      "table": "_ws_import_root"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "through_seq",
+      "entityType": "columns",
+      "table": "_ws_import_root"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "codec_version",
+      "entityType": "columns",
+      "table": "_ws_import_root"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "key",
       "entityType": "columns",
       "table": "kv"
@@ -871,6 +939,26 @@
       "default": null,
       "generated": null,
       "name": "current_values",
+      "entityType": "columns",
+      "table": "instruction_state"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "frozen_baseline",
+      "entityType": "columns",
+      "table": "instruction_state"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "imported_removals",
       "entityType": "columns",
       "table": "instruction_state"
     },
@@ -1607,6 +1695,17 @@
       "table": "event"
     },
     {
+      "columns": ["archive_id"],
+      "tableTo": "_ws_archive",
+      "columnsTo": ["id"],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk__ws_import_root_archive_id__ws_archive_id_fk",
+      "entityType": "fks",
+      "table": "_ws_import_root"
+    },
+    {
       "columns": ["project_id"],
       "tableTo": "project",
       "columnsTo": ["id"],
@@ -1784,6 +1883,20 @@
       "nameExplicit": false,
       "name": "event_pk",
       "table": "event",
+      "entityType": "pks"
+    },
+    {
+      "columns": ["id"],
+      "nameExplicit": false,
+      "name": "_ws_archive_pk",
+      "table": "_ws_archive",
+      "entityType": "pks"
+    },
+    {
+      "columns": ["aggregate_id"],
+      "nameExplicit": false,
+      "name": "_ws_import_root_pk",
+      "table": "_ws_import_root",
       "entityType": "pks"
     },
     {

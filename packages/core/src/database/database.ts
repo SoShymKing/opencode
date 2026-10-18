@@ -2,8 +2,8 @@ export * as Database from "./database.js"
 
 import { EffectDrizzleSqlite } from "./drizzle.js"
 import { sqliteLayer, supportsForeignKeyToggle, supportsTuningPragmas } from "#sqlite"
-import { Context, Effect, Layer, Schema, Semaphore } from "effect"
-import type { SqlClient } from "effect/sql"
+import { Context, Effect, Layer, Schedule, Schema, Semaphore } from "effect"
+import { SqlClient } from "effect/sql"
 import { Global } from "@opencode/util/global"
 import { closeSync, existsSync, openSync } from "node:fs"
 import { chmod } from "node:fs/promises"
@@ -37,17 +37,21 @@ const databaseLayer = (lock: Effect.Effect<Semaphore.Semaphore>, filename = ":me
       const db = yield* makeDatabase
       const semaphore = yield* lock
       yield* semaphore.withPermit(Effect.gen(function* () {
-      yield* DatabaseMigration.preflight(db)
-      if (supportsTuningPragmas) {
-        yield* db.run("PRAGMA synchronous = NORMAL")
-        yield* db.run("PRAGMA busy_timeout = 5000")
-        yield* db.run("PRAGMA cache_size = -64000")
-        yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
-      }
-      // Durable Object SQLite always enforces foreign keys and rejects the pragma.
-      if (supportsForeignKeyToggle) yield* db.run("PRAGMA foreign_keys = ON")
-      yield* DatabaseMigration.apply(db, filename)
-      if (supportsTuningPragmas) yield* db.run("PRAGMA journal_mode = WAL")
+        if (filename !== ":memory:") yield* DatabaseMigration.preflight(db)
+        if (supportsForeignKeyToggle) yield* db.run("PRAGMA foreign_keys = ON")
+        if (filename === ":memory:") yield* DatabaseMigration.apply(db, filename)
+        if (supportsTuningPragmas) {
+          yield* db.run("PRAGMA synchronous = NORMAL")
+          yield* db.run("PRAGMA busy_timeout = 5000")
+          yield* db.run("PRAGMA cache_size = -64000")
+          yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+          const client = yield* SqlClient.SqlClient
+          yield* client.unsafe("PRAGMA journal_mode = WAL").pipe(Effect.retry({
+            while: (error) => error.reason._tag === "LockTimeoutError",
+            schedule: Schedule.exponential("10 millis").pipe(Schedule.upTo({ duration: "5 seconds" })),
+          }))
+        }
+        if (filename !== ":memory:") yield* DatabaseMigration.apply(db, filename)
       }))
 
       return { db }
@@ -74,13 +78,15 @@ export function layer(options: Options = { path: ":memory:" }) {
           Layer.provide(sqliteLayer({ filename })),
         )
       const filename = options.path ?? ":memory:"
-      if (filename === ":memory:") return provide(filename)
+      if (filename === ":memory:" || !supportsTuningPragmas) return provide(filename)
       const file = isAbsolute(filename) ? filename : join((yield* Global.Service).data, filename)
       const { DatabaseLease } = yield* Effect.promise(() => import("./lease.js"))
       const { DatabaseReplacement } = yield* Effect.promise(() => import("./replacement.js"))
+      const { WsNativeFile } = yield* Effect.promise(() => import("./ws-native-file.js"))
+      yield* WsNativeFile.admit(file).pipe(Effect.orDie)
       yield* DatabaseLease.shared(file).pipe(Effect.orDie)
       if (yield* DatabaseReplacement.pending(file).pipe(Effect.orDie))
-        return yield* Effect.die(new DatabaseMigration.WsUpgradeRequiredError([], false))
+        return yield* Effect.die(new DatabaseMigration.UnsafeMigrationHistoryError([], "replacement appeared during startup; reopen the database"))
       yield* Effect.promise(() => restrictToOwner(file))
       return provide(file)
     }),

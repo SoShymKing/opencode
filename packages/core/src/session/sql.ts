@@ -197,4 +197,6 @@ export const InstructionStateTable = sqliteTable("instruction_state", {
   through_seq: integer().notNull(),
   initial_values: text({ mode: "json" }).notNull().$type<Instruction.Values>(),
   current_values: text({ mode: "json" }).notNull().$type<Instruction.Values>(),
+  frozen_baseline: text(),
+  imported_removals: text({ mode: "json" }).$type<Readonly<Record<string, string>>>(),
 })

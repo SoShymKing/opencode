@@ -1,10 +1,13 @@
-import { createMemo, createSignal, Match, Show, Switch } from "solid-js"
+import { createMemo, createSignal, For, Match, Show, Switch } from "solid-js"
 import { RGBA, TextAttributes, type MouseEvent } from "@opentui/core"
 import type { JSX } from "@opentui/solid"
 import type {
   SessionMessageAssistant,
   SessionMessageAssistantReasoning,
   SessionMessageAssistantText,
+  SessionMessageAssistantTool,
+  SessionMessageRecordedFile,
+  SessionMessageRecordedShell,
 } from "@opencode/client"
 import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, useTheme, useThemes } from "../../context/theme"
@@ -15,6 +18,30 @@ import { Locale } from "../../util/locale"
 import { use } from "./render-context"
 import { generateThinkingSyntax } from "./thinking-syntax"
 import { canonicalToolName } from "../../util/tool-display"
+import { recordedFileText, recordedShellText, recordedToolText } from "../../util/recorded-history"
+
+export function RecordedShellMessage(props: { message: SessionMessageRecordedShell }) {
+  const theme = useTheme()
+  return (
+    <box paddingLeft={3} flexShrink={0}>
+      <text fg={theme.text.base}>{recordedShellText(props.message)}</text>
+    </box>
+  )
+}
+
+export function RecordedFiles(props: { files?: SessionMessageRecordedFile[] }) {
+  const theme = useTheme()
+  return <For each={props.files}>{(file) => <text fg={theme.text.muted}>{recordedFileText(file)}</text>}</For>
+}
+
+export function RecordedToolPart(props: { part: SessionMessageAssistantTool }) {
+  const theme = useTheme()
+  return (
+    <box paddingLeft={3} flexShrink={0}>
+      <text fg={theme.text.base}>{recordedToolText(props.part)}</text>
+    </box>
+  )
+}
 
 export const INLINE_TOOL_ICON_WIDTH = 2
 

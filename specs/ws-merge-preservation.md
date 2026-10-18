@@ -2,7 +2,7 @@
 
 ## 범위와 판정 원칙
 
-- 기준은 그대로 `HEAD 5573129a75492773c5049a0b0909bbfb90d26a9d`, `MERGE_HEAD eeec76bb620f9bee8cab89c5a3a88e315539645b`다. **초기 271개 충돌 모두 해결, 현재 U 0**이다. 읽기 전용 `set "GIT_MASTER=1" && git ls-files -u` 결과도 비어 있다. 마지막 42개(A 26/B 12/C 2/D 2)를 포함한 native 이식과 구 경로 해결은 주 담당자가 모두 stage했다. 이는 index 충돌 해결이며 merge commit 완료나 전체 검사 통과가 아니다.
+- 현재 기준은 사용자가 commit한 merge `HEAD 50aca9ad1a93ca4d8214658a541a391800be7185`다. 부모는 `5573129a75`와 `eeec76bb62`다. 초기 271개 충돌 및 마지막 42개(A 26/B 12/C 2/D 2)의 해결·stage 기록은 merge 전 이력이다. 아래 2026-10-16 증거와 당시 index 상태는 현재 작업 트리 상태의 증명이 아니다.
 - 사용자 방향: `2.x` runtime과 schema/정규화 part storage를 유지하며 ws 동작을 native 소유자에 통합한다. Schema → Core/Protocol → Server 의존 방향을 지키고 Client runtime은 Core/Server를 참조하지 않는다. 파생 상태를 durable event에 중복 저장하지 않는다.
 - 아래 donor commit은 인계에서 확인된 출처다. 이 문서에서 commit을 독립 검증하지 않았으며, commit 존재나 충돌 표식 제거만으로 동작 보존을 인정하지 않는다. **충돌 해결과 기능 검증의 범위를 구분한 기록이며 전체 검증 승인 또는 과거 성능 동등성 판정이 아니다.**
 
@@ -13,7 +13,7 @@
 | 필수 ws 동작 | 인계에서 확인된 donor commit | 대상 고유 소유자 (`target native owner`) | 필수 수용 증거 (`required acceptance proof`) | 현재 상태 |
 | --- | --- | --- | --- | --- |
 | part storage 및 성능 보존 | `8504130e23`, `0a8c0a157b` | Core DB/storage | 격리 DB 저장·조회·재시작 내용 일치; 동일 입력의 읽기·쓰기 비용 비교 | 부분 검증: 저장/fixture 통과, 성능 비교 차단 |
-| 안전한 DB export/import | `9e603e4e0b` | Core DB/storage | 격리 왕복·무결성, 미지원 입력의 변경 전 거부 | 부분 검증: standalone만 통과, 일반 ws 변환 BLOCKED |
+| 안전한 DB export/import | `9e603e4e0b` | Core DB/storage | 격리 왕복·무결성, 미지원 입력의 변경 전 거부 | 지원 형식의 자동 변환 구현·검증 완료. 아래 2026-10-17 지원 범위와 안전 조건 적용 |
 | history 증분 처리 | `31a85fe3e2` | Core storage/runner | 항목 추가 후 누락·중복 없는 증분 반영 | native history/Runner/cache 기능 검사 통과; 매 Step DB reload 유지 |
 | 불필요한 clone 방지 | `fc9f2c7384` | Core runner | 큰 history 반복 step의 할당·실행 비용 비교 | native drain cache/선택적 hook 복사 검증; 전체 비용 동등성 미측정 |
 | tool cache 및 shell progress | `a13ab66cd0`, `0d696e377e` | Core runner, AI, App/TUI/session-ui | cache 정합성 및 UI 진행 이벤트·종료 정리 | native converter cache와 ShellID 진행 검증; V1 tuple/metadata API 호환 주장 없음 |
@@ -25,19 +25,66 @@
 | attachment controls | `827dc14934`, `c9869929a7`, `37c2b2bbe7` | Schema/Protocol/Server/Client Solid, App/TUI/session-ui | 첨부 조작·제출 내용 및 거부 참조 격리 | 부분 검증: native controls/quarantine 통과, opaque 출처 한계 유지 |
 | thinking 현지화 | `54f3951c3e` | App/TUI/session-ui | 해당 언어의 실제 표시·상태 전환 | 부분 검증: 한국어 browser/TUI, 기존 번역 768개 checksum 보존 |
 
-## 현재 차단 사항과 미확인 조건
+## 현재 수용 범위와 미확인 조건
 
-- **BLOCKED: 데이터가 있는 일반 ws DB의 자동 변환.** `message/event/instruction/permission/workspace/pending` 매핑의 보존을 실제 테스트로 입증하기 전에는 허용하지 않는다. 파괴적인 과거 데이터 migration은 금지한다. 지원 여부를 확인할 수 없으면 mutation 전에 fail-closed로 중단해야 한다. export/import donor만으로 자동 변환을 승인하지 않는다.
+- **지원 범위의 일반 ws 자동 변환은 구현·검증되었다.** 아래 지원 표와 보존 조건을 적용한다. 미지원 입력, fingerprint 불일치, ID 충돌 및 설명되지 않는 history prefix는 변경 전에 거부한다. 원본을 파괴하는 migration이나 임의 형식 지원을 승인한 것은 아니다.
 - 병합 전 UI benchmark 시도는 historical ws `HEAD` build에서 `@opencode-ai/protocol/groups/session`을 찾지 못해 실패했다. 유효한 historical baseline은 없다. 현재 production build 성공이나 단일 진단 표본으로 과거 성능 보존을 주장하지 않는다.
 - 초기 환경 인계는 `Effect 4.0.1`의 `ignore-scripts` 설치와 실행 Bun `1.4.1`/고정 `1.4.2` 차이를 기록했다. 이를 아래 실제 실행 결과의 실패 원인으로 단정하지 않는다.
 
 ## 증거 갱신 규칙
 
-주 통합 담당자가 직접 확인한 결과를 기록한다. 아래 묶음은 서로 겹치므로 합산하지 않는다. 실패 또는 미실행 범위를 수용하지 않으며 부분 검증만으로 전체 기능 검증이 통과했다고 판정하지 않는다. Git 충돌 해결 완료 여부는 별도로 확인한다. 이번 문서 갱신에서는 테스트를 다시 실행하지 않았다.
+주 통합 담당자의 직접 확인과 작업자 보고를 구분한다. 아래 묶음은 서로 겹치므로 합산하지 않는다. 실패 또는 미실행 범위를 수용하지 않으며 부분 검증만으로 전체 기능 검증이 통과했다고 판정하지 않는다. 2026-10-17 결과는 이번 통합 작업의 증거이며, 후속 수정 전후를 구분한다. 최종 읽기 전용 검토의 두 차단 사항은 아래 수정·재검증으로 닫았다.
+
+## 2026-10-17 자동 변환 수용 기록
+
+### 지원 입력과 보존 계약
+
+| 입력 계열 | 구현·검증 범위 |
+| --- | --- |
+| compact ws | v01 inline 및 v02 parts |
+| expanded ws | 38개 계열, metadata alias, split ledger 및 historical part 포함 |
+| previous native | 전체 57개 migration 이력과 구조가 일치하는 이전 native 형식 |
+| current native / V1 | 회귀 검사 포함. 활성 native migration은 timestamp ID 52개이며 `20261017041333_ws_native_imports` 포함 |
+
+- 원본의 모든 table/DDL, 알 수 없는 cell, raw JSON/BLOB, ledger/event는 변경 불가 INTERNAL archive로 남긴다. source ID·순서·시각·archive·fork·합계와 WS1/P2 root를 보존한다. 공개 raw-event SSE나 전역 persist 기본값을 새로 만들지 않는다. native tail은 import별 ancestry를 따라 유지한다.
+- 정확한 frozen baseline은 현재 값과 구분한다. fork는 캡처된 부모 cursor를 사용하며, 지연된 prompt promotion timestamp도 유효하다. event log에만 있다고 가정하지 않고 projection에만 있던 source system notice도 복원한다.
+- shell 기록의 알 수 없는 결과는 그대로 남기며 가짜 job/exit를 만들지 않는다. 빈 tool, raw hosted/provider map, 사용할 수 없는 URI 참조도 사실대로 유지한다. local worktree/folder는 `ws-local` native adapter와 명시적 Workspace ID를 사용한다. remote를 local로 추측하지 않는다. `WsNativeJson`은 호환되는 JSON 속성의 원래 순서와 raw token을 유지한다.
+
+### 활성화 안전성과 검증 경계
+
+- stage, backup, preimage, WAL 및 증거를 확보하고 exclusive 절차를 거친 뒤 lifetime lease를 유지한다. 기존 V1 marker도 별도 stage에서 승격한다. source-safety의 빈 WAL 오판은 일반 파일의 0-byte 동등성에만 한정하여 수정했다. 실패 artifact는 보존한다. crash 또는 활성화 실패 뒤 참조되지 않는 이전 stage가 남을 수 있는 한계는 유지한다.
+- 실제 native WAL `BUSY` 오류 5는 migration 전에 WAL을 처리하고, 최대 5초의 `LockTimeout`만 제한적으로 재시도하도록 수정했다. Model retry는 변경하지 않았다. profile과 독립적인 V1 완료 경로이며 legacy gate에 의존하지 않는다. source lease는 공유하고 fingerprint/충돌은 실패 처리한다. 전역 event 삭제는 없다.
+- hybrid `verifyClone`은 내부 DISPOSABLE 직렬화 clone에서만 실행한다. 현재 authority와 supplement 입력을 요구하고 scoped reset 및 native rowid 순서를 사용한다. 전체 log나 전역 rebuild를 검증했다는 뜻이 아니다. 설명되지 않는 prefix는 실패한다.
+- 실제 UI/TUI는 정적 기록을 표시한다. 알 수 없는 결과를 확정하지 않고 live fetch를 하지 않는다. 새 fallback 문구만 영어다. 실제 사용자 DB/profile/model, 서비스 재시작, 설치는 사용하지 않았다. 실제 Server 검증도 격리된 합성 fixture에 한정한다.
+
+### 이번 통합 작업의 실행 증거
+
+| 확인 주체·범위 | 결과 | 해석 및 시점 |
+| --- | --- | --- |
+| 주 담당자 Core 11파일 묶음 | 175 통과, 1725 assertions | 최신 소규모 수정 전 결과 |
+| 주 담당자 Core replacement/lease/fork/fold/rebuild 5파일 | 52 통과, 217 assertions | 이후 재검증 |
+| 주 담당자 기존 Runner/첨부/transport 8파일 gate | 367 통과, 1816 assertions | 이번 DB 통합 후 재실행. 이전 결과를 단순 인용한 것이 아님 |
+| 주 담당자 Server 실제 Fetch | 2 통과, 111 assertions | 실제 Runner + TestLLM, 요청 2회의 순서 및 reopen 후 중복 없음 |
+| 주 담당자 source conversion 7파일 | 74 통과, 1031 assertions | 지원 입력 변환 |
+| 주 담당자 message driver | PASS | native wire, ordinal, hosted raw, shell unknown |
+| 주 담당자 이전 차단 4건 | 4 통과, 214 assertions | 아래 과거 BLOCKED 판정 대체 |
+| 작업자 전체 migration 반복 | 29개 안정 통과, 5회 반복에서 150 통과 보고 | WAL 수정 후 보고값. 다른 묶음과 합산 금지 |
+| 작업자 Schema / Protocol | 각각 11 통과·55 assertions / 5 통과·18 assertions | 작업자 실행 증거 |
+| 작업자 web | unit 96 통과, browser 30 통과 | Edge, 폭 390/1280, LTR/RTL, live-shell 읽기 0. 증거는 `%LOCALAPPDATA%/Temp/opencode/recorded-history-proof/recorded-history-*.png`로 이동. 격리 Storybook/Edge 프로세스 종료 |
+| 작업자 TUI | 101 통과, 기존 Windows skip 1; 반복 120회 | 실제 OpenTUI 폭 44/100. artifact는 `%TEMP%/opencode` 아래 |
+| 주 담당자 화면 확인 | Edge에서 폭 390 RTL, 키보드 disclosure와 가로 overflow 없음, live API 요청 0 확인 | screenshot 및 OpenTUI terminal frame도 직접 검사. Chrome 부재로 설치된 Edge 사용, 추가 설치 없음 |
+| 주 담당자 타입·빌드·migration | Core/Server/Client/TUI/Session UI typecheck PASS, Core build PASS, 공식 migration `--check` PASS | 루트 전체 검사 통과와 별개 |
+| 주 담당자 최종 P 회귀 묶음 | 75 통과, 1223 assertions | P native/WS native/profile/message 4파일. 과거 step-start에 없는 `started`를 요구하지 않는 전용 codec 검증 |
+| 주 담당자 최종 TUI 회귀 묶음 | 146 통과, 기존 Windows skip 1 | 기록된 assistant tool도 native dispatch·job 추적·output reader보다 먼저 정적 처리. 실제 폭 44/100 renderer 증거는 `%LOCALAPPDATA%/Temp/opencode/recorded-tools-{session,mini}-{44,100}.txt` |
+| Client 공식 생성 재실행 | 재생성 전후 Git content hash 일치: Promise `b95ab7b8390a…`, Effect API `44babc4304f1…` | 생성 결정성 확인. `check:generated`는 index와 비교하여 의도한 미commit 생성 차이로 실패하므로 PASS로 기록하지 않음. Client typecheck 및 contract/import 경계 44건·170 assertions 통과 |
+
+최종 Oracle 최초 검토는 P step-start 필드 차이와 TUI의 기록 tool live 취급 두 건을 차단 사항으로 지적했다. 실제 과거 P 계약의 전용 decoder와 TUI/mini/subagent/grouping의 정적 기록 분기를 추가하고 red-first 회귀 검사로 확인했다. 같은 검토자의 범위 제한 재검토는 **두 지적 모두 해소, 추가 구체적 지적 없음(PASS)**이었다. 검토자는 코드를 읽었으며 테스트를 재실행하지 않았다. 이는 루트 전체 검사나 임의 형식·실사용 DB의 보증은 아니다.
+
+이번 변경에 `git add`/commit/push는 하지 않았다. 유효한 과거 성능 baseline이 없으므로 종단 성능 동등성은 판정하지 않는다.
 
 ## 2026-10-16 후속 통합 검증
 
-다음은 주 통합 작업에서 직접 실행한 결과다. 작업자 보고만 회수한 항목, 진행 중인 수정, 성능 비교는 포함하지 않는다. 명령은 표시한 패키지 디렉터리에서 실행했다.
+다음은 2026-10-16 당시 주 통합 작업에서 직접 실행한 과거 결과다. 명령은 표시한 패키지 디렉터리에서 실행했다. 당시 Client `check:generated` 성공과 DB 실패는 현재 판정이 아니며, 위 2026-10-17 결과가 해당 범위를 대체한다.
 
 | 패키지 | 명령 또는 확인 | 실제 결과 | 판정 범위 |
 | --- | --- | --- | --- |
@@ -53,7 +100,7 @@
 | Core | `bun run script/test.ts test/database-lineage.test.ts test/database-native-parts.test.ts test/database-artifact.test.ts` | 13 통과, 34 assertions | lineage 거부, native part 변환, 백업 artifact |
 | Core | `bun run script/test.ts test/database-legacy-v01.test.ts test/database-legacy-v01-failure.test.ts` | 20 통과, 75 assertions | 지원하는 구 ws 형식의 격리 export/import. native 자동 이전 성공은 아님 |
 | Core | `bun run script/test.ts test/database-replacement.test.ts --test-name-pattern "Standalone ws replacement"` | 6 통과, 9 filtered out, 30 assertions | 독립 replacement 복구/실패 보존만 검증 |
-| Core | `bun run script/test.ts test/database-migration.test.ts` | 25 통과, 4 실패, 129 assertions | 독립 프로세스 초기화는 통과. 아래 자동 변환 4건은 차단 상태 |
+| Core | `bun run script/test.ts test/database-migration.test.ts` | 당시 25 통과, 4 실패, 129 assertions | 과거 자동 변환 실패. 현재는 위 재검증으로 대체 |
 | Core | `bun run script/test.ts test/session-execution.test.ts test/session-status-coalescer.test.ts test/session-runner-retry.test.ts test/session-runner-tool-events.test.ts` | 96 통과, 355 assertions | 실행 상태, retry, final count 및 publisher settlement |
 | Core | `bun run script/test.ts test/session-runner.test.ts test/session-attachment-quarantine.test.ts test/session-attachment-transport.test.ts test/session-model-transport.test.ts` | 292 통과, 0 실패, 1484 assertions | 전체 Runner 244 포함. canonical safe refs, 원본 불변/reload/followup media `[1,0]`, 실제 loopback WS fresh replay 및 continuation/fallback 보존 |
 | Core | `bun run script/test.ts test/session-runner-message.test.ts test/session-model-request-hooks.test.ts test/session-attachment-quarantine.test.ts test/session-runner.test.ts test/session-runner-retry.test.ts test/session-step.test.ts test/session-attachment-transport.test.ts test/session-model-transport.test.ts` | 최신 직접 367 통과, 1816 assertions | cache/hook 격리, retry/Step 전달 및 첨부/transport 통합 8파일 gate |
@@ -85,24 +132,24 @@ Browser gate는 실제 실행한 keeper와 검증 범위를 표시했다. Bundle
 - storage/perf-reader gate는 새 `rejectedAttachments: []`가 expected runner-context에 없어 먼저 37 통과/1 실패했다. 실제 key는 `initial/entries/rejectedAttachments`였고 201개 항목과 순서는 모두 같았다. 최소 expected shape만 갱신하고 deep strict equality를 유지했으며 예상하지 않은 비어 있지 않은 refs를 거부하는 negative assertion을 추가했다. 동일 gate의 38 통과는 harness 정확성 증거이지 benchmark가 아니다.
 - DB lineage/nativeparts/artifact/legacy-v01/legacy-v01-failure 5파일의 위 직접 결과는 33 통과/109 assertions다. standalone replacement 6 통과/30 assertions와 9 filtered는 좁은 범위이며 전체 DB 또는 CLI/TUI 진입점 이전 수용이 아니다.
 
-DB migration의 다음 실패는 테스트를 삭제하거나 skip하지 않고 유지한다.
+당시 DB migration에서 실패한 테스트 이름은 다음과 같다. 현재는 네 건 모두 주 담당자 재검증에서 통과했으며 `BLOCKED` 이름도 제거되었다. 아래는 실패 원인을 보존한 과거 기록이다.
 
 - `BLOCKED automatic ws conversion: compact baseline`
 - `BLOCKED automatic ws conversion: complete union with metadata alias`
 - `BLOCKED automatic ws conversion: old part marker`
 - `BLOCKED preserves previous V2 state through the current migration lineage`
 
-네 건 모두 `WsUpgradeRequiredError`로 변경 전에 중단된다. 안전한 거부와 기존 DB의 실제 이전 성공은 별개다.
+당시 네 건은 모두 `WsUpgradeRequiredError`로 변경 전에 중단되었다. 현재 지원 입력의 실제 이전 성공 증거는 위 2026-10-17 기록을 따른다.
 
 ## 전체 검사 차단 상태
 
 | 검사 | 최신 상태와 범위 |
 | --- | --- |
 | 루트 `bun run check` | **최신 실패: lint 1 error / 1478 warnings**, 이후 단계 미실행. 유일한 오류는 비충돌 구 fixture `packages/opencode/test/session/prompt-history-conversion.fixtures.ts:230:26`의 `no-restricted-globals`/`Reflect.set`. 이전 5개 중 나머지는 소스/테스트 폐기로 해소. 이 orphan fixture와 비충돌 소비자는 수정하지 않음. 미병합 오류가 아님 |
-| App 전체 typecheck | **1 error**: `../session-ui/src/components/markdown-cache.tsx:23`, DOMPurify `WindowLike`와 중복 `@types/trusted-types` private brand. 주 담당자의 `git diff --exit-code MERGE_HEAD --` 비교에서 소스는 incoming과 동일. 의존성 불일치는 수정하지 않음 |
-| App E2E typecheck | **4 errors**: `performance/terminals/probe.ts:61`, `performance/timeline/session-timeline-stream-probe.ts:148`, `regression/timeline-stream.spec.ts:1822`, `:1825`. 3파일 모두 MERGE_HEAD 비교 통과. 이번 generic timeline forwarding 오류는 `export const event = makeEvent`로 수정됨; cast/억제 없음. 이를 기존 오류로 분류하지 않음 |
-| Core DB migration | **25 통과 / 4 실패 / 129 assertions**, 위 BLOCKED 이름 유지. populated ws 자동 변환 미지원 |
-| staged whitespace | 편집한 native Core/Protocol/Server/TUI/Client 및 앞선 지정 App 경로의 focused `git diff --cached --check` 통과. 전체 staged 검사는 보존한 incoming license/font/patch/test262/documentation 공백 때문에 실패. 전체 clean 주장이나 일괄 공백 수정 없음 |
+| App 전체 typecheck | **최신 재실행도 같은 기존 오류 1건**: `../session-ui/src/components/markdown-cache.tsx:23`, DOMPurify `WindowLike`와 중복 `@types/trusted-types` private brand. 이 파일과 의존성은 수정하지 않음. Session UI typecheck 및 App production build는 통과 |
+| App E2E typecheck | **과거 4 errors, 최신 재실행 없음**: `performance/terminals/probe.ts:61`, `performance/timeline/session-timeline-stream-probe.ts:148`, `regression/timeline-stream.spec.ts:1822`, `:1825`. 당시 3파일 모두 incoming과 같았음. 별도의 generic timeline forwarding 오류는 `export const event = makeEvent`로 수정했으며 기존 오류로 분류하지 않음 |
+| Core DB migration | 과거 4건 차단 해소. 주 담당자 4건 PASS 및 작업자 전체 migration 반복 결과는 위 참조 |
+| staged whitespace | merge 전 focused 검사는 통과했으나 당시 전체 staged 검사는 incoming 공백으로 실패. 현재 index 판정이 아니며 이번 작업에서 stage하지 않음 |
 
 ## 마지막 42개 충돌 해결과 native 대체 증거
 
@@ -125,6 +172,6 @@ DB migration의 다음 실패는 테스트를 삭제하거나 skip하지 않고 
 
 ## 인계 경계
 
-이전 42 U/HOLD/매핑 대기 기록은 위 해결 결과로 대체한다. 주 담당자 직접 확인에서 이번 문서 편집 전 `unmerged:''`, `unstaged:''`, `untracked:''`였다. 의도한 대상 밖 보호 index 6967개 항목의 SHA256 `2fc6af76a4a347affcc41d04b9f2e0a3352138844f33aea246904a91229af465`는 변하지 않았다. 앞선 충돌 표식 검사는 0이었고 최종 재검사는 주 담당자가 별도 수행한다. 보고서를 포함한 최종 stage와 index 확인은 주 담당자가 수행한다. commit/push, 실사용 DB 접근·변경, 기존 서비스 재시작은 하지 않았다.
+이전 42 U/HOLD/매핑 대기 기록은 위 해결 결과로 대체한다. merge 전 주 담당자의 `unmerged:''`, `unstaged:''`, `untracked:''` 확인과 보호 index 6967개 항목의 SHA256 `2fc6af76a4a347affcc41d04b9f2e0a3352138844f33aea246904a91229af465` 불변 기록은 **과거 증거**이며 현재 index나 작업 트리의 보증이 아니다. 현재 merge commit은 사용자가 완료했다. 이번 문서 편집은 이 파일에만 한정하며 테스트 실행, stage/commit/push, 실사용 DB/profile/model 접근·변경, 서비스 재시작이나 설치를 하지 않는다.
 
-historical ws HEAD build는 `@opencode-ai/protocol/groups/session` 해석 실패로 유효한 baseline을 만들지 못했다. 현재 UI 단일 진단 표본과 converter 작업량 검사는 과거 성능 동등성이나 종단 성능 측정이 아니다. **Git 충돌은 0개이며 모두 stage되었다. 별도로 루트 1/App 1/E2E 4/DB 4 실패와 전체 staged 공백 검사 실패가 남아 있다. 전체 검증 통과나 merge commit 완료를 주장하지 않는다.**
+historical ws HEAD build는 `@opencode-ai/protocol/groups/session` 해석 실패로 유효한 baseline을 만들지 못했다. UI 진단 표본과 converter 작업량 검사는 과거 성능 동등성이나 종단 성능 측정이 아니다. **지원 형식의 자동 변환 및 이전 DB 차단 4건은 통과했다. 루트 검사는 기존 `Reflect.set` 오류 1건/1478 warnings로 실패했고 이후 검사는 중단되었다. App typecheck의 같은 기존 오류 1건은 재확인했고 production build는 통과했다. E2E 4건은 과거 기록이며 재실행하지 않았다. Client 생성 hash 결정성은 확인했으며 최종 검토의 두 차단 사항은 수정·재검토 PASS로 닫았다. merge 완료와 전체 검증 통과를 혼동하지 않는다.**

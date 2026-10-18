@@ -24,6 +24,7 @@ import type {
   SessionMessageUser,
 } from "@opencode/client/promise"
 import { Locale } from "../util/locale"
+import { recordedToolText } from "../util/recorded-history"
 import { createFragmentReconciler, fragmentRef, type FragmentReconciler } from "./stream-v2.fragment"
 import { toolImageCommits, userImageCommits } from "./stream-v2.image"
 import type {
@@ -306,6 +307,17 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
   }
 
   const childTool = (child: ChildState, item: SessionMessageAssistantTool, messageID: string) => {
+    if (item.recorded !== undefined) {
+      setFrame(child, `recorded-tool:${sourceKey(messageID, item.id)}`, {
+        kind: "system",
+        source: "system",
+        text: recordedToolText(item),
+        phase: "start",
+        messageID,
+        partID: `recorded-tool:${item.id}`,
+      })
+      return
+    }
     const part = normalizeTool(item)
     const key = sourceKey(messageID, part.id)
     const frame = `tool:${key}`
@@ -937,6 +949,7 @@ export function createSubagentTracker(input: SubagentTrackerInput): SubagentTrac
   }
 
   const mainTool = (item: SessionMessageAssistantTool, active?: Record<string, unknown>) => {
+    if (item.recorded !== undefined) return
     const tool = normalizeTool(item)
     if (tool.name !== "subagent" || tool.state.status === "streaming") return
     const found = childSessionID(record(tool.state.metadata))

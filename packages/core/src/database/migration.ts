@@ -9,6 +9,7 @@ import { migrations } from "./migration.gen.js"
 import schema from "./schema.gen.js"
 import type { Global } from "@opencode/util/global"
 import { DatabaseLineage } from "./lineage.js"
+import previousV2Migration from "./migration/20260804233008_loose_psylocke.js"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -22,22 +23,32 @@ export type Migration = {
 export const currentMigrationIDs = new Set(migrations.map((migration) => migration.id))
 
 export function preflight(db: Pick<Database, "all">) {
-  return DatabaseLineage.requireNative(db, migrations.map((migration) => migration.id)).pipe(
-    Effect.flatMap((state) => (state.tables.has("session") || state.tables.has("session_v2")) && state.completed.size === 0
-      ? Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([], "session schema has no migration evidence"))
-      : Effect.succeed(state)),
-  )
+  return Effect.gen(function* () {
+    const state = yield* DatabaseLineage.requireNative(db, [...currentMigrationIDs])
+    if (state.tables.has("session") || state.tables.has("session_v2")) {
+      if (!state.completed.size)
+        return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([], "session schema has no migration evidence"))
+      return state
+    }
+    if ([...state.tables].some((name) => !name.startsWith("_")))
+      return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([...state.completed], "nonempty database without sessions"))
+    if (state.completed.size)
+      return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([...state.completed], "ledger without schema"))
+    return state
+  })
 }
 
 export function apply(db: Database, filename = ":memory:") {
   return Effect.gen(function* () {
+    const source = yield* DatabaseLineage.inspect(db, [...currentMigrationIDs])
+    if (source.ws || source.previousNative) {
+      const { WsNative } = yield* Effect.promise(() => import("./ws-native.js"))
+      yield* WsNative.convert(db)
+      return
+    }
     const state = yield* db.transaction((tx) => Effect.gen(function* () {
       const state = yield* preflight(tx)
       if (state.tables.has("session") || state.tables.has("session_v2")) return state
-      if ([...state.tables].some((name) => !name.startsWith("_")))
-        return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([...state.completed], "nonempty database without sessions"))
-      if (state.completed.size)
-        return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([...state.completed], "ledger without schema"))
       yield* schema.up(tx)
       if (!(yield* tx.get(sql`SELECT name FROM sqlite_master WHERE name = 'session_message_part'`)))
         return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([], "generated schema lacks normalized parts; run the schema generator"))
@@ -59,6 +70,12 @@ function journal(tx: Transaction, id: string) {
 
 export function applyOnly(db: Database, input: readonly Migration[]) {
   return Effect.gen(function* () {
+    const source = yield* DatabaseLineage.inspect(db, [...currentMigrationIDs, ...input.map((item) => item.id)])
+    if (source.previousNative && input.includes(previousV2Migration) && input.every((item) => migrations.includes(item))) {
+      const { WsNative } = yield* Effect.promise(() => import("./ws-native.js"))
+      yield* WsNative.convert(db)
+      return
+    }
     const state = yield* DatabaseLineage.requireNative(db, [...currentMigrationIDs, ...input.map((item) => item.id)])
     yield* db.transaction((tx) => Effect.gen(function* () {
       yield* tx.run(sql`CREATE TABLE IF NOT EXISTS migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)

@@ -5,6 +5,19 @@ import { currentToolError, currentToolInput, currentToolMetadata, currentToolOut
 const time = { created: 1 }
 
 describe("current tool state", () => {
+  test("reads recorded running content without requiring live output metadata", () => {
+    const tool = {
+      type: "tool",
+      id: "recorded-tool",
+      name: "shell",
+      state: { status: "running", input: { command: "pwd" }, metadata: {} },
+      recorded: { content: [{ type: "text", text: "/recorded/repo" }] },
+      time,
+    } satisfies SessionMessageAssistantTool
+
+    expect(currentToolOutput(tool)).toBe("/recorded/repo")
+  })
+
   test("decodes complete streaming input", () => {
     const tool = {
       type: "tool",

@@ -652,6 +652,7 @@ export type SessionLogOutput =
             readonly parentID: Session.ID
             readonly boundary: Session.ForkBoundary
             readonly instructions?: { readonly [x: Instruction.Key]: Instruction.Hash } | undefined
+            readonly instructionSourceSeq?: number | undefined
             readonly instructionEntries?: InstructionEntry.Snapshot | undefined
           }
         }
@@ -1512,6 +1513,7 @@ export type MessageListInput = {
     | "system"
     | "skill"
     | "shell"
+    | "shell-recorded"
     | "assistant"
     | "compaction"
     | undefined

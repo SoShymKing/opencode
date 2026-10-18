@@ -1,9 +1,11 @@
 export * as WorkspaceDriver from "./driver.js"
 
 import { Workspace } from "@opencode/schema/workspace"
+import { CrossSpawnSpawner } from "@opencode/util/cross-spawn-spawner"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Context, Effect, Layer, Schema } from "effect"
 import type { Scope } from "effect"
+import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner"
 import type { EnvironmentDriver } from "../environment/driver.js"
 
 /**
@@ -85,4 +87,15 @@ export const registryNode = (drivers: Readonly<Record<string, Interface>>) =>
     deps: [],
   })
 
-export const node = registryNode({})
+export const node = makeGlobalNode({
+  service: RegistryService,
+  layer: Layer.effect(
+    RegistryService,
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner
+      const { WsNativeWorkspace } = yield* Effect.promise(() => import("../database/ws-native-workspace.js"))
+      return registry({ [WsNativeWorkspace.Provider]: WsNativeWorkspace.make(spawner) })
+    }),
+  ),
+  deps: [CrossSpawnSpawner.node],
+})

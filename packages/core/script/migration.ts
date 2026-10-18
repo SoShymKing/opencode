@@ -156,13 +156,13 @@ function renderSchema(sql: string) {
   return `import { Effect } from "effect"
 import type { DatabaseMigration } from "./migration.js"
 
-const schema: Omit<DatabaseMigration.Migration, "id"> = {
-  up(tx) {
+const schema = {
+  up(tx: Parameters<DatabaseMigration.Migration["up"]>[0]) {
     return Effect.gen(function* () {
 ${renderStatements(sql)}
     })
   },
-}
+} satisfies Omit<DatabaseMigration.Migration, "id">
 
 export default schema
 `

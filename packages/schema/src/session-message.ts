@@ -7,7 +7,7 @@ import { Content } from "./tool.js"
 import { Location } from "./location.js"
 import { Model } from "./model.js"
 import { Project } from "./project.js"
-import { Prompt } from "./prompt.js"
+import { Prompt, PromptMention } from "./prompt.js"
 import { DateTimeUtcFromMillis, NonNegativeInt, PositiveInt, RelativePath } from "./schema.js"
 import { ID } from "./session-message-id.js"
 import { Shell as ShellSchema } from "./shell.js"
@@ -31,6 +31,32 @@ export const ProviderState = Schema.Record(Schema.String, Schema.Unknown).annota
   identifier: "Session.Message.ProviderState",
 })
 export type ProviderState = typeof ProviderState.Type
+
+export const RecordedProviderMetadata = Schema.Record(
+  Schema.String,
+  Schema.Record(Schema.String, Schema.Json),
+).annotate({ identifier: "Session.Message.RecordedProviderMetadata" })
+export type RecordedProviderMetadata = typeof RecordedProviderMetadata.Type
+
+export interface RecordedFile extends Schema.Schema.Type<typeof RecordedFile> {}
+export const RecordedFile = Schema.Struct({
+  uri: Schema.String,
+  mime: Schema.String,
+  name: Schema.String.pipe(optional),
+  description: Schema.String.pipe(optional),
+  source: PromptMention.pipe(optional),
+}).annotate({ identifier: "Session.Message.RecordedFile" })
+
+export interface RecordedTool extends Schema.Schema.Type<typeof RecordedTool> {}
+export const RecordedTool = Schema.Struct({
+  providerMetadata: RecordedProviderMetadata.pipe(optional),
+  providerResultMetadata: RecordedProviderMetadata.pipe(optional),
+  result: Schema.Json.pipe(optional),
+  content: Schema.Array(Content).pipe(optional),
+  attachments: Schema.Array(RecordedFile).pipe(optional),
+  outputPaths: Schema.Array(Schema.String).pipe(optional),
+  pruned: DateTimeUtcFromMillis.pipe(optional),
+}).annotate({ identifier: "Session.Message.RecordedTool" })
 
 export interface AgentSelected extends Schema.Schema.Type<typeof AgentSelected> {}
 export const AgentSelected = Schema.Struct({
@@ -67,6 +93,7 @@ export const User = Schema.Struct({
   ...Base,
   text: Prompt.fields.text,
   files: Prompt.fields.files,
+  recordedFiles: Schema.Array(RecordedFile).pipe(optional),
   agents: Prompt.fields.agents,
   skills: Prompt.fields.skills,
   type: Schema.tag("user"),
@@ -114,6 +141,19 @@ export const Shell = Schema.Struct({
   }),
 }).annotate({ identifier: "Session.Message.Shell" })
 
+export interface RecordedShell extends Schema.Schema.Type<typeof RecordedShell> {}
+export const RecordedShell = Schema.Struct({
+  ...Base,
+  type: Schema.tag("shell-recorded"),
+  callID: Schema.String,
+  command: Schema.String,
+  output: Schema.String,
+  time: Schema.Struct({
+    created: DateTimeUtcFromMillis,
+    completed: DateTimeUtcFromMillis.pipe(optional),
+  }),
+}).annotate({ identifier: "Session.Message.RecordedShell" })
+
 export interface ToolStateStreaming extends Schema.Schema.Type<typeof ToolStateStreaming> {}
 export const ToolStateStreaming = Schema.Struct({
   status: Schema.tag("streaming"),
@@ -131,7 +171,7 @@ export interface ToolStateCompleted extends Schema.Schema.Type<typeof ToolStateC
 export const ToolStateCompleted = Schema.Struct({
   status: Schema.tag("completed"),
   input: Schema.Record(Schema.String, Schema.Unknown),
-  content: Schema.NonEmptyArray(Content),
+  content: Schema.Array(Content),
   metadata: Schema.Record(Schema.String, Schema.Json).pipe(optional),
 }).annotate({ identifier: "Session.Message.ToolState.Completed" })
 
@@ -140,7 +180,7 @@ export const ToolStateError = Schema.Struct({
   status: Schema.tag("error"),
   input: Schema.Record(Schema.String, Schema.Unknown),
   error: SessionError.Error,
-  content: Schema.NonEmptyArray(Content).pipe(optional),
+  content: Schema.Array(Content).pipe(optional),
   metadata: Schema.Record(Schema.String, Schema.Json).pipe(optional),
 }).annotate({ identifier: "Session.Message.ToolState.Error" })
 
@@ -157,6 +197,7 @@ export const AssistantTool = Schema.Struct({
   executed: Schema.Boolean.pipe(optional),
   providerState: ProviderState.pipe(optional),
   providerResultState: ProviderState.pipe(optional),
+  recorded: RecordedTool.pipe(optional),
   state: ToolState,
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
@@ -177,6 +218,7 @@ export const AssistantReasoning = Schema.Struct({
   type: Schema.tag("reasoning"),
   text: Schema.String,
   state: ProviderState.pipe(optional),
+  recordedProviderMetadata: RecordedProviderMetadata.pipe(optional),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),
@@ -295,6 +337,7 @@ export const Info = Schema.Union([
   System,
   Skill,
   Shell,
+  RecordedShell,
   Assistant,
   Compaction,
   Idle,
@@ -308,6 +351,7 @@ export type Info =
   | System
   | Skill
   | Shell
+  | RecordedShell
   | Assistant
   | Compaction
   | Idle

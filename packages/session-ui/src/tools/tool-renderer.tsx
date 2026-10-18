@@ -48,6 +48,7 @@ import type {
   SessionMessageAssistantReasoning,
   SessionMessageAssistantTool,
   SessionMessageShell,
+  SessionMessageRecordedShell,
 } from "@opencode/client/promise"
 import {
   currentToolError,
@@ -59,7 +60,8 @@ import {
   readImagePath,
 } from "../message/current-tool-state"
 import { AssistantReasoningContent, writeClipboard } from "../message/message-content"
-import { followShellOutput } from "./shell-output"
+import { followShellOutput, SHELL_OUTPUT_TAIL_BYTES } from "./shell-output"
+import { RecordedFiles } from "../message/recorded-files"
 
 function ShellSubmessage(props: { text: string; animate?: boolean }) {
   let widthRef: HTMLSpanElement | undefined
@@ -477,7 +479,8 @@ export function CurrentContextToolGroup(props: {
   const tools = createMemo(() => props.parts.filter((part) => part.type === "tool"))
 
   const pending = createMemo(
-    () => tools().some((tool) => tool.state.status === "streaming" || tool.state.status === "running"),
+    () =>
+      tools().some((tool) => !tool.recorded && (tool.state.status === "streaming" || tool.state.status === "running")),
   )
 
   const names = createMemo(() =>
@@ -553,10 +556,12 @@ export function CurrentContextToolGroup(props: {
 
       if (
         tool.name === "skill" &&
+        !tool.recorded &&
         tool.state.status !== "error" &&
         currentSkillName(tool) &&
         Array.isArray(previous) &&
         previous?.[0]?.name === "skill" &&
+        !previous[0].recorded &&
         previous[0].state.status !== "error" &&
         currentSkillName(previous[0])
       ) {
@@ -719,7 +724,11 @@ export function CurrentContextToolGroup(props: {
                           }
                         >
                           <Show
-                            when={tool().state.status !== "error" && ["glob", "grep", "list"].includes(tool().name)}
+                            when={
+                              !tool().recorded &&
+                              tool().state.status !== "error" &&
+                              ["glob", "grep", "list"].includes(tool().name)
+                            }
                             fallback={
                               <Show
                                 when={
@@ -732,6 +741,7 @@ export function CurrentContextToolGroup(props: {
                                       <ToolDisplay
                                         id={tool().id}
                                         tool={tool().name}
+                                        recorded={tool().recorded}
                                         input={currentToolInput(tool())}
                                         metadata={currentToolMetadata(tool())}
                                         output={currentToolOutput(tool())}
@@ -1075,7 +1085,11 @@ function scrollParent(element: HTMLElement): HTMLElement | undefined {
 }
 
 function isFileChangeTool(tool: SessionMessageAssistantTool) {
-  return tool.state.status !== "error" && (tool.name === "edit" || tool.name === "write" || tool.name === "patch")
+  return (
+    !tool.recorded &&
+    tool.state.status !== "error" &&
+    (tool.name === "edit" || tool.name === "write" || tool.name === "patch")
+  )
 }
 
 function samePatchFile(a: FileDiffInfo, b: FileDiffInfo) {
@@ -1345,13 +1359,16 @@ export function ToolDisplay(
   props: ToolProps & {
     id: string
     error?: string
+    recorded?: SessionMessageAssistantTool["recorded"]
   },
 ) {
   const data = useData()
   const i18n = useI18n()
 
-  if (props.tool === "todowrite") return null
-  const hideQuestion = () => props.tool === "question" && (props.status === "streaming" || props.status === "running")
+  if (props.tool === "todowrite" && !props.recorded) return null
+
+  const hideQuestion = () =>
+    !props.recorded && props.tool === "question" && (props.status === "streaming" || props.status === "running")
 
   const taskId = createMemo(() => {
     if (props.tool !== "subagent") return undefined
@@ -1375,6 +1392,32 @@ export function ToolDisplay(
     <Show when={!hideQuestion()}>
       <div data-component="tool-part-wrapper" data-timeline-part-id={props.id}>
         <Switch>
+          <Match when={props.recorded}>
+            <RecordedTool
+              title={i18n.t("ui.tool.recorded", { tool: props.tool })}
+              unknownOutcome={props.status === "running" || props.status === "streaming"}
+              command={
+                toolInput(props.input).command ?? toolInput(props.input).code ?? JSON.stringify(props.input, null, 2)
+              }
+              output={
+                props.output ??
+                (props.recorded?.result === undefined ? "" : JSON.stringify(props.recorded.result, null, 2))
+              }
+              defaultOpen={props.defaultOpen}
+              open={props.open}
+              onOpenChange={props.onOpenChange}
+            >
+              <RecordedFiles
+                files={[
+                  ...(props.recorded?.attachments ?? []),
+                  ...(props.recorded?.content?.flatMap((item) =>
+                    item.type === "file" ? [{ uri: item.uri, mime: item.mime, name: item.name ?? undefined }] : [],
+                  ) ?? []),
+                ]}
+              />
+              <Show when={props.error}>{(error) => <ToolErrorCard tool={props.tool} error={error()} />}</Show>
+            </RecordedTool>
+          </Match>
           <Match when={error()}>
             {(error) => {
               const cleaned = error().replace("Error: ", "")
@@ -2042,6 +2085,70 @@ ToolRegistry.register({
     )
   },
 })
+
+function RecordedTool(props: {
+  title: string
+  unknownOutcome?: boolean
+  command: string
+  output: string
+  defaultOpen?: boolean
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  children?: JSX.Element
+}) {
+  const i18n = useI18n()
+  const output = createMemo(() => stripAnsi(props.output).replace(/\r\n?/g, "\n"))
+
+  return (
+    <BasicTool
+      icon="console"
+      rail={false}
+      hasContent
+      compact
+      defer
+      defaultOpen={props.defaultOpen}
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      trigger={{
+        title: props.title,
+        subtitle: props.unknownOutcome === false ? undefined : i18n.t("ui.tool.recorded.unknownOutcome"),
+      }}
+    >
+      <ConsoleOutput copy={props.command} variant="shell">
+        <span data-slot="bash-command">{props.command}</span>
+        <Show when={output().length > SHELL_OUTPUT_TAIL_BYTES}>
+          <span data-slot="bash-result">{i18n.t("ui.tool.recorded.truncated")}</span>
+        </Show>
+        <Show when={output()}>
+          {(value) => <span data-slot="bash-result">{value().slice(-SHELL_OUTPUT_TAIL_BYTES)}</span>}
+        </Show>
+      </ConsoleOutput>
+      {props.children}
+    </BasicTool>
+  )
+}
+
+export function SessionRecordedShellMessage(props: {
+  message: SessionMessageRecordedShell
+  defaultOpen?: boolean
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}) {
+  const i18n = useI18n()
+
+  return (
+    <div data-component="session-recorded-shell-message" data-timeline-part-id={props.message.id}>
+      <RecordedTool
+        title={i18n.t("ui.tool.shell.recorded")}
+        command={props.message.command}
+        output={props.message.output}
+        defaultOpen={props.defaultOpen}
+        open={props.open}
+        onOpenChange={props.onOpenChange}
+      />
+    </div>
+  )
+}
 
 export function SessionShellMessage(props: {
   message: SessionMessageShell

@@ -5,7 +5,7 @@ import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
-import { Deferred, Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer, Schema } from "effect"
 import { Reactivity } from "effect/reactivity"
 import { SqlClient, Statement } from "effect/sql"
 import { sql } from "drizzle-orm"
@@ -14,13 +14,21 @@ import { migrations } from "@opencode/core/database/migration.gen"
 import sessionMessagePartMigration from "@opencode/core/database/ws-message-parts"
 import nativeMessagePartMigration from "@opencode/core/database/migration/20261016000000_session_message_part"
 import { Database } from "@opencode/core/database/database"
+import { DatabaseWsArchive } from "@opencode/core/database/ws-archive"
+import { WsNative } from "@opencode/core/database/ws-native"
+import { hydrateSelection } from "@opencode/core/session/message-storage"
+import { SessionInbox } from "@opencode/core/session/inbox"
+import { SessionMessage } from "@opencode/core/session/message"
+import { SessionID } from "@opencode/schema/session-id"
+import {
+  messageID, normalizedMessageData, pendingQueueID, pendingSteerID, previousNativeIDs,
+  sessionID, setupPreviousNative, setupWs,
+} from "./fixture/database-ws"
 import { tmpdir } from "./fixture/tmpdir"
+import { nativeData, nativeInlineIDs, setupNativeInline } from "./fixture/database-native-inline"
 import legacyCredentialsMigration from "@opencode/core/database/migration/20260805200742_import_legacy_credentials"
 import worktreeMigration from "@opencode/core/database/migration/20260812213948_worktree"
 import previousV2Migration from "@opencode/core/database/migration/20260804233008_loose_psylocke"
-import workspaceMigration from "@opencode/core/database/migration/20260808023530_workspace_domain"
-import executionClaimsMigration from "@opencode/core/database/migration/20260811161259_execution_claim_attempts"
-import sessionInboxMigration from "@opencode/core/database/migration/20260812181746_session_inbox"
 import sessionViewedStateMigration from "@opencode/core/database/migration/20260819222447_session_viewed_state"
 import azureCliCredentialMigration from "@opencode/core/database/migration/20261007190000_azure_cli_external_credential"
 import { Global } from "@opencode/util/global"
@@ -46,10 +54,6 @@ const wsData = JSON.stringify({
   time: { created: 1 },
 })
 const parentData = JSON.stringify({ agent: "build", model: { providerID: "test", id: "model" }, time: { created: 1 } })
-const nativeData = JSON.stringify({
-  agent: "build", model: { providerID: "test", id: "model" },
-  content: [{ type: "text", text: "first" }, { type: "text", text: "second" }], time: { created: 1 },
-})
 const wsHistories = [
   { name: "compact baseline", ids: ["v01_baseline"], complete: true },
   { name: "complete union with metadata alias", ids: DatabaseMigration.legacyBaselineMigrationIDs.map((id) =>
@@ -77,15 +81,52 @@ function wsFixture(db: EffectDrizzleSqlite.EffectSQLiteDatabase, ids: readonly s
   })
 }
 
-function nativeFixture(db: EffectDrizzleSqlite.EffectSQLiteDatabase) {
+function sourceEvidence(db: EffectDrizzleSqlite.EffectSQLiteDatabase, tables: readonly string[]) {
+  return Effect.forEach(tables, (name) => Effect.gen(function* () {
+    const table = DatabaseWsArchive.identifier(name)
+    return { name, rows: yield* db.all(sql`SELECT * FROM ${table} ORDER BY rowid`) }
+  }))
+}
+
+function archivedEvidence(db: EffectDrizzleSqlite.EffectSQLiteDatabase, evidence: Effect.Success<ReturnType<typeof sourceEvidence>>, codec = 1) {
   return Effect.gen(function* () {
-    yield* db.run(sql`CREATE TABLE session_v2 (id TEXT PRIMARY KEY)`)
-    yield* db.run(sql`CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session_v2(id), type TEXT, seq INTEGER, data TEXT)`)
-    yield* db.run(sql`CREATE TABLE migration (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`)
-    yield* db.run(sql`INSERT INTO session_v2 VALUES ('session')`)
-    yield* db.run(sql`INSERT INTO session_message VALUES ('msg_migration', 'session', 'assistant', 0, ${nativeData})`)
-    for (const id of nativeIDs.filter((id) => id !== nativeMessagePartMigration.id))
-      yield* db.run(sql`INSERT INTO migration VALUES (${id}, 1)`)
+    const root = yield* DatabaseWsArchive.readRoot(db, sessionID)
+    expect(root).toMatchObject({ aggregate_id: sessionID, through_seq: 50, codec_version: codec })
+    if (!root) throw new Error("Missing import root")
+    const archive = yield* DatabaseWsArchive.read(db, root.archive_id)
+    expect(archive).toBeDefined()
+    if (!archive) throw new Error("Missing source archive")
+    for (const source of evidence) {
+      const retained = DatabaseWsArchive.sourceTable(archive, source.name)
+      expect(retained).toBeDefined()
+      if (!retained) throw new Error(`Missing archived ${source.name}`)
+      expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)} ORDER BY rowid`)).toEqual(source.rows)
+    }
+    const messages = DatabaseWsArchive.sourceTable(archive, "session_message")
+    if (!messages) throw new Error("Missing archived messages")
+    return DatabaseWsArchive.identifier(messages)
+  })
+}
+
+function nativeMessage(db: EffectDrizzleSqlite.EffectSQLiteDatabase) {
+  return Effect.gen(function* () {
+    expect(yield* db.get(sql`SELECT id, session_id, seq, data FROM session_message WHERE id = ${messageID}`)).toEqual({
+      id: messageID, session_id: sessionID, seq: 7, data: normalizedMessageData,
+    })
+    expect(yield* db.all(sql`SELECT position, id, type, data FROM session_message_part WHERE message_id = ${messageID} ORDER BY position`)).toEqual([
+      { position: 0, id: "0", type: "text", data: '{"text":"first"}' },
+      { position: 1, id: "1", type: "text", data: '{"text":"second"}' },
+    ])
+    expect(yield* hydrateSelection({ db, where: sql`session_message.id = ${messageID}` })).toEqual([{
+      sessionID: SessionID.make(sessionID), seq: 7, message: Schema.decodeUnknownSync(SessionMessage.Info)({
+        id: messageID, type: "assistant", agent: "build", model: { providerID: "test", id: "model" },
+        content: [{ type: "text", text: "first" }, { type: "text", text: "second" }],
+        time: { created: 1 },
+      }),
+    }])
+    expect(yield* db.all(sql`SELECT id FROM migration ORDER BY rowid`)).toEqual(nativeIDs.map((id) => ({ id })))
+    expect(yield* db.all(sql`PRAGMA foreign_key_check`)).toEqual([])
+    expect(yield* db.get(sql`PRAGMA foreign_keys`)).toEqual({ foreign_keys: 1 })
   })
 }
 
@@ -115,7 +156,7 @@ const parkedClient = (arrived: Deferred.Deferred<void>, gate: Deferred.Deferred<
   ).pipe(Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Layer.provide(Reactivity.layer))
 
 describe("DatabaseMigration", () => {
-  test.each(wsHistories)("refuses ws $name before mutation or backup", async (history) => {
+  test.each(wsHistories)("refuses incomplete ws schema $name before mutation or backup", async (history) => {
     await using tmp = await tmpdir()
     await run(Effect.gen(function* () {
       const db = yield* makeDb
@@ -127,31 +168,61 @@ describe("DatabaseMigration", () => {
       const parts = history.ids.includes(DatabaseMigration.legacyPartMigrationID)
         ? yield* db.all(sql`SELECT * FROM session_message_part ORDER BY position`)
         : []
-      for (const attempt of [DatabaseMigration.apply(db, path.join(tmp.path, "ws.sqlite")), DatabaseMigration.applyOnly(db, [nativeMessagePartMigration])]) {
-        const error = yield* attempt.pipe(Effect.flip)
-        expect(error).toBeInstanceOf(DatabaseMigration.WsUpgradeRequiredError)
-        expect(error).toMatchObject({ baselineComplete: history.complete })
+      for (const entrypoint of ["apply", "applyOnly"]) {
+        const error = yield* (entrypoint === "apply"
+          ? DatabaseMigration.apply(db, path.join(tmp.path, "ws.sqlite"))
+          : DatabaseMigration.applyOnly(db, [nativeMessagePartMigration])).pipe(Effect.flip)
+        if (entrypoint === "apply") {
+          expect(error).toBeInstanceOf(WsNative.WsNativeError)
+          expect(error).toMatchObject({
+            message: history.complete ? "Missing source column account.id" : "Source is not a complete supported WS or previous-native lineage",
+          })
+        }
+        if (entrypoint === "applyOnly") {
+          expect(error).toBeInstanceOf(DatabaseMigration.WsUpgradeRequiredError)
+          expect(error).toMatchObject({ baselineComplete: history.complete })
+        }
         expect(yield* db.all(sql`SELECT * FROM migration ORDER BY rowid`)).toEqual(journal)
         expect(yield* db.all(sql`SELECT * FROM __drizzle_migrations ORDER BY rowid`)).toEqual(drizzle)
         expect(yield* db.all(sql`SELECT * FROM sqlite_master ORDER BY name`)).toEqual(schema)
         expect(yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message`)).toEqual(bytes)
         if (history.ids.includes(DatabaseMigration.legacyPartMigrationID))
           expect(yield* db.all(sql`SELECT * FROM session_message_part ORDER BY position`)).toEqual(parts)
+        expect((yield* Effect.promise(() => readdir(tmp.path))).filter((name) => name.includes(".backup-"))).toEqual([])
       }
     }), Global.make({ data: tmp.path }), path.join(tmp.path, "ws.sqlite"))
     expect((await readdir(tmp.path)).filter((name) => name.includes(".backup-"))).toEqual([])
   })
 
-  test.each(wsHistories.filter((history) => history.complete))("BLOCKED automatic ws conversion: $name", async (history) => {
+  test.each([
+    { name: "compact baseline", lineage: "v01" },
+    { name: "complete union with metadata alias", lineage: "split-alias" },
+    { name: "old part marker", lineage: "historical-part" },
+  ] as const)("automatic ws conversion: $name", async (history) => {
     await run(Effect.gen(function* () {
       const db = yield* makeDb
-      yield* wsFixture(db, history.ids)
-      yield* DatabaseMigration.apply(db)
-      expect(yield* db.all(sql`SELECT id FROM migration WHERE id IN ('v01_baseline', 'v02_session_message_part') ORDER BY id`)).toEqual([
-        { id: "v01_baseline" }, { id: "v02_session_message_part" },
+      yield* setupWs(db, { directory: "/repo", lineage: history.lineage })
+      yield* db.run(sql`INSERT INTO event VALUES ('evt_source_text', ${sessionID}, 10, 'session.next.text.ended.1', '{"sessionID":"ses_migration","timestamp":4,"assistantMessageID":"msg_migration","textID":"text-1","text":"first"}')`)
+      const evidence = yield* sourceEvidence(db, [
+        "migration", "session", "session_message", "event", "event_sequence",
+        ...(history.lineage === "split-alias" ? ["__drizzle_migrations"] : []),
+        ...(history.lineage === "historical-part" ? ["session_message_part"] : []),
       ])
-      expect(yield* db.get(sql`SELECT data FROM session_message`)).toEqual({ data: parentData })
+      const bytes = yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = ${messageID}`)
+      expect(yield* DatabaseMigration.applyOnly(db, [nativeMessagePartMigration]).pipe(Effect.flip)).toBeInstanceOf(DatabaseMigration.WsUpgradeRequiredError)
+      expect(yield* sourceEvidence(db, evidence.map((table) => table.name))).toEqual(evidence)
+      yield* DatabaseMigration.apply(db)
+      yield* nativeMessage(db)
       expect(yield* db.get(sql`SELECT count(*) AS count FROM session_message_part`)).toEqual({ count: 2 })
+      const archivedMessages = yield* archivedEvidence(db, evidence)
+      expect(yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM ${archivedMessages} WHERE id = ${messageID}`)).toEqual(bytes)
+      expect(yield* db.get(sql`SELECT seq FROM event_sequence WHERE aggregate_id = ${sessionID}`)).toEqual({ seq: 50 })
+      expect(yield* db.all(sql`SELECT id FROM event WHERE aggregate_id = ${sessionID} AND seq <= 50`)).toEqual([])
+      expect(yield* db.get(sql`SELECT id FROM session_v2 WHERE id = ${sessionID}`)).toEqual({ id: sessionID })
+      expect(yield* db.get(sql`SELECT directory FROM worktree`)).toEqual({ directory: "/repo" })
+      yield* DatabaseMigration.apply(db)
+      yield* nativeMessage(db)
+      yield* archivedEvidence(db, evidence)
     }))
   })
 
@@ -173,7 +244,9 @@ describe("DatabaseMigration", () => {
     const filename = name === ":memory:" ? name : path.join(tmp.path, name)
     await run(Effect.gen(function* () {
       const db = yield* makeDb
-      yield* nativeFixture(db)
+      yield* setupNativeInline(db)
+      expect(nativeInlineIDs).toHaveLength(50)
+      expect(yield* db.all(sql`SELECT id, time_completed FROM migration ORDER BY rowid`)).toEqual(nativeInlineIDs.map((id) => ({ id, time_completed: 1 })))
       yield* db.run(sql`PRAGMA wal_autocheckpoint = 0`)
       yield* DatabaseMigration.apply(db, filename)
       yield* DatabaseMigration.apply(db, filename)
@@ -194,7 +267,7 @@ describe("DatabaseMigration", () => {
       })
       expect(yield* db.get(sql`SELECT json_array_length(data, '$.content') AS count FROM session_message`)).toEqual({ count: 2 })
       expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE name = 'session_message_part'`)).toBeUndefined()
-      expect(yield* db.all(sql`SELECT id FROM migration ORDER BY rowid`)).toEqual(nativeIDs.filter((id) => id !== nativeMessagePartMigration.id).map((id) => ({ id })))
+      expect(yield* db.all(sql`SELECT id, time_completed FROM migration ORDER BY rowid`)).toEqual(nativeInlineIDs.map((id) => ({ id, time_completed: 1 })))
     }), Global.make({ data: tmp.path }), path.join(tmp.path, backup))
   })
 
@@ -203,7 +276,7 @@ describe("DatabaseMigration", () => {
     const filename = path.join(tmp.path, "failure.sqlite")
     await run(Effect.gen(function* () {
       const db = yield* makeDb
-      yield* nativeFixture(db)
+      yield* setupNativeInline(db)
       yield* db.run(sql`CREATE TABLE session_message_part (id TEXT)`)
       const before = yield* db.all(sql`SELECT * FROM session_message`)
       expect((yield* Effect.exit(DatabaseMigration.apply(db, filename)))._tag).toBe("Failure")
@@ -382,104 +455,46 @@ describe("DatabaseMigration", () => {
     )
   })
 
-  test("BLOCKED preserves previous V2 state through the current migration lineage", async () => {
+  test("preserves previous V2 state through the current migration lineage", async () => {
     await run(
       Effect.gen(function* () {
         const db = yield* makeDb
-        yield* db.run(sql`PRAGMA foreign_keys = ON`)
-        yield* db.run(sql`CREATE TABLE migration (id text PRIMARY KEY, time_completed integer NOT NULL)`)
-        yield* db.run(sql`
-          INSERT INTO migration (id, time_completed)
-          VALUES ('20260730195856_optional_session_title', 1)
-        `)
-        yield* db.run(sql`CREATE TABLE project (id text PRIMARY KEY)`)
-        yield* db.run(sql`
-          CREATE TABLE project_directory (
-            project_id text NOT NULL,
-            directory text NOT NULL,
-            type text,
-            strategy text,
-            time_created integer NOT NULL,
-            PRIMARY KEY (project_id, directory)
-          )
-        `)
-        yield* db.run(sql`
-          CREATE TABLE workspace (
-            id text PRIMARY KEY,
-            type text NOT NULL,
-            name text NOT NULL,
-            project_id text NOT NULL,
-            time_used integer NOT NULL
-          )
-        `)
-        yield* db.run(sql`
-          CREATE TABLE session (
-            id text PRIMARY KEY,
-            project_id text NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-            workspace_id text,
-            parent_id text,
-            time_suspended integer
-          )
-        `)
-        yield* db.run(sql`CREATE INDEX session_project_idx ON session (project_id)`)
-        yield* db.run(sql`CREATE INDEX session_workspace_idx ON session (workspace_id)`)
-        yield* db.run(sql`CREATE INDEX session_parent_idx ON session (parent_id)`)
-        yield* db.run(
-          sql`CREATE INDEX session_time_suspended_idx ON session (time_suspended) WHERE "session"."time_suspended" IS NOT NULL`,
-        )
-        yield* db.run(sql`
-          CREATE TABLE session_message (
-            id text PRIMARY KEY,
-            session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-            data text NOT NULL
-          )
-        `)
-        yield* db.run(sql`CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL)`)
-        yield* db.run(sql`
-          CREATE TABLE session_pending (
-            id text PRIMARY KEY,
-            session_id text NOT NULL REFERENCES session(id) ON DELETE CASCADE
-          )
-        `)
-        yield* db.run(sql`CREATE TABLE event_sequence (aggregate_id text PRIMARY KEY, seq integer NOT NULL)`)
-        yield* db.run(sql`
-          CREATE TABLE event (
-            id text PRIMARY KEY,
-            aggregate_id text NOT NULL REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE,
-            seq integer NOT NULL,
-            created integer NOT NULL,
-            type text NOT NULL,
-            data text NOT NULL
-          )
-        `)
-        yield* db.run(sql`CREATE TABLE data_migration (name text PRIMARY KEY)`)
-        yield* db.run(sql`INSERT INTO project VALUES ('project')`)
-        yield* db.run(sql`INSERT INTO project_directory VALUES ('project', '/repo', 'main', NULL, 1)`)
-        yield* db.run(sql`INSERT INTO session VALUES ('session', 'project', NULL, NULL, NULL)`)
-        yield* db.run(sql`INSERT INTO session_message VALUES ('message', 'session', '{"text":"preserved"}')`)
-        yield* db.run(sql`INSERT INTO session_pending VALUES ('pending', 'session')`)
-        yield* db.run(sql`INSERT INTO event_sequence VALUES ('session', 41)`)
-        yield* db.run(sql`INSERT INTO event VALUES ('event', 'session', 41, 1, 'session.text.ended.1', '{}')`)
-
-        yield* DatabaseMigration.applyOnly(db, [
-          previousV2Migration,
-          workspaceMigration,
-          executionClaimsMigration,
-          sessionInboxMigration,
-          worktreeMigration,
+        yield* setupPreviousNative(db, { directory: "/repo", rich: true })
+        expect(yield* db.all(sql`SELECT id FROM migration ORDER BY rowid`)).toEqual(previousNativeIDs.map((id) => ({ id })))
+        expect(previousNativeIDs).toHaveLength(57)
+        const evidence = yield* sourceEvidence(db, [
+          "migration", "session", "session_message", "session_pending", "event", "event_sequence",
+          "project_directory", "instruction_blob", "instruction_entry", "instruction_state", "fixture_extension",
         ])
+        const bytes = yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM session_message WHERE id = ${messageID}`)
 
-        expect(yield* db.get(sql`SELECT id, resume_attempts FROM session_v2`)).toEqual({
-          id: "session",
+        yield* DatabaseMigration.applyOnly(db, migrations)
+
+        expect(yield* db.get(sql`SELECT id, resume_attempts FROM session_v2 WHERE id = ${sessionID}`)).toEqual({
+          id: sessionID,
           resume_attempts: 0,
         })
-        expect(yield* db.get(sql`SELECT id, data FROM session_message`)).toEqual({
-          id: "message",
-          data: '{"text":"preserved"}',
-        })
-        expect(yield* db.get(sql`SELECT id FROM session_pending`)).toEqual({ id: "pending" })
-        expect(yield* db.get(sql`SELECT seq FROM event_sequence`)).toEqual({ seq: 41 })
-        expect(yield* db.get(sql`SELECT id, seq FROM event`)).toEqual({ id: "event", seq: 41 })
+        yield* nativeMessage(db)
+        const archivedMessages = yield* archivedEvidence(db, evidence, 2)
+        expect(yield* db.get(sql`SELECT hex(CAST(data AS blob)) AS bytes FROM ${archivedMessages} WHERE id = ${messageID}`)).toEqual(bytes)
+        expect(yield* db.get(sql`SELECT seq FROM event_sequence WHERE aggregate_id = ${sessionID}`)).toEqual({ seq: 50 })
+        expect(yield* db.all(sql`SELECT id, session_id, type, payload, delivery, enqueued_seq, time_created FROM session_inbox ORDER BY enqueued_seq`)).toEqual([
+          { id: pendingSteerID, session_id: sessionID, type: "user", payload: '{"text":"Steer next"}', delivery: "steer", enqueued_seq: 40, time_created: 40 },
+          { id: pendingQueueID, session_id: sessionID, type: "synthetic", payload: '{"text":"Queue later","description":"fixture"}', delivery: "queue", enqueued_seq: 43, time_created: 43 },
+          { id: "msg_pending_compaction", session_id: sessionID, type: "compaction", payload: '{}', delivery: "steer", enqueued_seq: 44, time_created: 44 },
+        ])
+        expect(yield* SessionInbox.find(db, SessionMessage.ID.make(pendingSteerID))).toEqual(Schema.decodeUnknownSync(SessionInbox.Info)({
+          id: pendingSteerID, sessionID, type: "user", payload: { text: "Steer next" }, delivery: "steer",
+          time: { created: 40 },
+        }))
+        expect(yield* SessionInbox.find(db, SessionMessage.ID.make(pendingQueueID))).toEqual(Schema.decodeUnknownSync(SessionInbox.Info)({
+          id: pendingQueueID, sessionID, type: "synthetic", payload: { text: "Queue later", description: "fixture" }, delivery: "queue",
+          time: { created: 43 },
+        }))
+        expect(yield* SessionInbox.find(db, SessionMessage.ID.make("msg_pending_compaction"))).toEqual(Schema.decodeUnknownSync(SessionInbox.Info)({
+          id: "msg_pending_compaction", sessionID, type: "compaction", payload: {}, delivery: "steer",
+          time: { created: 44 },
+        }))
         expect(
           yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session'`),
         ).toBeUndefined()
@@ -490,6 +505,12 @@ describe("DatabaseMigration", () => {
         expect(yield* db.all<{ table: string }>(sql`PRAGMA foreign_key_list(session_pending)`)).toContainEqual(
           expect.objectContaining({ table: "session_v2" }),
         )
+        expect(yield* db.all<{ table: string }>(sql`PRAGMA foreign_key_list(session_inbox)`)).toContainEqual(
+          expect.objectContaining({ table: "session_v2" }),
+        )
+        yield* DatabaseMigration.applyOnly(db, migrations)
+        yield* nativeMessage(db)
+        yield* archivedEvidence(db, evidence, 2)
       }),
     )
   })

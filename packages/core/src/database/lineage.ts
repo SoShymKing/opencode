@@ -64,6 +64,29 @@ export const legacyBaselineMigrationIDs = [
   "20260622202450_simplify_session_input",
 ] as const
 
+export const previousNativeMigrationIDs = [
+  ...legacyBaselineMigrationIDs,
+  "20260702134641_add_session_context_entry",
+  "20260703090000_reset_v2_event_rename_sweep",
+  "20260703181610_event_created_column",
+  "20260703190000_reset_v2_shell_event_payloads",
+  "20260703200000_reset_v2_session_events",
+  "20260705180000_rename_instructions",
+  "20260706223930_add-session-fork",
+  "20260707010146_durable_session_inbox",
+  "20260707120000_migrate_prelaunch_v2_state",
+  "20260709013000_generic_session_input",
+  "20260709025533_drop-todo",
+  "20260709163752_time_suspended",
+  "20260709190621_session_pending_table",
+  "20260710025429_instruction_sync",
+  "20260716020354_kv",
+  "20260722011141_delete_tool_progress_events",
+  "20260722170000_canonical_tool_results",
+  "20260729022634_session_fork_boundary",
+  "20260730195856_optional_session_title",
+] as const
+
 export function inspect(db: Reader, nativeIDs: readonly string[]) {
   return Effect.gen(function* () {
     const tables = new Set((yield* db.all<{ name: string }>(
@@ -72,8 +95,8 @@ export function inspect(db: Reader, nativeIDs: readonly string[]) {
     const completed = new Set(tables.has("migration")
       ? (yield* db.all<{ id: string }>(sql`SELECT id FROM migration`)).map((row) => row.id)
       : [])
-    const known = new Set([...nativeIDs, ...legacyBaselineMigrationIDs, legacySessionMetadataAlias,
-      legacyPartMigrationID, "v01_baseline", "v02_session_message_part", "20260730195856_optional_session_title"])
+    const known = new Set([...nativeIDs, ...previousNativeMigrationIDs, legacySessionMetadataAlias,
+      legacyPartMigrationID, "v01_baseline", "v02_session_message_part"])
     if (tables.has("__drizzle_migrations")) {
       const columns = new Set((yield* db.all<{ name: string }>(
         sql`SELECT name FROM pragma_table_info('__drizzle_migrations')`,
@@ -101,20 +124,50 @@ export function inspect(db: Reader, nativeIDs: readonly string[]) {
     const baselineComplete = completed.has("v01_baseline") || legacyBaselineMigrationIDs.every(
       (id) => completed.has(id) || (id === legacySessionMetadataMigrationID && completed.has(legacySessionMetadataAlias)),
     )
+    const wsMarker = completed.has("v01_baseline") || completed.has("v02_session_message_part") || completed.has(legacyPartMigrationID)
+    const previousNative = previousNativeMigrationIDs.slice(legacyBaselineMigrationIDs.length).some((id) => completed.has(id)) ||
+      (!tables.has("session_v2") && ["instruction_blob", "instruction_entry", "instruction_state", "session_pending"].some((table) => tables.has(table)))
+    if (previousNative) {
+      if (wsMarker || tables.has("session_v2") || completed.size !== previousNativeMigrationIDs.length ||
+        !previousNativeMigrationIDs.every((id) => completed.has(id)))
+        return yield* Effect.fail(new UnsafeMigrationHistoryError([...completed], "mixed or incomplete previous-native history"))
+      for (const [table, required] of Object.entries({
+        project: ["id"],
+        session: ["id", "project_id", "fork_session_id", "fork_boundary", "title", "time_suspended"],
+        session_message: ["id", "session_id", "type", "seq", "time_created", "time_updated", "data"],
+        instruction_blob: ["hash", "value"],
+        instruction_entry: ["session_id", "key", "value", "removed", "time_created", "time_updated"],
+        instruction_state: ["session_id", "epoch_start", "through_seq", "initial_values", "current_values"],
+        session_pending: ["id", "session_id", "type", "data", "delivery", "admitted_seq", "time_created"],
+      })) {
+        const columns = yield* db.all<{ name: string; notnull: number }>(sql`SELECT name, "notnull" FROM pragma_table_info(${table})`)
+        if (!required.every((name) => columns.some((column) => column.name === name)) ||
+          (table === "session" && columns.some((column) => column.name === "title" && column.notnull !== 0)))
+          return yield* Effect.fail(new UnsafeMigrationHistoryError([...completed], `incomplete previous-native ${table}`))
+        if (table === "project" || table === "instruction_blob") continue
+        const foreignKeys = yield* db.all<{ table: string; from: string; to: string }>(sql`SELECT "table", "from", "to" FROM pragma_foreign_key_list(${table})`)
+        if (!foreignKeys.some((key) => key.table === (table === "session" ? "project" : "session") &&
+          key.from === (table === "session" ? "project_id" : "session_id") && key.to === "id"))
+          return yield* Effect.fail(new UnsafeMigrationHistoryError([...completed], `invalid previous-native ${table} reference`))
+      }
+      return { tables, completed, baselineComplete, ws: false, previousNative: true }
+    }
     const references = tables.has("session_message")
       ? yield* db.all<{ table: string }>(sql`PRAGMA foreign_key_list('session_message')`)
       : []
     const populated = tables.has("session_message") && (yield* db.all(sql`SELECT 1 FROM session_message LIMIT 1`)).length > 0
-    const ws = completed.has("v01_baseline") || completed.has("v02_session_message_part") || completed.has(legacyPartMigrationID) ||
+    const ws = wsMarker ||
       (!tables.has("session_v2") && tables.has("session_message") &&
         (baselineComplete || (populated && references.some((row) => row.table === "session"))))
-    return { tables, completed, baselineComplete, ws }
+    return { tables, completed, baselineComplete, ws, previousNative: false }
   })
 }
 
 export function requireNative(db: Reader, nativeIDs: readonly string[]) {
   return Effect.gen(function* () {
     const state = yield* inspect(db, nativeIDs)
+    if (state.previousNative)
+      return yield* Effect.fail(new UnsafeMigrationHistoryError([...state.completed], "previous-native history requires a dedicated bridge"))
     if (state.ws) return yield* Effect.fail(new WsUpgradeRequiredError([...state.completed], state.baselineComplete))
     for (const id of ["20260622170816_reset_v2_session_state", "20260804233008_loose_psylocke"]) {
       if (!nativeIDs.includes(id) || state.completed.has(id)) continue

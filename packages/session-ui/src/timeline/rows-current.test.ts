@@ -6,6 +6,57 @@ import { timelinePresets } from "./detail"
 import { createTimelineProjection, Timeline, TimelineRow } from "./projection"
 
 describe("current session timeline rows", () => {
+  test("keeps recorded shell as a shell boundary, including assistant context", () => {
+    const messages = [
+      { id: "before", type: "user", text: "earlier", time: { created: 1 } },
+      {
+        id: "recorded", type: "shell-recorded", callID: "old-call", command: "pwd", output: "/repo",
+        time: { created: 2 },
+      },
+      {
+        id: "after", type: "assistant", agent: "build", model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "later" }], time: { created: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = createTimelineProjection({
+      sessionMessages: messages, status: { type: "idle" }, reasoningMode: "hidden",
+    })
+
+    expect(result.rows.map(TimelineRow.key)).toEqual([
+      "user-message:before",
+      "turn-gap:recorded",
+      "shell:recorded",
+      "turn-gap:after",
+      "assistant-part:part:part:after:after:text:0",
+    ])
+    expect(result.assistantMessagesByParent.has("before")).toBe(false)
+    expect(result.userContextByID.get("before")?.agent).toBe("")
+  })
+
+  test("applies shell placement, not notice placement, to recorded shells", () => {
+    const messages = [{
+      id: "recorded", type: "shell-recorded", callID: "old-call", command: "pwd", output: "/repo",
+      time: { created: 2 },
+    }] satisfies SessionMessageInfo[]
+
+    const rows = (timelineDetail: Parameters<typeof createTimelineProjection>[0]["timelineDetail"]) =>
+      createTimelineProjection({
+        sessionMessages: messages, status: { type: "idle" }, reasoningMode: "hidden", timelineDetail,
+      }).rows
+
+    expect(rows({ ...timelinePresets[0].value, notices: { placement: "hidden" } }).map(TimelineRow.key)).toEqual([
+      "shell:recorded",
+    ])
+    expect(rows(timelinePresets[2].value)).toEqual([
+      new TimelineRow.AssistantPart({
+        userMessageID: "recorded", previousAssistantPart: false,
+        group: { type: "context", key: "message:recorded", refs: [{ messageID: "recorded", partID: "recorded" }] },
+      }),
+    ])
+    expect(rows(timelinePresets[4].value)).toEqual([])
+  })
+
   test("derives turns and tagged rows from chronological current messages", () => {
     const source = [
       { id: "msg_1", type: "user", text: "first", time: { created: 1 } },

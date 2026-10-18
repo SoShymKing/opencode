@@ -9,6 +9,8 @@ import { entryGroupKey } from "../../src/mini/scrollback.writer"
 import { RUN_THEME_FALLBACK, RUN_THEME_MONO, type RunTheme } from "../../src/mini/theme"
 import type { StreamCommit } from "../../src/mini/types"
 import { canonicalToolPart } from "./fixture/tool-part"
+import { recordedAssistant, recordedShell, recordedUser } from "../fixture/recorded-history"
+import { recordedFileText, recordedShellText, recordedToolText } from "../../src/util/recorded-history"
 
 type ClaimedCommit = {
   snapshot: {
@@ -126,6 +128,59 @@ function reasoning(text: string, phase: StreamCommit["phase"] = "progress"): Str
     partID: "part-r-1",
   }
 }
+
+test.each([44, 100])("prints static recorded history through mini scrollback at width %s", async (width) => {
+  const out = await setup({ width })
+  try {
+    await out.scrollback.append({ kind: "system", source: "system", text: recordedShellText(recordedShell()), phase: "start", messageID: "msg_recorded", partID: "shell-recorded" })
+    for (const file of recordedUser.recordedFiles ?? [])
+      await out.scrollback.append({ kind: "system", source: "system", text: recordedFileText(file), phase: "start", messageID: "msg_recorded_user", partID: "recorded-file:0" })
+    await out.scrollback.complete()
+    const commits = claim(out.renderer)
+    try {
+      const output = render(commits)
+      expect(output).toContain("Recorded shell (outcome unknown)")
+      expect(output).toContain("$ printf recorded")
+      expect(output).toContain("recorded output")
+      expect(output.replace(/\s+/g, "")).toContain("Unavailablefile:missing.png-notaURI:%zz")
+      expect(output).not.toMatch(/running|completed|success|bad title|\u001b|\u0007/)
+      if (process.env.TUI_HISTORY_QA_DIR)
+        await Bun.write(`${process.env.TUI_HISTORY_QA_DIR}/recorded-mini-${width}.txt`, output)
+    } finally {
+      destroy(commits)
+    }
+  } finally {
+    out.scrollback.destroy()
+    destroy(claim(out.renderer))
+  }
+})
+
+test.each([44, 100])("prints recorded assistant tool facts through mini scrollback at width %s", async (width) => {
+  const out = await setup({ width })
+  try {
+    for (const part of recordedAssistant.content) {
+      if (part.type !== "tool") continue
+      await out.scrollback.append({ kind: "system", source: "system", text: recordedToolText(part), phase: "start", messageID: recordedAssistant.id, partID: `recorded-tool:${part.id}` })
+    }
+    await out.scrollback.complete()
+    const commits = claim(out.renderer)
+    try {
+      const output = render(commits)
+      const text = output.replace(/\s+/g, "")
+      for (const fact of ["savedprogress", "partial-read", "saved-output", "hosted-raw", "saved-error", "saved-partial", "saved-task"])
+        expect(text).toContain(fact)
+      expect(text).toContain("Unavailablefile:absent.png-notaURI:%zz")
+      expect(output).not.toMatch(/running shell|running read|\u001b|\u0007/)
+      if (process.env.TUI_HISTORY_QA_DIR)
+        await Bun.write(`${process.env.TUI_HISTORY_QA_DIR}/recorded-tools-mini-${width}.txt`, commits.map((commit) => renderRows(commit, width).join("\n")).join("\n"))
+    } finally {
+      destroy(commits)
+    }
+  } finally {
+    out.scrollback.destroy()
+    destroy(claim(out.renderer))
+  }
+})
 
 test("turn summary starts at the left edge", async () => {
   const out = await setup()

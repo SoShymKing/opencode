@@ -1,6 +1,6 @@
 import { createMemo } from "solid-js"
 import { useData } from "../../context/data"
-import { DialogSelect } from "../../ui/dialog-select"
+import { DialogSelect, type DialogSelectOption } from "../../ui/dialog-select"
 import { useClipboard } from "../../context/clipboard"
 import { useToast } from "../../ui/toast"
 import { useClient } from "../../context/client"
@@ -8,6 +8,7 @@ import { errorMessage } from "../../util/error"
 import { DialogFork } from "./dialog-fork"
 import type { PromptInfo } from "../../prompt/history"
 import { projectedPromptInput } from "../../prompt/codec"
+import { recordedFileText, recordedShellText } from "../../util/recorded-history"
 
 export function DialogMessage(props: {
   messageID: string
@@ -23,7 +24,7 @@ export function DialogMessage(props: {
   return (
     <DialogSelect
       title="Message Actions"
-      options={[
+      options={([
         {
           title: "Jump to",
           value: "message.jump",
@@ -57,15 +58,17 @@ export function DialogMessage(props: {
             if (!value) return
             const text =
               value.type === "user"
-                ? value.text
-                : value.type === "assistant"
-                  ? value.content
-                      .filter((content) => content.type === "text")
-                      .map((content) => content.text)
-                      .join("\n")
-                  : "text" in value
-                    ? value.text
-                    : ""
+                ? [value.text, ...(value.recordedFiles ?? []).map(recordedFileText)].join("\n")
+                : value.type === "shell-recorded"
+                  ? recordedShellText(value)
+                  : value.type === "assistant"
+                    ? value.content
+                        .filter((content) => content.type === "text")
+                        .map((content) => content.text)
+                        .join("\n")
+                    : "text" in value
+                      ? value.text
+                      : ""
             try {
               await clipboard.write(text)
               dialog.clear()
@@ -84,7 +87,9 @@ export function DialogMessage(props: {
             dialog.replace(() => <DialogFork sessionID={props.sessionID} messageID={props.messageID} />)
           },
         },
-      ]}
+      ] satisfies DialogSelectOption<string>[]).filter(
+        (option) => message()?.type !== "shell-recorded" || !["session.revert", "session.fork"].includes(option.value),
+      )}
     />
   )
 }

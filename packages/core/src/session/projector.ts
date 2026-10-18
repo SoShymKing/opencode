@@ -14,7 +14,8 @@ import { SessionMessageUpdater } from "./message-updater.js"
 import { SessionInbox } from "./inbox.js"
 import { Workspace } from "@opencode/schema/workspace"
 import { InstructionState } from "./instruction-state.js"
-import { SessionInboxTable, SessionMessagePartTable, SessionMessageTable, SessionTable } from "./sql.js"
+import { WsInstructionFrame } from "./ws-instruction-frame.js"
+import { InstructionStateTable, SessionInboxTable, SessionMessagePartTable, SessionMessageTable, SessionTable } from "./sql.js"
 import { decodeEnvelope, encodeStoredMessage, insertMessageChildren } from "./message-storage.js"
 import { projectContentEvent, replaceContent } from "./projector-content.js"
 import { InstructionEntry } from "./instruction-entry.js"
@@ -256,6 +257,25 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
     cursor = rows.at(-1)!.seq
   }
   if (copiedSeq !== undefined) yield* Bus.reserveSequence(db, event.data.sessionID, copiedSeq)
+  if (event.data.instructionSourceSeq !== undefined) {
+    if (event.data.instructions === undefined) return yield* Effect.die(new Error("Frozen fork capture has no instruction hashes"))
+    const frame = yield* WsInstructionFrame.resolve(db, {
+      sessionID: event.data.parentID,
+      throughSeq: event.data.instructionSourceSeq,
+      values: event.data.instructions,
+    })
+    const seq = Math.max(event.durable.seq, copiedSeq ?? -1)
+    yield* db.insert(InstructionStateTable).values({
+      session_id: event.data.sessionID,
+      epoch_start: seq,
+      through_seq: seq,
+      initial_values: {},
+      current_values: frame.values,
+      frozen_baseline: frame.baseline,
+      imported_removals: frame.removals,
+    }).run().pipe(Effect.orDie)
+    return
+  }
   if (event.data.instructions)
     yield* InstructionState.initialize(db, event.data.sessionID, event.durable.seq, event.data.instructions)
 })
@@ -692,6 +712,7 @@ const layer = Layer.effectDiscard(
                 metadata: input.payload.metadata,
                 text: input.payload.text,
                 files: input.payload.files,
+                recordedFiles: input.payload.recordedFiles,
                 agents: input.payload.agents,
                 skills: input.payload.skills,
                 time: { created: DateTime.makeUnsafe(event.created) },

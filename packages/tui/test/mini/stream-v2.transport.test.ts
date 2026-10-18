@@ -19,6 +19,7 @@ import type { StreamCommit } from "../../src/mini/types"
 import { createFooterApiFixture } from "./fixture/footer-api"
 import { canonicalToolPart } from "./fixture/tool-part"
 import { tmpdir } from "../fixture/fixture"
+import { recordedAssistant, recordedShell, recordedUser } from "../fixture/recorded-history"
 
 type RunV2Event = EventSubscribeOutput
 
@@ -229,6 +230,121 @@ afterEach(() => {
 })
 
 describe("V2 mini transport", () => {
+  test("renders recorded assistant tools without native tracking or footer transitions", async () => {
+    const events = feed()
+    events.push(connected())
+    const ui = footer()
+    const client = sdk({ streams: [events], messages: { ses_1: [recordedAssistant] } })
+    const transport = await createSessionTransport({ sdk: client, sessionID: "ses_1", thinking: false, replay: true, footer: ui.api })
+    try {
+      const output = ui.commits.map((commit) => commit.text).join("\n")
+      for (const text of ["savedprogress", "partial-read", "saved-output", "hosted-raw", "saved-error", "saved-partial", "saved-task", "Unavailable file:"])
+        expect(output).toContain(text)
+      expect(output).toContain("outcome unknown")
+      expect(output).toContain('"nested":{"exact":true}')
+      expect(output).toContain('"count":0')
+      expect(output).toContain("Recorded result: false")
+      expect(output).not.toMatch(/\u001b|\u0007/)
+      expect(ui.commits.every((commit) => !commit.shell && !commit.tool && !commit.toolState && !commit.image)).toBe(true)
+      expect(ui.events.some((event) => event.type === "stream.patch" && event.patch.phase === "running")).toBe(false)
+      expect(ui.events.flatMap((event) => event.type === "stream.subagent" ? event.state.tabs : [])).toEqual([])
+      const count = ui.commits.length
+      const before = ui.events.length
+      await transport.waitForIdle()
+      expect(ui.commits).toHaveLength(count)
+      expect(ui.events.slice(before).some((event) => event.type === "stream.patch" && event.patch.phase === "running")).toBe(false)
+      const rows = ui.commits.map((commit) => ({ commit }))
+      await transport.replayOnResize({ localRows: () => rows, reset: async () => { ui.commits.length = 0 } })
+      expect(ui.commits).toHaveLength(count)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test("renders recorded assistant tools in an existing child without adopting recorded jobs", async () => {
+    const events = feed()
+    events.push(connected())
+    const ui = footer()
+    const client = sdk({
+      streams: [events], messages: { ses_1: [], ses_child: [recordedAssistant] },
+      sessions: [{ id: "ses_child", parentID: "ses_1", title: "Existing child", time: { updated: 4 } }],
+    })
+    const transport = await createSessionTransport({ sdk: client, sessionID: "ses_1", thinking: false, replay: true, footer: ui.api })
+    try {
+      transport.selectSubagent("ses_child")
+      const deadline = Date.now() + 2000
+      while (!ui.events.some((event) => event.type === "stream.subagent" && event.state.details.ses_child?.commits.some((commit) => commit.text.includes("savedprogress")))) {
+        if (Date.now() > deadline) throw new Error("child recorded history did not render")
+        await Bun.sleep(10)
+      }
+      const snapshot = ui.events.flatMap((event) => event.type === "stream.subagent" ? [event.state] : []).at(-1)
+      const commits = snapshot?.details.ses_child?.commits ?? []
+      expect(commits).toHaveLength(recordedAssistant.content.length)
+      expect(commits.every((commit) => !commit.tool && !commit.toolState && !commit.shell && !commit.image)).toBe(true)
+      expect(snapshot?.tabs.some((tab) => tab.sessionID === "ses_must_not_adopt")).toBe(false)
+    } finally {
+      await transport.close()
+    }
+  })
+
+  test.each([undefined, 2])("renders recorded history without live shell state, completed=%s", async (completed) => {
+    const events = feed()
+    events.push(connected())
+    const idle = defer()
+    const client = sdk({
+      streams: [events],
+      messages: { ses_1: [recordedUser, recordedShell(completed)] },
+      active: () => ({ ses_1: { type: "running" } }),
+      wait: () => idle.promise,
+    })
+    const ui = footer()
+    const transport = await createSessionTransport({ sdk: client, sessionID: "ses_1", thinking: false, replay: true, footer: ui.api })
+    try {
+      expect(ui.commits).toMatchObject([
+        { messageID: "msg_recorded", partID: "shell-recorded", text: "Recorded shell (outcome unknown)\n$ printf recorded\nrecorded output\nsecond line" },
+        { messageID: "msg_recorded_user", partID: "recorded-file:0", text: "Unavailable file: missing.png - not a URI:%zz" },
+      ])
+      expect(ui.commits.every((item) => !item.shell && !item.toolState && !item.image)).toBe(true)
+      expect(ui.events.findLast((event) => event.type === "stream.patch")?.patch.phase).toBe("running")
+      let finished = false
+      const waiting = transport.waitForIdle().then(() => { finished = true })
+      await transport.replayOnResize({ localRows: () => [], reset: async () => { ui.commits.length = 0 } })
+      expect(finished).toBe(false)
+      expect(ui.commits).toHaveLength(2)
+      expect(ui.events.findLast((event) => event.type === "stream.patch")?.patch.phase).toBe("running")
+      idle.resolve()
+      await waiting
+      expect(ui.commits).toHaveLength(2)
+    } finally {
+      idle.resolve()
+      await transport.close()
+    }
+  })
+
+  test.each([true, false])("keeps recorded history idempotent on reconnect, replay=%s", async (replay) => {
+    const first = feed()
+    const second = feed()
+    first.push(connected())
+    second.push(connected("evt_reconnected"))
+    const client = sdk({ streams: [first, second], messages: { ses_1: [recordedUser, recordedShell(), recordedAssistant] } })
+    const ui = footer()
+    const projected = spyOn(client.message, "list")
+    const transport = await createSessionTransport({ sdk: client, sessionID: "ses_1", thinking: false, replay, footer: ui.api })
+    try {
+      first.close()
+      const deadline = Date.now() + 2000
+      while (projected.mock.calls.length < 2) {
+        if (Date.now() > deadline) throw new Error("reconnect did not hydrate history")
+        await Bun.sleep(10)
+      }
+      await transport.waitForIdle()
+      expect(ui.commits).toHaveLength(replay ? 2 + recordedAssistant.content.length : 0)
+      expect(ui.commits.every((item) => !item.shell && !item.toolState && !item.image)).toBe(true)
+    } finally {
+      await transport.close()
+    }
+  })
+
   test.each(["steer", "queue"] as const)("cancels the first local %s after attaching while busy", async (delivery) => {
     const events = feed()
     events.push(connected())
@@ -3183,15 +3299,17 @@ describe("V2 mini transport", () => {
     await transport.close()
   })
 
-  test("does not resolve an owned shell output wait from an unrelated shell", async () => {
+  test.each([undefined, 2])("does not resolve an owned shell output wait from an unrelated shell or recording, completed=%s", async (completed) => {
     const events = feed()
     events.push(connected())
-    const client = sdk({ streams: [events] })
+    const messages: Record<string, SessionMessages> = { ses_1: [] }
+    const client = sdk({ streams: [events], messages, active: () => ({ ses_1: { type: "running" } }) })
     const ui = footer()
     const transport = await createSessionTransport({
       sdk: client,
       sessionID: "ses_1",
       thinking: false,
+      replay: true,
       footer: ui.api,
     })
     let request: Parameters<OpenCodeClient["session"]["shell"]>[0] | undefined
@@ -3217,6 +3335,15 @@ describe("V2 mini transport", () => {
         done = true
       })
     while (!request) await Bun.sleep(0)
+    if (!request.id) throw new Error("shell request missing message ID")
+    messages.ses_1 = [recordedAssistant, { ...recordedShell(completed), id: request.id, callID: "sh_owned" }]
+    const beforeRecording = ui.events.length
+    await transport.replayOnResize({ localRows: () => [], reset: async () => { ui.commits.length = 0 } })
+    expect(ui.commits).toHaveLength(1 + recordedAssistant.content.length)
+    expect(ui.commits[0]).toMatchObject({ partID: "shell-recorded", kind: "system" })
+    expect(ui.commits[0]?.shell).toBeUndefined()
+    expect(ui.commits[0]?.toolState).toBeUndefined()
+    expect(ui.events.slice(beforeRecording).some((event) => event.type === "stream.patch" && event.patch.phase === "idle")).toBe(false)
     events.push({
       id: "evt_unrelated_shell",
       created: 0,

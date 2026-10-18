@@ -1,9 +1,11 @@
 import type { SessionMessageAssistant, SessionMessageInfo } from "@opencode/client/promise"
-import { createMemo } from "solid-js"
+import { createMemo, createSignal } from "solid-js"
+import { DataProvider } from "../context/data"
 import { createStore } from "solid-js/store"
 import type { SessionDocument } from "../document"
 import { SessionTimeline } from "./session-timeline"
 import type { ReasoningMode } from "./projection"
+import { timelinePresets } from "./detail"
 import { CurrentSessionProviders, CurrentSessionTimelineStory } from "../storybook/current-session-story"
 import {
   CURRENT_SESSION_ID,
@@ -54,6 +56,97 @@ export const StreamingReasoningAndText = {
       width="560px"
     />
   ),
+}
+
+export const RecordedHistory = {
+  args: { grouped: false },
+  render: (args: { grouped: boolean }) => {
+    const [liveReads, setLiveReads] = createSignal(0)
+
+    const document = {
+      sessionID: CURRENT_SESSION_ID,
+      status: { type: "idle" },
+      diffs: [],
+      messages: [
+        {
+          id: "recorded-user",
+          type: "user",
+          text: "Imported history",
+          time: { created: STORY_TIME },
+          recordedFiles: [{ uri: "javascript:alert('unavailable')", name: "missing-image.png", mime: "image/png" }],
+        },
+        {
+          id: "recorded-shell",
+          type: "shell-recorded",
+          callID: "historical-call",
+          command: "printf 'hello / مرحبا'",
+          output: "recorded output / مرحبا\n" + "saved line\n".repeat(7000) + "END OF RECORD",
+          time: { created: STORY_TIME + 1000 },
+        },
+        {
+          id: "recorded-assistant",
+          type: "assistant",
+          agent: "build",
+          model: STORY_MODEL,
+          time: { created: STORY_TIME + 2000, completed: STORY_TIME + 3000 },
+          content: [
+            {
+              type: "tool",
+              id: "recorded-progress",
+              name: "shell",
+              time: { created: STORY_TIME + 2000 },
+              state: {
+                status: "running",
+                input: { command: "old-build --watch" },
+                metadata: { shellID: "not-a-live-shell", status: "running" },
+              },
+              recorded: {
+                content: [{ type: "text", text: "Saved progress, not a live job" }],
+                attachments: [{ uri: "file:///unavailable/report.txt", mime: "text/plain", name: "report.txt" }],
+              },
+            },
+          ],
+        },
+        {
+          id: "native-shell",
+          type: "shell",
+          shellID: "native-shell-job",
+          command: "pwd",
+          status: "exited",
+          exit: 0,
+          output: { output: "/native/repo", cursor: 12, size: 12, truncated: false },
+          time: { created: STORY_TIME + 4000, completed: STORY_TIME + 5000 },
+        },
+      ],
+    } satisfies SessionDocument
+
+    return (
+      <section class="mx-auto w-full max-w-[840px] p-6">
+        <CurrentSessionProviders document={document}>
+          <DataProvider
+            directory="/recorded"
+            data={{ session: [], session_status: {}, session_diff: {} }}
+            shellRunning={(id) => {
+              if (id !== "native-shell-job") setLiveReads((count) => count + 1)
+
+              return false
+            }}
+            shellOutput={async () => {
+              setLiveReads((count) => count + 1)
+              throw new Error("Recorded output must not load a live shell")
+            }}
+          >
+            <SessionTimeline
+              document={document}
+              shellToolDefaultOpen
+              timelineDetail={args.grouped ? timelinePresets[2].value : timelinePresets[0].value}
+            />
+          </DataProvider>
+          <output data-testid="recorded-live-reads">{liveReads()}</output>
+        </CurrentSessionProviders>
+      </section>
+    )
+  },
 }
 
 function AgentReasoningStory(props: { mode: ReasoningMode; reasoning: string; tool: boolean; text: string }) {

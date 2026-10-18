@@ -122,7 +122,17 @@ import { SessionLocationMissing } from "./location-missing"
 import { isRecord } from "../../util/record"
 import { createHistoryPrepend } from "./history"
 import { context, use, type PendingAction } from "./render-context"
-import { INLINE_TOOL_ICON_WIDTH, InlineToolRow, ReasoningPart, TextPart, toolDisplay } from "./message-parts"
+import {
+  INLINE_TOOL_ICON_WIDTH,
+  InlineToolRow,
+  ReasoningPart,
+  TextPart,
+  toolDisplay,
+  RecordedShellMessage,
+  RecordedFiles,
+  RecordedToolPart,
+} from "./message-parts"
+import { recordedFileText, recordedShellText, recordedToolText } from "../../util/recorded-history"
 import { defaultVerbosity, type GroupKind, type SessionEntry } from "./grouping/session"
 import { SessionGroupView } from "./group-view"
 import { useEntryAnchor } from "./anchor-view"
@@ -1771,7 +1781,7 @@ function BackgroundToolHint(props: { messages: SessionMessageInfo[] }) {
       (message): message is SessionMessageAssistant => message.type === "assistant" && !message.time.completed,
     )
     const part = current?.content.find((part): part is SessionMessageAssistantTool => {
-      if (part.type !== "tool" || part.state.status !== "running") return false
+      if (part.type !== "tool" || part.recorded !== undefined || part.state.status !== "running") return false
       const name = canonicalToolName(part.name)
       return name === "shell" || name === "subagent"
     })
@@ -1804,6 +1814,9 @@ function SessionMessageView(props: { message: SessionMessageInfo }) {
       </Match>
       <Match when={props.message.type === "shell"}>
         <ShellMessage message={props.message as Extract<SessionMessageInfo, { type: "shell" }>} />
+      </Match>
+      <Match when={props.message.type === "shell-recorded"}>
+        <RecordedShellMessage message={props.message as Extract<SessionMessageInfo, { type: "shell-recorded" }>} />
       </Match>
       <Match
         when={
@@ -2235,7 +2248,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
   }
 
   return (
-    <Show when={props.message.text.trim() || files().length || skills().length}>
+    <Show when={props.message.text.trim() || files().length || skills().length || props.message.recordedFiles?.length}>
       <box
         border={["left"]}
         borderColor={delivery() ? theme.border.base : color()}
@@ -2284,6 +2297,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
           flexShrink={0}
         >
           <text fg={theme.text.base}>{props.message.text}</text>
+          <RecordedFiles files={props.message.recordedFiles} />
           <Show when={skills().length}>
             <box flexDirection="row" paddingTop={1} gap={1} flexWrap="wrap">
               <For each={skills()}>
@@ -2426,6 +2440,9 @@ function ToolPart(props: { part: SessionMessageAssistantTool; images?: boolean }
 
   const content = (
     <Switch>
+      <Match when={props.part.recorded !== undefined}>
+        <RecordedToolPart part={props.part} />
+      </Match>
       <Match when={display() === "shell"}>
         <Shell {...toolprops} />
       </Match>
@@ -2472,7 +2489,7 @@ function ToolPart(props: { part: SessionMessageAssistantTool; images?: boolean }
   )
   return [
     content,
-    <Show when={props.images !== false}>
+    <Show when={props.part.recorded === undefined && props.images !== false}>
       <ToolImages parts={[props.part]} />
     </Show>,
   ]
@@ -3541,7 +3558,8 @@ function formatSessionTranscript(
   tools = true,
 ) {
   const body = messages.flatMap((message) => {
-    if (message.type === "user") return [`## User\n\n${message.text}`]
+    if (message.type === "user") return [`## User\n\n${[message.text, ...(message.recordedFiles ?? []).map(recordedFileText)].join("\n")}`]
+    if (message.type === "shell-recorded") return [`## Shell Recording\n\n${recordedShellText(message)}`]
     if (message.type === "shell")
       return [`## Shell\n\n\`\`\`\n$ ${message.command}\n${message.output?.output ?? ""}\n\`\`\``]
     if (message.type !== "assistant") return []
@@ -3549,6 +3567,7 @@ function formatSessionTranscript(
       if (item.type === "text") return [item.text]
       if (item.type === "reasoning") return thinking ? [`_Thinking:_\n\n${item.text}`] : []
       if (!tools) return []
+      if (item.recorded !== undefined) return [recordedToolText(item)]
       const input = typeof item.state.input === "string" ? item.state.input : JSON.stringify(item.state.input, null, 2)
       const output =
         item.state.status === "error"

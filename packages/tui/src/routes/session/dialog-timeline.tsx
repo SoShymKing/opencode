@@ -5,6 +5,7 @@ import { Locale } from "../../util/locale"
 import { DialogMessage } from "./dialog-message"
 import { useDialog } from "../../ui/dialog"
 import type { PromptInfo } from "../../prompt/history"
+import { recordedFileText, historyText } from "../../util/recorded-history"
 
 export function DialogTimeline(props: {
   sessionID: string
@@ -22,9 +23,13 @@ export function DialogTimeline(props: {
     const messages = data.session.message.list(props.sessionID)
     const result = [] as DialogSelectOption<string>[]
     for (const message of messages) {
-      if (message.type !== "user") continue
+      if (message.type !== "user" && message.type !== "shell-recorded") continue
       result.push({
-        title: message.text.replace(/\n/g, " "),
+        title: historyText(
+          message.type === "shell-recorded"
+            ? `Recorded shell: ${message.command}`
+            : [message.text, ...(message.recordedFiles ?? []).map(recordedFileText)].join("\n"),
+        ).replace(/\n/g, " "),
         value: message.id,
         footer: Locale.time(message.time.created),
         onSelect: (dialog) => {

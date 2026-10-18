@@ -4,6 +4,7 @@ import type {
   SessionMessageIdle,
   SessionMessageInfo,
   SessionMessageShell,
+  SessionMessageRecordedShell,
   SessionMessageUser,
   SessionStatus,
 } from "@opencode/client/promise"
@@ -37,7 +38,7 @@ export function thinkingStreamCount(
   return message?.streamEventCount
 }
 
-type Notice = Exclude<SessionMessageInfo, { type: "user" | "assistant" | "shell" | "idle" }>
+type Notice = Exclude<SessionMessageInfo, { type: "user" | "assistant" | "shell" | "shell-recorded" | "idle" }>
 
 type FailedIdle = SessionMessageIdle & {
   outcome: "failed"
@@ -259,7 +260,7 @@ export namespace Timeline {
       id: string
       time: { created: number }
       user?: SessionMessageUser
-      shell?: SessionMessageShell
+      shell?: SessionMessageShell | SessionMessageRecordedShell
       entries: Entry[]
     }
 
@@ -279,7 +280,7 @@ export namespace Timeline {
         return
       }
 
-      if (message.type === "shell") {
+      if (message.type === "shell" || message.type === "shell-recorded") {
         const turn: Turn = { id: message.id, time: message.time, shell: message, entries: [] }
         turns.push(turn)
         current = turn
@@ -657,7 +658,9 @@ function isFailedIdle(message: SessionMessageInfo): message is FailedIdle {
   return message.type === "idle" && message.outcome === "failed" && !!message.error
 }
 
-function shellFailed(message: SessionMessageShell) {
+function shellFailed(message: SessionMessageShell | SessionMessageRecordedShell) {
+  if (message.type === "shell-recorded") return false
+
   return (
     message.status === "timeout" || (message.status === "exited" && message.exit !== undefined && message.exit !== 0)
   )
@@ -766,7 +769,7 @@ function indexUserContext(messages: SessionMessageInfo[]) {
       })
     }
 
-    if (message.type === "shell") userID = undefined
+    if (message.type === "shell" || message.type === "shell-recorded") userID = undefined
 
     if (message.type !== "assistant") return
     agent = message.agent
@@ -785,7 +788,7 @@ function indexAssistantMessages(messages: SessionMessageInfo[]) {
   messages.forEach((message) => {
     if (message.type === "user") userID = message.id
 
-    if (message.type === "shell") userID = undefined
+    if (message.type === "shell" || message.type === "shell-recorded") userID = undefined
 
     if (message.type !== "assistant") return
 
@@ -855,9 +858,10 @@ function renderable(content: Content, showReasoning: boolean, detail?: TimelineD
 
   if (detail && currentToolFailed(content)) return true
 
-  if (content.name === "todowrite") return false
+  if (content.name === "todowrite" && !content.recorded) return false
 
-  if (content.name === "question") return content.state.status !== "streaming" && content.state.status !== "running"
+  if (content.name === "question" && !content.recorded)
+    return content.state.status !== "streaming" && content.state.status !== "running"
 
   if (detail && detail[timelineCategory(content)!].placement === "hidden") return false
 
@@ -956,6 +960,8 @@ function toolGroupType(
 
     if (detail[category].placement === "grouped") return "context"
 
+    if (content.recorded) return undefined
+
     if (currentToolGroupedRead(content)) return "read"
 
     if (currentToolFailed(content)) return undefined
@@ -964,6 +970,8 @@ function toolGroupType(
 
     return undefined
   }
+
+  if (content.recorded) return currentContentDefaultOpen(content, shellExpanded, editExpanded) ? undefined : "context"
 
   if (content.name === "question" || currentToolHasLoadedFiles(content)) return undefined
 
@@ -1063,7 +1071,13 @@ export function unwrapErrorMessage(message: string) {
 }
 
 function isNotice(message: SessionMessageInfo): message is Notice {
-  if (message.type === "user" || message.type === "assistant" || message.type === "shell" || message.type === "idle")
+  if (
+    message.type === "user" ||
+    message.type === "assistant" ||
+    message.type === "shell" ||
+    message.type === "shell-recorded" ||
+    message.type === "idle"
+  )
     return false
 
   if (message.type !== "synthetic") return true

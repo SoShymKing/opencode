@@ -9,6 +9,7 @@ import { DatabaseReplacement } from "@opencode/core/database/replacement"
 import { sql } from "drizzle-orm"
 import { Effect, Schema } from "effect"
 import { createCurrentDatabase } from "./fixture/database-transfer"
+import { createStartupDatabase } from "./fixture/database-startup"
 import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
 
@@ -18,8 +19,8 @@ describe("Database pending replacement", () => {
     const current = path.join(tmp.path, "current.sqlite")
     const legacy = path.join(tmp.path, "legacy.sqlite")
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(current)
-    await createCurrentDatabase(target)
+    await createStartupDatabase(current)
+    await createStartupDatabase(target)
     using old = new SqliteDatabase(target)
     old.query("UPDATE session SET title = 'old target'").run()
     old.run("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -29,7 +30,7 @@ describe("Database pending replacement", () => {
 
     const title = await Effect.runPromise(
       Effect.gen(function* () {
-        return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session`)
+        return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session_v2`)
       }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped),
     )
 
@@ -108,7 +109,7 @@ describe("Database pending replacement", () => {
   test("rejects unsafe marker basenames before touching the target", async () => {
     await using tmp = await tmpdir()
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(target)
+    await createStartupDatabase(target)
     using old = new SqliteDatabase(target)
     old.query("UPDATE session SET title = 'old target'").run()
     old.close()
@@ -135,8 +136,8 @@ describe("Database pending replacement", () => {
     const current = path.join(tmp.path, "current.sqlite")
     const legacy = path.join(tmp.path, "legacy.sqlite")
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(current)
-    await createCurrentDatabase(target)
+    await createStartupDatabase(current)
+    await createStartupDatabase(target)
     await Effect.runPromise(
       Effect.gen(function* () {
         const db = (yield* Database.Service).db
@@ -160,8 +161,8 @@ describe("Database pending replacement", () => {
     const current = path.join(tmp.path, "current.sqlite")
     const legacy = path.join(tmp.path, "legacy.sqlite")
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(current)
-    await createCurrentDatabase(target)
+    await createStartupDatabase(current)
+    await createStartupDatabase(target, true)
     await DatabaseLegacyV01.exportDatabase({ source: current, destination: legacy }).pipe(Effect.runPromise)
     const child = spawnDatabase(target)
     try {
@@ -215,7 +216,7 @@ const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown
 describe("Standalone ws replacement", () => {
   test.each(["prepared", "backup_ready", "renamed"] as const)("preserves the backup at %s", async (phase) => {
     await using tmp = await tmpdir()
-    const fixture = await stagedFixture(tmp.path)
+    const fixture = await stagedFixture(tmp.path, createCurrentDatabase)
     const before = await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)
     if (phase !== "prepared") {
       const backup = `${fixture.target}.replacement-backup-interrupted.db`
@@ -243,7 +244,7 @@ describe("Standalone ws replacement", () => {
 
   test.each(["invalid marker", "corrupt stage", "sidecar"])("leaves the target unchanged for %s", async (state) => {
     await using tmp = await tmpdir()
-    const fixture = await stagedFixture(tmp.path)
+    const fixture = await stagedFixture(tmp.path, createCurrentDatabase)
     const before = await DatabaseArtifact.digest(fixture.target).pipe(Effect.runPromise)
     if (state === "invalid marker") await Bun.write(fixture.marker, "{invalid")
     if (state === "corrupt stage") await Bun.write(fixture.staged, "corrupt")
@@ -257,12 +258,12 @@ describe("Standalone ws replacement", () => {
   })
 })
 
-async function stagedFixture(root: string) {
+async function stagedFixture(root: string, create: (filename: string) => Promise<void> = createStartupDatabase) {
   const current = path.join(root, "current.sqlite")
   const legacy = path.join(root, "legacy.sqlite")
   const target = path.join(root, "target.sqlite")
-  await createCurrentDatabase(current)
-  await createCurrentDatabase(target)
+  await create(current)
+  await create(target)
   using old = new SqliteDatabase(target)
   old.query("UPDATE session SET title = 'old target'").run()
   old.run("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -282,7 +283,7 @@ async function preparedMarker(filename: string) {
 function openTitle(target: string) {
   return Effect.runPromise(
     Effect.gen(function* () {
-      return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session`)
+      return yield* (yield* Database.Service).db.get<{ readonly title: string }>(sql`SELECT title FROM session_v2`)
     }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped),
   )
 }

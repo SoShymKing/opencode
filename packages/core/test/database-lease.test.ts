@@ -7,7 +7,7 @@ import { Database } from "@opencode/core/database/database"
 import { DatabaseLegacyV01 } from "@opencode-ai/core/database/legacy-v01"
 import { DatabaseReplacement } from "@opencode-ai/core/database/replacement"
 import { Effect } from "effect"
-import { createCurrentDatabase } from "./fixture/database-transfer"
+import { createStartupDatabase } from "./fixture/database-startup"
 import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
 
@@ -64,11 +64,11 @@ describe("DatabaseLease", () => {
     const current = path.join(tmp.path, "current.sqlite")
     const legacy = path.join(tmp.path, "legacy.sqlite")
     const target = path.join(tmp.path, "target.sqlite")
-    await createCurrentDatabase(current)
-    await createCurrentDatabase(target)
+    await createStartupDatabase(current)
+    await createStartupDatabase(target, true)
     {
       using old = new SqliteDatabase(target)
-      old.query("UPDATE session SET title = 'old target'").run()
+      old.query("UPDATE session_v2 SET title = 'old target'").run()
       old.run("PRAGMA wal_checkpoint(TRUNCATE)")
     }
     await DatabaseLegacyV01.exportDatabase({ source: current, destination: legacy }).pipe(Effect.runPromise)
@@ -83,11 +83,15 @@ describe("DatabaseLease", () => {
 
     child.kill()
     await child.exited
-    await DatabaseReplacement.activate(target).pipe(Effect.runPromise)
+    await Effect.runPromise(Database.Service.pipe(
+      Effect.provide(Database.layerFromPath(target)),
+      Effect.provide(tempGlobalLayer),
+      Effect.scoped,
+    ))
     expect(await Bun.file(staged.marker).exists()).toBe(false)
     expect(await Bun.file(`${target}.lease.sqlite`).exists()).toBe(true)
     using replaced = new SqliteDatabase(target, { readonly: true })
-    expect(replaced.query<{ readonly title: string }, []>("SELECT title FROM session").get()).toEqual({
+    expect(replaced.query<{ readonly title: string }, []>("SELECT title FROM session_v2").get()).toEqual({
       title: "Session",
     })
   })
