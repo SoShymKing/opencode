@@ -70,51 +70,82 @@ export function message(row: { id: string; type: string; data: string }) {
   })
 }
 
-export function read(db: Reader, archive?: DatabaseWsArchive.Archive) {
+export function validateEvent(row: WsEventCodec.Row & { created: number }) {
   return Effect.gen(function* () {
-    const table = (name: string) => {
+    if (!Number.isSafeInteger(row.created)) return yield* fail(`Invalid P event time: ${row.id}`)
+    if (legacyEvents.has(row.type)) {
+      yield* Effect.try({ try: () => WsEventCodec.decode(row), catch: (cause) => fail(`Invalid P legacy event: ${String(cause)}`) })
+      return
+    }
+    const value = yield* Schema.decodeUnknownEffect(json)(row.data)
+    yield* Schema.decodeUnknownEffect(events)({ type: row.type, data: value }, options)
+    if (value.sessionID !== row.aggregate_id) return yield* fail(`P event aggregate mismatch: ${row.id}`)
+  })
+}
+
+type PendingRow = {
+  id: string; session_id: string; type: string; data: string; delivery: string | null; admitted_seq: number; time_created: number; seq: number | null;
+}
+export type Pending = { row: PendingRow; delivery: typeof SessionInbox.Delivery.Type }
+
+export function read<E = never, R = never>(db: Reader, archive?: DatabaseWsArchive.Archive, acceptPending?: (pending: Pending) => Effect.Effect<void, E, R>) {
+  return Effect.scoped(Effect.gen(function* () {
+    const { WsNativeScan } = yield* Effect.promise(() => import("./ws-native-scan.js"))
+    const { open } = yield* Effect.promise(() => import("#ws-native-worker"))
+    const worker = yield* open
+    const source = (name: string) => {
       const source = archive ? DatabaseWsArchive.sourceTable(archive, name) : name
       if (!source) throw fail(`Archive is missing ${name}`)
-      return DatabaseWsArchive.identifier(source)
+      return source
     }
-    for (const row of yield* db.all<WsEventCodec.Row & { created: number }>(sql`SELECT * FROM ${table("event")}`)) {
-      if (!Number.isSafeInteger(row.created)) return yield* fail(`Invalid P event time: ${row.id}`)
-      if (legacyEvents.has(row.type)) {
-        yield* Effect.try({ try: () => WsEventCodec.decode(row), catch: (cause) => fail(`Invalid P legacy event: ${String(cause)}`) })
-        continue
-      }
-      const value = yield* Schema.decodeUnknownEffect(json)(row.data)
-      yield* Schema.decodeUnknownEffect(events)({ type: row.type, data: value }, options)
-      if (value.sessionID !== row.aggregate_id) return yield* fail(`P event aggregate mismatch: ${row.id}`)
-    }
-    const blobs = yield* db.all<{ hash: string; value: string | null }>(sql`SELECT * FROM ${table("instruction_blob")}`)
-    for (const row of blobs) {
+    const table = (name: string) => DatabaseWsArchive.identifier(source(name))
+    yield* WsNativeScan.rows(db, { table: source("event"), bytes: sql`octet_length(m.data)` },
+      (rows: readonly (WsEventCodec.Row & { created: number })[]) => worker.run(rows.map((row) => ({ kind: "p-event", row }))).pipe(Effect.asVoid))
+    yield* WsNativeScan.rows(db, { table: source("instruction_blob"), key: "hash", bytes: sql`coalesce(octet_length(m.value), 0)` },
+      (rows: readonly { hash: string; value: string | null }[]) => Effect.forEach(rows, (row) => Effect.gen(function* () {
       yield* Schema.decodeUnknownEffect(Instruction.Hash)(row.hash)
       if (row.value !== null) yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(row.value)
+    }), { discard: true }))
+    let cursor: { session_id: string; key: string } | undefined
+    while (true) {
+      const keys = yield* db.all<{ session_id: string; key: string }>(sql`SELECT session_id, key FROM ${table("instruction_entry")}
+        WHERE ${cursor ? sql`(session_id, key) > (${cursor.session_id}, ${cursor.key})` : sql`1`}
+        ORDER BY session_id, key LIMIT 128`)
+      if (!keys.length) break
+      for (const key of keys) {
+        const row = yield* db.get<{ value: string | null; removed: number }>(sql`SELECT value, removed FROM ${table("instruction_entry")}
+          WHERE session_id = ${key.session_id} AND key = ${key.key}`)
+        if (!row) return yield* fail("P instruction entry disappeared")
+        if (row.removed !== 0 && row.removed !== 1) return yield* fail("Invalid P instruction removal flag")
+        if (row.value !== null) yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(row.value)
+        cursor = key
+      }
     }
-    for (const row of yield* db.all<{ value: string | null; removed: number }>(sql`SELECT * FROM ${table("instruction_entry")}`)) {
-      if (row.removed !== 0 && row.removed !== 1) return yield* fail("Invalid P instruction removal flag")
-      if (row.value !== null) yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(row.value)
-    }
-    for (const row of yield* db.all<{ session_id: string; epoch_start: number; through_seq: number; initial_values: string; current_values: string; seq: number | null }>(sql`
-      SELECT i.*, e.seq FROM ${table("instruction_state")} i LEFT JOIN ${table("event_sequence")} e ON e.aggregate_id = i.session_id`)) {
+    yield* WsNativeScan.rows(db, { table: source("instruction_state"), key: "session_id",
+      bytes: sql`octet_length(m.initial_values) + octet_length(m.current_values)`,
+      columns: sql`m.*, (SELECT seq FROM ${table("event_sequence")} e WHERE e.aggregate_id = m.session_id) AS seq`,
+    }, (rows: readonly { session_id: string; epoch_start: number; through_seq: number; initial_values: string; current_values: string; seq: number | null }[]) => Effect.forEach(rows, (row) => Effect.gen(function* () {
       if (row.seq === null || !Number.isSafeInteger(row.epoch_start) || !Number.isSafeInteger(row.through_seq) || row.epoch_start < 0 || row.through_seq < row.epoch_start || row.through_seq > row.seq)
         return yield* fail(`Invalid P instruction watermark: ${row.session_id}`)
       for (const text of [row.initial_values, row.current_values]) {
         const values = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Instruction.Values))(text)
-        if (Object.values(values).some((hash) => !blobs.some((blob) => blob.hash === hash)))
-          return yield* fail(`Missing P instruction blob: ${row.session_id}`)
+        for (const hash of new Set(Object.values(values))) {
+          if (!(yield* db.get(sql`SELECT 1 FROM ${table("instruction_blob")} WHERE hash = ${hash}`)))
+            return yield* fail(`Missing P instruction blob: ${row.session_id}`)
+        }
       }
-    }
-    for (const row of yield* db.all<{ id: string; fork_session_id: string | null; fork_boundary: string | null; time_suspended: number | null }>(sql`SELECT id, fork_session_id, fork_boundary, time_suspended FROM ${table("session")}`)) {
+    }), { discard: true }))
+    yield* WsNativeScan.rows(db, { table: source("session"), bytes: sql`coalesce(octet_length(m.fork_boundary), 0)`,
+      columns: sql`m.id, m.fork_session_id, m.fork_boundary, m.time_suspended`,
+    }, (rows: readonly { id: string; fork_session_id: string | null; fork_boundary: string | null; time_suspended: number | null }[]) => Effect.forEach(rows, (row) => Effect.gen(function* () {
       if (row.fork_boundary !== null) yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Session.ForkBoundary))(row.fork_boundary)
       if (row.fork_session_id !== null && !(yield* db.get(sql`SELECT 1 FROM ${table("session")} WHERE id = ${row.fork_session_id}`)))
         return yield* fail(`Missing P fork parent: ${row.id}`)
       if (row.time_suspended !== null && !Number.isSafeInteger(row.time_suspended)) return yield* fail(`Invalid P suspension time: ${row.id}`)
-    }
-    return yield* Effect.forEach(yield* db.all<{
-      id: string; session_id: string; type: string; data: string; delivery: string | null; admitted_seq: number; time_created: number; seq: number | null;
-    }>(sql`SELECT p.*, e.seq FROM ${table("session_pending")} p LEFT JOIN ${table("event_sequence")} e ON e.aggregate_id = p.session_id ORDER BY p.session_id, p.admitted_seq`), (row) => Effect.gen(function* () {
+    }), { discard: true }))
+    yield* WsNativeScan.rows(db, { table: source("session_pending"), bytes: sql`octet_length(m.data)`,
+      columns: sql`m.*, (SELECT seq FROM ${table("event_sequence")} e WHERE e.aggregate_id = m.session_id) AS seq`,
+    }, (rows: readonly PendingRow[]) => Effect.forEach(rows, (row) => Effect.gen(function* () {
       if (row.seq === null || !Number.isSafeInteger(row.admitted_seq) || row.admitted_seq < 0 || row.admitted_seq > row.seq)
         return yield* fail(`Invalid P pending watermark: ${row.id}`)
       if (yield* db.get(sql`SELECT 1 FROM ${table("session_message")} WHERE id = ${row.id}`)) return yield* fail(`P pending input is already visible: ${row.id}`)
@@ -125,7 +156,7 @@ export function read(db: Reader, archive?: DatabaseWsArchive.Archive) {
         delivery: row.type === "compaction" ? "steer" : row.delivery, time: { created: row.time_created },
       }, options)
       if (item.type !== "user" && item.type !== "synthetic" && item.type !== "compaction") return yield* fail(`Unknown P pending type: ${row.type}`)
-      return { row, delivery: item.delivery }
-    }))
-  })
+      if (acceptPending) yield* acceptPending({ row, delivery: item.delivery })
+    }), { discard: true }))
+  }))
 }
