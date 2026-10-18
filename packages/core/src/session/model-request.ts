@@ -309,14 +309,15 @@ export const layer = Layer.effect(
         if (message.native !== undefined || message.providerMetadata !== undefined) return message
         const content = yield* Effect.forEach(message.content, (part) => Effect.gen(function* () {
           if (part.type !== "tool-result" || part.providerExecuted || part.providerMetadata !== undefined) return part
+          const outputPath = typeof part.metadata?.outputPath === "string" ? part.metadata.outputPath : undefined
           if (part.result.type === "text" && typeof part.result.value === "string") {
-            const value = yield* output.project([{ type: "text", text: part.result.value }])
+            const value = yield* output.project([{ type: "text", text: part.result.value }], outputPath)
             const text = value.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")
             return text === part.result.value ? part : { ...part, result: { ...part.result, value: text } }
           }
           if (part.result.type !== "content") return part
           const previous = part.result.value
-          const value = yield* output.project(previous)
+          const value = yield* output.project(previous, outputPath)
           return value.every((item, index) => item === previous[index]) && value.length === previous.length
             ? part : { ...part, result: { ...part.result, value } }
         }))

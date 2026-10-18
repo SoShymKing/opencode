@@ -30,7 +30,7 @@ export type Editor = {
 
 export interface Interface extends State.Transformable<Editor> {
   readonly truncate: (result: Result) => Effect.Effect<Result>
-  readonly project: (content: readonly Tool.Content[]) => Effect.Effect<readonly Tool.Content[]>
+  readonly project: (content: readonly Tool.Content[], outputPath?: string) => Effect.Effect<readonly Tool.Content[]>
   readonly cleanup: () => Effect.Effect<void>
 }
 
@@ -65,7 +65,7 @@ const layer = Layer.effect(
       }),
     })
 
-    const truncate = Effect.fnUntraced(function* (result: Result, archive = true) {
+    const truncate = Effect.fnUntraced(function* (result: Result, archive = true, outputPath?: string) {
       if (result.metadata?.truncated !== undefined) return result
       const content = result.content
       const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
@@ -84,8 +84,8 @@ const layer = Layer.effect(
         kept.push(line)
         bytes += size
       }
-      const file = archive ? path.join(directory, fileName()) : undefined
-      if (file !== undefined) {
+      const file = archive ? path.join(directory, fileName()) : outputPath
+      if (archive && file !== undefined) {
         yield* fs.ensureDir(directory).pipe(Effect.orDie)
         yield* fs.writeFileString(file, text).pipe(Effect.orDie)
       }
@@ -130,7 +130,7 @@ const layer = Layer.effect(
       transform: state.transform,
       reload: state.reload,
       truncate,
-      project: (content) => truncate({ content: [...content] }, false).pipe(Effect.map((result) => result.content)),
+      project: (content, outputPath) => truncate({ content: [...content] }, false, outputPath).pipe(Effect.map((result) => result.content)),
       cleanup: () => cleanup(fs, directory),
     })
   }),

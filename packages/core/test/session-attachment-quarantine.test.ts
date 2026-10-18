@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { readdir } from "node:fs/promises"
+import path from "node:path"
 import { AIError, CompactionPart, InvalidRequestError, LanguageModel, Media, Message, ProviderID } from "@opencode/ai"
 import { OpenAIChat } from "@opencode/ai/protocols"
 import { TestLLM } from "@opencode/ai/testing"
@@ -241,6 +243,64 @@ it.effect("bounds stored tool text after hooks without changing history or attac
   expect(changed.request.messages).toEqual(cold.request.messages)
   expect(changed.request.messages.flatMap((message) => message.content).find((part) => part.type === "tool-result")?.result)
     .toEqual({ type: "text", value: expect.stringMatching(/^new\nx\n\[/) })
+}))
+
+for (const kind of ["primary", "compaction", "generate"] as const) it.effect(`preserves archived tool output during ${kind} preparation and bounds hook changes`, () => Effect.gen(function* () {
+  const database = yield* Database.Service
+  const bus = yield* Bus.Service
+  const store = yield* SessionStore.Service
+  const output = yield* ToolOutput.Service
+  const hooks = yield* PluginHooks.Service
+  yield* output.transform((editor) => editor.configure({ maxLines: 2, maxBytes: 10 }))
+  const truncated = yield* output.truncate({ content: [{ type: "text", text: "alpha\nbeta\ngamma" }] })
+  const outputPath = truncated.metadata?.outputPath
+  if (typeof outputPath !== "string") throw new Error("Missing full-output artifact")
+  const artifacts = yield* Effect.promise(() => readdir(path.dirname(outputPath)))
+  const sessionID = Session.ID.make("ses_archived_output")
+  yield* database.db.insert(ProjectTable).values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] }).run()
+  yield* bus.publish(SessionEvent.Created, { sessionID, projectID: Project.ID.global, location: { directory: AbsolutePath.make("/project") }, slug: "archived-output", version: "test" })
+  const native = decode({ id: "msg_archived_output", type: "assistant", agent: "build", model: model.ref,
+    time: { created: 1, completed: 2 }, content: [false, true].map((file) => ({
+      type: "tool", id: file ? "mixed" : "text", name: "read", time: { created: 1, completed: 2 },
+      state: { status: "completed", input: {}, metadata: truncated.metadata, content: [...truncated.content,
+        ...(file ? [{ type: "file", mime: "image/png", uri: "data:image/png;base64,aW1hZ2U=" }] : []),
+      ] },
+    })),
+  })
+  const stored = yield* encodeStoredMessage(native)
+  yield* database.db.insert(SessionMessageTable).values({ ...stored.envelope, id: native.id, session_id: sessionID, seq: 1, time_created: 0 }).run()
+  yield* insertMessageChildren(database.db, stored.parts)
+  const session = yield* store.get(sessionID)
+  const loaded = yield* store.message(native.id)
+  if (!session || !loaded) throw new Error("Missing stored fixture")
+  const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer), Effect.provideService(SessionModelTransport.Service, {
+    bind: () => ({ execute: () => Effect.die("unused") }), invalidateContinuation: () => Effect.void, close: () => Effect.void, closeAll: Effect.void,
+  }))
+  const converter = createConverter()
+  const base = () => SessionModelRequest.baseTranscript({ agent, model, tools, initial: "", messages: [loaded.message] }, converter)
+  const texts = (prepared: SessionModelRequest.Prepared) => prepared.request.messages.flatMap((message) => message.content).flatMap((part) =>
+    part.type !== "tool-result" ? [] : part.result.type === "content"
+      ? [part.result.value.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")]
+      : part.result.type === "text" && typeof part.result.value === "string" ? [part.result.value] : [],
+  )
+  for (const prepare of [requests[kind], requests[kind]]) {
+    const prepared = yield* prepare({ session, agent: agent.id, model, ...base() })
+    expect(texts(prepared)).toHaveLength(2)
+    expect(texts(prepared).every((text) => text.includes(outputPath))).toBe(true)
+    expect(texts(prepared).every((text) => text.startsWith("alpha\nbeta\n"))).toBe(true)
+    expect(prepared.attachmentBatch).toEqual({ coverage: "complete", refs: refs([{ source: "tool", messageID: native.id, partIndex: 1, contentIndex: truncated.content.length }]) })
+  }
+  const hook = yield* hooks.register("session", kind === "primary" ? "context" : kind, (event) => Effect.sync(() => {
+    for (const message of event.messages) for (const part of message.content)
+      if (part.type === "tool-result") Object.assign(part, { result: { type: "text", value: "changed\n".repeat(1000) } })
+  }))
+  const hooked = yield* requests[kind]({ session, agent: agent.id, model, ...base() })
+  expect(texts(hooked).every((text) => text.length < outputPath.length + 100)).toBe(true)
+  expect(texts(hooked).every((text) => text.startsWith("changed\n"))).toBe(true)
+  yield* hook.dispose
+  expect(yield* Effect.promise(() => Bun.file(outputPath).text())).toBe("alpha\nbeta\ngamma")
+  expect(yield* Effect.promise(() => readdir(path.dirname(outputPath)))).toEqual(artifacts)
+  expect((yield* store.message(native.id))?.message).toEqual(native)
 }))
 
 it.effect("retains continuation for unknown coverage and rejects context-hook wrapper attribution", () => Effect.gen(function* () {
