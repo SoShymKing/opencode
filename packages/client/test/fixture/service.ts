@@ -1,4 +1,5 @@
 import { appendFile, rename, rm, writeFile } from "node:fs/promises"
+import { existsSync } from "node:fs"
 
 const [registration, mode, delay] = process.argv.slice(2)
 if (registration === undefined || mode === undefined) throw new Error("Missing service fixture arguments")
@@ -44,7 +45,7 @@ if (mode === "delayed" || mode === "delayed-failed" || mode === "coordinated" ||
 
 let requests = 0
 let version = "test"
-if (mode === "old" || mode === "handoff") version = "old"
+if (mode === "old" || mode === "handoff" || mode === "database-old" || mode === "database-ready-old") version = "old"
 if (mode === "incompatible") version = "1.9.0"
 if (mode === "compatible" || mode === "delayed-compatible") version = "2.1.0-next.1"
 const id = crypto.randomUUID()
@@ -74,6 +75,18 @@ const server = Bun.serve({
     if (mode === "protocol" && (await Bun.file(registration + ".missing-health").exists()))
       return new Response(null, { status: 404 })
     requests += 1
+    if (mode === "churn" || (mode === "database-ready-old" && existsSync(registration + ".release"))) {
+      const info = await Bun.file(registration).json()
+      if (mode === "churn") info.id = crypto.randomUUID()
+      else delete info.startup
+      await writeFile(registration + `.${process.pid}.tmp`, JSON.stringify(info), { mode: 0o600 })
+      await publish()
+    }
+    if (mode === "database-probe" && requests <= 3) {
+      await appendFile(registration + ".requests", process.pid + "\n")
+      if (requests < 3) return new Promise<Response>(() => {})
+      await prepareDatabase()
+    }
     if (mode === "starting") await writeFile(registration + ".status-request", "")
     if (mode === "hanging" || controlled === "hang") {
       await appendFile(registration + ".requests", process.pid + "\n")
@@ -89,7 +102,7 @@ const server = Bun.serve({
         { version, pid: process.pid, urls: [server.url.toString()], paths: { tmp: "/tmp/opencode" } },
         { status: 503 },
       )
-    if (mode === "failed-owner")
+    if (mode === "failed-owner" || mode === "database-failed")
       return Response.json(
         { version, pid: process.pid, urls: [server.url.toString()], paths: { tmp: "/tmp/opencode" } },
         { status: 500 },
@@ -110,17 +123,44 @@ if (controlled !== "hang") {
 }
 
 await writeFile(
-  registration + ".tmp",
+  registration + `.${process.pid}.tmp`,
   JSON.stringify({
     id,
     version,
     url: server.url.toString(),
     pid: process.pid,
     password: "private",
+    ...(mode.startsWith("database") && mode !== "database-probe" ? { startup: "database-preparation" } : {}),
   }),
   { mode: 0o600 },
 )
-await rename(registration + ".tmp", registration)
+await publish()
+
+if (mode === "database" || mode === "database-old") await prepareDatabase()
+
+async function prepareDatabase() {
+  const info = await Bun.file(registration).json()
+  await writeFile(registration + `.${process.pid}.tmp`, JSON.stringify({ ...info, startup: "database-preparation" }), { mode: 0o600 })
+  await publish()
+  await writeFile(registration + ".blocked", "")
+  while (!existsSync(registration + ".release")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5)
+  delete info.startup
+  await writeFile(registration + `.${process.pid}.tmp`, JSON.stringify(info), { mode: 0o600 })
+  await publish()
+}
+
+async function publish() {
+  const deadline = Date.now() + 3_000
+  while (true) {
+    try {
+      await rename(registration + `.${process.pid}.tmp`, registration)
+      return
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EPERM") || Date.now() >= deadline) throw error
+      await Bun.sleep(5)
+    }
+  }
+}
 
 async function shutdown(signal?: NodeJS.Signals) {
   if (signal !== undefined) await writeFile(registration + ".signal", signal)

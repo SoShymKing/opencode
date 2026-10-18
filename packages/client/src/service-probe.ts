@@ -42,7 +42,13 @@ export function fallback() {
 
 /** Whether two registrations describe the same service instance. */
 export function same(left: Info, right: Info) {
-  return left.id === right.id && left.version === right.version && left.url === right.url && left.pid === right.pid
+  return (
+    left.id === right.id &&
+    left.version === right.version &&
+    left.url === right.url &&
+    left.pid === right.pid &&
+    left.password === right.password
+  )
 }
 
 /** Ask a registered owner for its health and classify the answer. */
@@ -82,7 +88,7 @@ export async function probeResult(info: Info, timeout = defaultEnsureTiming.requ
       info,
       endpoint,
       version: serverInfo.version,
-      state: response.ok ? "ready" : response.status === 500 ? "failed" : "waiting",
+      state: response.status === 200 ? "ready" : response.status === 500 ? "failed" : "waiting",
       compatible: true,
     } satisfies LocalService,
     timedOut: false,

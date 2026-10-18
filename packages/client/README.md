@@ -13,6 +13,8 @@ The Effect entrypoint uses canonical decoded values such as `Session.ID`, `Locat
 
 The Promise root remains structural and has no Core or Effect runtime dependency. `/effect` depends only on Effect, Schema, and Protocol and is browser-bundle safe. Bundle-boundary tests enforce both import graphs.
 
+Local service discovery excludes a live registered owner's `startup: "database-preparation"` phase from its ordinary startup budget and automatic recovery. Protection requires a nonempty instance ID. Authenticated ready health permits compatible reuse, but does not permit automatic replacement while preparation continues; authenticated failed health reports startup failure. Protection uses the existing registration identity and process existence, not a lease: a stale phase combined with PID reuse can wait until explicit stop or caller cancellation. The producer must publish the private registration atomically before blocking database work and remove the phase when preparation completes or fails.
+
 Effect consumers construct canonical decoded inputs:
 
 ```ts

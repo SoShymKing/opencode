@@ -12,7 +12,7 @@ const timings = new WeakMap<object, EnsureTiming>()
 
 // A freshly spawned service registers in ~250 ms, so the poll cadence is a large share of the
 // time a client waits for it. Probes are sequential, so the wait between them only matters while
-// the connection is refused; both variants give up after promiseTimeout of wall-clock time.
+// the connection is refused; both variants exclude protected database preparation from promiseTimeout.
 export const defaultEnsureTiming: EnsureTiming = {
   pollInterval: 25,
   requestTimeout: 2_000,
