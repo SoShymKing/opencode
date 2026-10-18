@@ -6,6 +6,7 @@ import { expect, test } from "bun:test"
 import { parse } from "jsonc-parser"
 import path from "path"
 import { Config } from "../src/config"
+import { OPENCODE_CHANNEL } from "../src/version"
 import { tmpdir } from "./fixture/tmpdir"
 
 function run<A, E>(directory: string, effect: Effect.Effect<A, E, Config.Service>) {
@@ -17,6 +18,217 @@ function run<A, E>(directory: string, effect: Effect.Effect<A, E, Config.Service
     ),
   )
 }
+
+test("migrates legacy session windows with existing cli config and preserves scope defaults", async () => {
+  for (const item of [
+    { value: 7, expected: 7 },
+    { value: " 14 ", expected: 14 },
+    { value: " ALL ", expected: "all" },
+    { value: 0, expected: 30 },
+    { value: -1, expected: 30 },
+    { value: 1.5, expected: 30 },
+    { value: Number.MAX_SAFE_INTEGER, expected: 30 },
+    { value: "bad", expected: 30 },
+    { value: null, expected: 30 },
+  ]) {
+    await using directory = await tmpdir()
+    await Bun.write(path.join(directory.path, "cli.json"), JSON.stringify({ tabs: { scope: "global" } }))
+    const legacy = { session_list_request_window_days: item.value }
+    await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify(legacy))
+    await run(directory.path, Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+      yield* service.get()
+    }))
+    const channel = process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL
+    expect(await Bun.file(path.join(directory.path, channel, "tui/session-list.json")).json()).toEqual({
+      allProjects: true,
+      session_list_request_window_days: item.expected,
+    })
+    expect(await Bun.file(path.join(directory.path, "kv.json")).json()).toEqual(legacy)
+  }
+})
+
+test("migrates session windows on update using inline scope and the effective channel", async () => {
+  await using directory = await tmpdir()
+  const previous = { channel: process.env.OPENCODE_TUI_CHANNEL, content: process.env.OPENCODE_CLI_CONFIG_CONTENT }
+  process.env.OPENCODE_TUI_CHANNEL = "migration-test"
+  process.env.OPENCODE_CLI_CONFIG_CONTENT = JSON.stringify({ tabs: { scope: "global" } })
+  try {
+    await Bun.write(path.join(directory.path, "cli.json"), JSON.stringify({ tabs: { scope: "cwd" } }))
+    await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify({ session_list_request_window_days: 90 }))
+    await run(directory.path, Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.update((draft) => { draft.mouse = false })
+    }))
+    expect(await Bun.file(path.join(directory.path, "migration-test/tui/session-list.json")).json()).toEqual({
+      allProjects: true, session_list_request_window_days: 90,
+    })
+    expect(await Bun.file(path.join(directory.path, OPENCODE_CHANNEL, "tui/session-list.json")).exists()).toBe(false)
+    delete process.env.OPENCODE_TUI_CHANNEL
+    delete process.env.OPENCODE_CLI_CONFIG_CONTENT
+    await run(directory.path, Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+    }))
+    expect(await Bun.file(path.join(directory.path, OPENCODE_CHANNEL, "tui/session-list.json")).json()).toEqual({
+      allProjects: false, session_list_request_window_days: 90,
+    })
+  } finally {
+    if (previous.channel === undefined) delete process.env.OPENCODE_TUI_CHANNEL
+    else process.env.OPENCODE_TUI_CHANNEL = previous.channel
+    if (previous.content === undefined) delete process.env.OPENCODE_CLI_CONFIG_CONTENT
+    else process.env.OPENCODE_CLI_CONFIG_CONTENT = previous.content
+  }
+})
+
+test("does not migrate session-list outside state for an invalid channel", async () => {
+  await using directory = await tmpdir()
+  const state = path.join(directory.path, "state")
+  const previous = process.env.OPENCODE_TUI_CHANNEL
+  await Bun.write(path.join(state, "cli.json"), "{}")
+  await Bun.write(path.join(state, "kv.json"), JSON.stringify({ session_list_request_window_days: 7 }))
+  process.env.OPENCODE_TUI_CHANNEL = "../outside"
+  try {
+    await run(
+      state,
+      Effect.gen(function* () {
+        const service = yield* Config.Service
+        yield* service.get()
+      }),
+    )
+    expect(await Bun.file(path.join(directory.path, "outside", "tui", "session-list.json")).exists()).toBe(false)
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_TUI_CHANNEL
+    else process.env.OPENCODE_TUI_CHANNEL = previous
+  }
+})
+
+test("preserves session-list properties and existing choices across repeated migration", async () => {
+  for (const preference of [undefined, 3, "all", null]) {
+    await using directory = await tmpdir()
+    const file = path.join(directory.path, process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL, "tui/session-list.json")
+    const initial = { allProjects: true, extra: { keep: true }, session_list_request_window_days: preference }
+    await Bun.write(file, JSON.stringify(initial))
+    await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify({ session_list_request_window_days: 7 }))
+    await run(directory.path, Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+      yield* Effect.promise(() => Bun.write(path.join(directory.path, "kv.json"), JSON.stringify({ session_list_request_window_days: 60 })))
+      yield* service.get()
+    }))
+    expect(await Bun.file(file).json()).toEqual({ ...initial, session_list_request_window_days: preference === undefined ? 7 : preference })
+  }
+})
+
+test("does not create session-list storage without a legacy window", async () => {
+  for (const legacy of [undefined, {}]) {
+    await using directory = await tmpdir()
+    if (legacy) await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify(legacy))
+    await run(directory.path, Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+    }))
+    expect(await Bun.file(path.join(directory.path, process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL, "tui/session-list.json")).exists()).toBe(false)
+  }
+})
+
+test("creates session-list storage with the default cwd scope when cli config is missing", async () => {
+  await using directory = await tmpdir()
+  await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify({ session_list_request_window_days: 7 }))
+  await run(
+    directory.path,
+    Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+    }),
+  )
+  const file = path.join(directory.path, process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL, "tui/session-list.json")
+  expect(await Bun.file(file).json()).toEqual({ allProjects: false, session_list_request_window_days: 7 })
+})
+
+test("preserves a session-list choice written by the current lock owner", async () => {
+  await using directory = await tmpdir()
+  const channel = process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL
+  const file = path.join(directory.path, channel, "tui/session-list.json")
+  const legacy = path.join(directory.path, "kv.json")
+  await Bun.write(path.join(directory.path, "cli.json"), "{}")
+  await Bun.write(legacy, JSON.stringify({ session_list_request_window_days: 7 }))
+  const reading = Promise.withResolvers<void>()
+  const node = await Effect.runPromise(FileSystem.FileSystem.pipe(Effect.provide(NodeFileSystem.layer)))
+  const fs = {
+    ...node,
+    readFileString: (...args: Parameters<typeof node.readFileString>) =>
+      node.readFileString(...args).pipe(
+        Effect.tap(() => Effect.sync(() => {
+          if (args[0] === legacy) reading.resolve()
+        })),
+      ),
+  }
+  const held = await Flock.acquire(file, { dir: path.join(directory.path, channel, "locks") })
+  const migration = Effect.runPromise(
+    Effect.gen(function* () {
+      const service = yield* Config.Service
+      yield* service.get()
+    }).pipe(
+      Effect.provide(Config.layer),
+      Effect.provide(Global.layerWith({ config: directory.path, state: directory.path })),
+      Effect.provideService(FileSystem.FileSystem, fs),
+    ),
+  )
+  try {
+    expect(await Promise.race([reading.promise.then(() => "reading"), migration.then(() => "finished")])).toBe("reading")
+    await Bun.write(file, JSON.stringify({ allProjects: true, session_list_request_window_days: 120, extra: true }))
+  } finally {
+    await held.release()
+    await migration
+  }
+  expect(await Bun.file(file).json()).toEqual({ allProjects: true, session_list_request_window_days: 120, extra: true })
+})
+
+test("reads session-list inside its native lock before a waiting writer updates it", async () => {
+  await using directory = await tmpdir()
+  const channel = process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL
+  const file = path.join(directory.path, channel, "tui/session-list.json")
+  await Bun.write(path.join(directory.path, "cli.json"), "{}")
+  await Bun.write(path.join(directory.path, "kv.json"), JSON.stringify({ session_list_request_window_days: 7 }))
+  await Bun.write(file, JSON.stringify({ allProjects: true }))
+  const reading = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const waiting = Promise.withResolvers<void>()
+  const node = await Effect.runPromise(FileSystem.FileSystem.pipe(Effect.provide(NodeFileSystem.layer)))
+  const fs = { ...node, readFileString: (...args: Parameters<typeof node.readFileString>) =>
+    args[0] !== file ? node.readFileString(...args) : Effect.gen(function* () {
+      reading.resolve()
+      yield* Effect.promise(() => resume.promise)
+      return yield* node.readFileString(...args)
+    }),
+  }
+  const migration = Effect.runPromise(Effect.gen(function* () {
+    const service = yield* Config.Service
+    yield* service.get()
+  }).pipe(
+    Effect.provide(Config.layer),
+    Effect.provide(Global.layerWith({ config: directory.path, state: directory.path })),
+    Effect.provideService(FileSystem.FileSystem, fs),
+  ))
+  try {
+    expect(await Promise.race([reading.promise.then(() => "reading"), migration.then(() => "finished")])).toBe("reading")
+    const writer = Flock.withLock(file, async () => {
+      await Bun.write(file, JSON.stringify({ allProjects: false, session_list_request_window_days: "all", extra: true }))
+    }, { dir: path.join(directory.path, channel, "locks"), onWait: () => { waiting.resolve() } })
+    try {
+      expect(await Promise.race([waiting.promise.then(() => "waiting"), writer.then(() => "finished")])).toBe("waiting")
+    } finally {
+      resume.resolve()
+      await Promise.all([migration, writer])
+    }
+    expect(await Bun.file(file).json()).toEqual({ allProjects: false, session_list_request_window_days: "all", extra: true })
+  } finally {
+    resume.resolve()
+    await migration
+  }
+})
 
 test("generates reusable keybind schemas and preserves descriptions and numeric constraints", () => {
   const document = Schema.toJsonSchemaDocument(Config.Info)
