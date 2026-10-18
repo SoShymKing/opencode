@@ -5,6 +5,7 @@ import { Database } from "@opencode/core/database/database"
 import { DatabaseMigration } from "@opencode/core/database/migration"
 import { V1Migration } from "@opencode/core/database/v1-migration"
 import { V1MigrationRows } from "@opencode/core/database/v1-migration-rows"
+import { WsNative } from "@opencode/core/database/ws-native"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionTable } from "@opencode/core/session/sql"
@@ -678,6 +679,8 @@ describe("V1Migration.transformSession", () => {
       ["compaction", 0],
       ["assistant", 1],
     ])
+    expect(result.omittedMessageIDs).toEqual(new Set([subtask.id, taskAssistant.id, summary.id]))
+    expect(result.warnings).toEqual([])
     expect(result.messages[0]).toMatchObject({
       id: compact.id,
       time_created: 3,
@@ -764,6 +767,7 @@ describe("V1Migration.transformSession", () => {
       time_compacting: null,
     })
     expect(source[0]).toBe(good)
+    expect(result.omittedMessageIDs).toEqual(new Set())
   })
 
   test("retains empty ordinary messages and omits failed compactions", () => {
@@ -786,6 +790,7 @@ describe("V1Migration.transformSession", () => {
       ],
     )
     expect(result.messages.map((row) => row.type)).toEqual(["user", "assistant"])
+    expect(result.omittedMessageIDs).toEqual(new Set([compact.id, failed.id]))
     expect(result.messages[0].data).toEqual({ text: "", time: { created: 1 } })
     expect(result.messages[1].data).toMatchObject({ content: [], snapshot: { start: "standalone" } })
     expect(result.watermark).toBe(1)
@@ -839,6 +844,7 @@ describe("V1Migration.transformSession", () => {
       ],
     )
     expect(result.messages.map((row) => [row.id, row.type])).toEqual([[mixed.id, "user"]])
+    expect(result.omittedMessageIDs).toEqual(new Set([task.id, compact.id, unfinished.id]))
     expect(result.watermark).toBe(0)
     expect(result.session).toMatchObject({
       cost: 5,
@@ -917,6 +923,32 @@ describe("V1Migration database workflow", () => {
       }),
     )
 
+  test("unexplained projection loss fails production accounting and rolls back source writes", () => database(Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const message = user("msg_ordinary")
+    yield* db.run(sql`INSERT INTO message VALUES (${message.id}, ${message.session_id}, ${message.time_created}, ${message.time_updated}, ${message.data})`)
+    const prepared = yield* V1Migration.prepareSession(db, session())
+    expect(prepared.warnings).toEqual([])
+    expect(prepared.omittedMessageIDs).toEqual(new Set())
+    yield* WsNative.validateLegacyProjection(prepared)
+    const before = yield* db.all("SELECT * FROM message")
+    const ddl = yield* db.all("SELECT * FROM sqlite_schema")
+    const result = yield* db.transaction((tx) => Effect.gen(function* () {
+      yield* tx.run("DELETE FROM message")
+      yield* WsNative.validateLegacyProjection({ ...prepared, messages: [] })
+    })).pipe(Effect.result)
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure") {
+      expect(result.failure).toBeInstanceOf(WsNative.WsNativeError)
+      expect(String(result.failure)).toContain("unexplained missing source IDs 1, warnings 0, reason classes []")
+      expect(String(result.failure)).not.toContain(message.id)
+      expect(String(result.failure)).not.toContain(message.session_id)
+      expect(String(result.failure)).not.toContain(message.data)
+    }
+    expect(yield* db.all("SELECT * FROM message")).toEqual(before)
+    expect(yield* db.all("SELECT * FROM sqlite_schema")).toEqual(ddl)
+  })))
+
   test("prepares one session across worker waves with ordered compaction, subtasks, synthetic IDs and warnings", async () => {
     const messages = Array.from({ length: 270 }, (_, index) => user(`msg_${String(index).padStart(4, "0")}`, {}, Math.floor(index / 2)))
     const compact = user("msg_0270", {}, 140)
@@ -981,6 +1013,8 @@ describe("V1Migration database workflow", () => {
       expect(actual.messages.some((message) => message.id === subtask.id || message.id === child.id)).toBe(false)
       expect(actual.messages.some((message) => message.id === failedCompact.id)).toBe(false)
       expect(actual.messages.some((message) => message.id === laterSummary.id)).toBe(true)
+      expect(actual.omittedMessageIDs).toEqual(new Set([summary.id, subtask.id, child.id, failedCompact.id]))
+      expect(actual.messages.some((message) => message.id === messages[1].id)).toBe(true)
       expect(actual.session.cost).toBe(4)
     }))
   })

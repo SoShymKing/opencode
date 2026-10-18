@@ -184,8 +184,8 @@ for (const [name, change] of [
   ["promoted identity mismatch", "UPDATE session_input SET promoted_seq = 5 WHERE promoted_seq IS NOT NULL"],
   ["invalid delivery", "UPDATE session_input SET delivery = 'later' WHERE promoted_seq IS NULL"],
   ["invalid legacy message", "UPDATE message SET data = '{}'"],
+  ["unknown legacy role", "UPDATE message SET data = json_set(data, '$.role', 'future')"],
   ["invalid legacy part", "UPDATE part SET data = '{}'"],
-  ["legacy transform omission", "UPDATE part SET data = '{\"type\":\"compaction\",\"auto\":false}'"],
   ["missing WS watermark", "DELETE FROM event_sequence WHERE aggregate_id = 'ses_migration'"],
   ["unknown payload version", "UPDATE event SET type = 'session.next.step.started.99' WHERE seq = 7"],
   ["saved permission collision", "INSERT INTO permission VALUES ('permission_write', 'project', 'write', '*', 1, 2), ('permission_patch', 'project', 'patch', '*', 1, 2)"],
@@ -202,6 +202,112 @@ for (const [name, change] of [
   if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(WsNative.WsNativeError)
   expect(yield* db.all("SELECT * FROM sqlite_schema")).toEqual(ddl)
   for (const [name, rows] of before) expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(name)}`)).toEqual(rows)
+})))
+
+for (const kind of ["completed compaction", "failed compaction", "incomplete compaction", "missing summary", "subtask"] as const)
+test(`intentional legacy ${kind} omission retains immutable raw rows`, () => run(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: true })
+  yield* db.run(sql`UPDATE part SET data = ${JSON.stringify(kind === "subtask"
+    ? { type: "subtask", prompt: "work", description: "work", agent: "build" }
+    : { type: "compaction", auto: false })}`)
+  if (kind !== "missing summary") {
+    yield* db.run(sql`INSERT INTO message VALUES ('msg_summary', 'ses_legacy', 3, 4, ${JSON.stringify({
+      role: "assistant", parentID: "msg_legacy", summary: kind !== "subtask",
+      time: kind === "incomplete compaction" ? { created: 3 } : { created: 3, completed: 4 },
+      ...(kind === "failed compaction" ? { error: { name: "UnknownError", data: { message: "failed" } } } : {}),
+      modelID: "model", providerID: "test", mode: "build", agent: "build", path: { cwd: "/fixture", root: "/fixture" },
+      cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    })})`)
+    yield* db.run(sql`INSERT INTO part VALUES ('prt_summary', 'msg_summary', 'ses_legacy', 3, 4, ${kind === "subtask"
+      ? JSON.stringify({ type: "tool", callID: "task", tool: "task", state: { status: "pending", input: {}, raw: "{}" } })
+      : '{ "type":"text", "text":"Summary" }'})`)
+  }
+  const originals = new Map<string, unknown[]>()
+  for (const table of ["message", "part"]) originals.set(table, yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(table)}`))
+  yield* WsNative.convert(db)
+  yield* WsNative.validate(db)
+  expect(yield* db.all("SELECT id, type FROM session_message WHERE session_id = 'ses_legacy'")).toEqual(
+    kind === "completed compaction" ? [{ id: "msg_legacy", type: "compaction" }] : [],
+  )
+  const manifest = yield* db.get<{ id: string }>("SELECT id FROM _ws_archive")
+  if (!manifest) throw new Error("Missing archive")
+  const archive = yield* DatabaseWsArchive.read(db, manifest.id)
+  if (!archive) throw new Error("Missing manifest")
+  for (const [table, rows] of originals) {
+    const retained = DatabaseWsArchive.sourceTable(archive, table)
+    if (!retained) throw new Error("Missing archived source")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)}`)).toEqual(rows)
+    const mutation = yield* db.run(sql`DELETE FROM ${DatabaseWsArchive.identifier(retained)}`).pipe(Effect.result)
+    expect(mutation._tag).toBe("Failure")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)}`)).toEqual(rows)
+  }
+})))
+
+test("completed legacy compaction fold preserves summary and raw source rows", () => run(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: true })
+  yield* db.run(`UPDATE part SET data = '{ "type":"compaction", "auto":false }' WHERE id = 'prt_legacy'`)
+  yield* db.run(sql`INSERT INTO message VALUES ('msg_summary', 'ses_legacy', 3, 4, ${JSON.stringify({
+    role: "assistant", parentID: "msg_legacy", summary: true,
+    time: { created: 3, completed: 4 },
+    modelID: "model", providerID: "test", mode: "build", agent: "build", path: { cwd: "/fixture", root: "/fixture" },
+    cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  })})`)
+  yield* db.run(`INSERT INTO part VALUES ('prt_summary', 'msg_summary', 'ses_legacy', 3, 4, '{ "type":"text", "text":"Completed legacy summary" }')`)
+  const originals = new Map<string, unknown[]>()
+  for (const table of ["message", "part"]) originals.set(table, yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(table)} ORDER BY id`))
+  yield* WsNative.validateSource(db)
+  yield* WsNative.convert(db)
+  yield* WsNative.validate(db)
+  expect(yield* db.all("SELECT id, type FROM session_message WHERE session_id = 'ses_legacy'")).toEqual([
+    { id: "msg_legacy", type: "compaction" },
+  ])
+  expect((yield* hydrateSelection({ db })).find((item) => item.message.id === "msg_legacy")?.message).toMatchObject({
+    id: "msg_legacy", type: "compaction", summary: "Completed legacy summary",
+  })
+  const manifest = yield* db.get<{ id: string }>("SELECT id FROM _ws_archive")
+  if (!manifest) throw new Error("Missing archive")
+  const archive = yield* DatabaseWsArchive.read(db, manifest.id)
+  if (!archive) throw new Error("Missing manifest")
+  for (const [table, rows] of originals) {
+    const retained = DatabaseWsArchive.sourceTable(archive, table)
+    if (!retained) throw new Error("Missing archived source")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)} ORDER BY id`)).toEqual(rows)
+  }
+})))
+
+test("ordinary legacy messages survive an unpaired compaction without a native boundary", () => run(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: true })
+  for (const [id, time] of [["msg_unpaired", 3], ["msg_after", 5]] as const) {
+    yield* db.run(sql`INSERT INTO message VALUES (${id}, 'ses_legacy', ${time}, ${time + 1}, ${JSON.stringify({
+      role: "user", time: { created: time }, agent: "build", model: { providerID: "test", modelID: "model" },
+    })})`)
+  }
+  yield* db.run(`INSERT INTO part VALUES
+    ('prt_unpaired', 'msg_unpaired', 'ses_legacy', 3, 4, '{ "type":"compaction", "auto":false }'),
+    ('prt_after', 'msg_after', 'ses_legacy', 5, 6, '{ "type":"text", "text":"Continue after historical compaction" }')`)
+  const originals = new Map<string, unknown[]>()
+  for (const table of ["message", "part"]) originals.set(table, yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(table)} ORDER BY id`))
+  yield* WsNative.convert(db)
+  yield* WsNative.validate(db)
+  expect(yield* db.all("SELECT id, type, seq, json_extract(data, '$.text') AS text FROM session_message WHERE session_id = 'ses_legacy' ORDER BY seq")).toEqual([
+    { id: "msg_legacy", type: "user", seq: 0, text: "Legacy transcript" },
+    { id: "msg_after", type: "user", seq: 1, text: "Continue after historical compaction" },
+  ])
+  const manifest = yield* db.get<{ id: string }>("SELECT id FROM _ws_archive")
+  if (!manifest) throw new Error("Missing archive")
+  const archive = yield* DatabaseWsArchive.read(db, manifest.id)
+  if (!archive) throw new Error("Missing manifest")
+  for (const [table, rows] of originals) {
+    const retained = DatabaseWsArchive.sourceTable(archive, table)
+    if (!retained) throw new Error("Missing archived source")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)} ORDER BY id`)).toEqual(rows)
+    const mutation = yield* db.run(sql`DELETE FROM ${DatabaseWsArchive.identifier(retained)}`).pipe(Effect.result)
+    expect(mutation._tag).toBe("Failure")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(retained)} ORDER BY id`)).toEqual(rows)
+  }
 })))
 
 test("empty session without source watermark reserves an empty native prefix", () => run(Effect.gen(function* () {

@@ -66,6 +66,7 @@ export type TransformResult = {
   >
   readonly watermark: number
   readonly warnings: ReadonlyArray<Warning>
+  readonly omittedMessageIDs: ReadonlySet<string>
 }
 
 type Progress = {
@@ -313,18 +314,28 @@ function projectSession(input: {
       summaries.set(item.value.parentID, { row: item.row, value: item.value })
   }
   const paired = new Set<string>()
+  const omittedMessageIDs = new Set<string>()
   const used = new Set(messages.map((item) => item.row.id))
   const projected = messages
     .flatMap((item) => {
-      if (paired.has(item.row.id)) return []
+      if (paired.has(item.row.id)) {
+        omittedMessageIDs.add(item.row.id)
+        return []
+      }
       const owned = byMessage.get(item.row.id)?.map((part) => part.value) ?? []
       if (item.value.role === "user") {
         const compaction = owned.find((part) => part.type === "compaction")
         if (compaction) {
           const pairedSummary = summaries.get(item.row.id)
-          if (!pairedSummary) return []
+          if (!pairedSummary) {
+            omittedMessageIDs.add(item.row.id)
+            return []
+          }
           paired.add(pairedSummary.row.id)
-          if (pairedSummary.value.error || pairedSummary.value.time.completed === undefined) return []
+          if (pairedSummary.value.error || pairedSummary.value.time.completed === undefined) {
+            omittedMessageIDs.add(item.row.id)
+            return []
+          }
           const summary = pairedSummary
           const summaryText = (byMessage.get(summary.row.id) ?? [])
             .map((part) => part.value)
@@ -355,7 +366,10 @@ function projectSession(input: {
         const visible = owned.filter((part): part is typeof SessionV1.TextPart.Encoded => part.type === "text" && !part.ignored)
         const files = owned.filter((part) => part.type === "file")
         const agents = owned.filter((part) => part.type === "agent")
-        if (subtasks.length > 0 && visible.length === 0 && files.length === 0 && agents.length === 0) return []
+        if (subtasks.length > 0 && visible.length === 0 && files.length === 0 && agents.length === 0) {
+          omittedMessageIDs.add(item.row.id)
+          return []
+        }
         const ordinary = visible.filter((part) => !part.synthetic)
         const synthetic = visible.filter((part) => part.synthetic)
         const attachments = files.flatMap((part) => migrateFile(part))
@@ -414,8 +428,10 @@ function projectSession(input: {
       if (
         parentParts.some((part) => part.type === "subtask") &&
         owned.some((part) => part.type === "tool" && part.tool === "task")
-      )
+      ) {
+        omittedMessageIDs.add(item.row.id)
         return []
+      }
       const content = owned.flatMap((part): Array<Record<string, unknown>> => {
         if (part.type === "text")
           return [{ type: "text", text: part.text, ...(part.metadata ? { state: part.metadata } : {}) }]
@@ -526,6 +542,7 @@ function projectSession(input: {
     },
     watermark: migrated.length - 1,
     warnings,
+    omittedMessageIDs,
   }
 }
 
