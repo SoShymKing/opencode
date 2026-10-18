@@ -20,6 +20,7 @@ const result = await Bun.build({
   format: "esm",
   packages: "external",
   external: [
+    "#ws-native-os",
     "#ws-native-worker",
     "#sqlite",
     "#pty",
