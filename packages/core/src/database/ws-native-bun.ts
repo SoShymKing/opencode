@@ -14,7 +14,7 @@ export function openWorker(url = workerURL) {
       const worker = new Worker(url)
       const state: {
         failure?: WsNativeMessage.WsNativeMessageError
-        pending?: { readonly id: string; readonly resolve: (items: readonly WsNativeBatch.Output[]) => void; readonly reject: (error: WsNativeMessage.WsNativeMessageError) => void }
+        pending?: { readonly id: string; readonly resolve: (items: readonly WsNativeBatch.Result[]) => void; readonly reject: (error: WsNativeMessage.WsNativeMessageError) => void }
       } = {}
       const fail = () => {
         const error = new WsNativeMessage.WsNativeMessageError({
@@ -33,23 +33,27 @@ export function openWorker(url = workerURL) {
         if ("items" in reply) pending?.resolve(reply.items)
         else pending?.reject(new WsNativeMessage.WsNativeMessageError(reply))
       })
-      return {
-        worker,
-        close: async () => { fail(); await worker.terminate() },
-        process: (items: readonly WsNativeBatch.Input[]) => Effect.tryPromise({
-          try: () => new Promise<readonly WsNativeBatch.Output[]>((resolve, reject) => {
+      const run = (items: readonly WsNativeBatch.Job[]) => Effect.tryPromise({
+          try: () => new Promise<readonly WsNativeBatch.Result[]>((resolve, reject) => {
+            const id = items[0] ? WsNativeBatch.jobID(items[0]) : ""
             if (state.failure) return reject(new WsNativeMessage.WsNativeMessageError({
-              messageID: items[0]?.row.id ?? "", message: state.failure.message,
+              messageID: id, message: state.failure.message,
             }))
-            state.pending = { id: items[0]?.row.id ?? "", resolve, reject }
+            if (state.pending) return reject(new WsNativeMessage.WsNativeMessageError({ messageID: id, message: "WS worker already has a pending request" }))
+            state.pending = { id, resolve, reject }
             try { worker.postMessage(items) } catch (error) {
               fail()
               if (!(error instanceof Error)) throw error
             }
           }),
           catch: (error) => error instanceof WsNativeMessage.WsNativeMessageError ? error
-            : new WsNativeMessage.WsNativeMessageError({ messageID: items[0]?.row.id ?? "", message: "WS message worker failed" }),
-        }),
+            : new WsNativeMessage.WsNativeMessageError({ messageID: items[0] ? WsNativeBatch.jobID(items[0]) : "", message: "WS message worker failed" }),
+        })
+      return {
+        worker,
+        close: async () => { fail(); await worker.terminate() },
+        run,
+        process: (items: readonly WsNativeBatch.Input[]) => run(items.map((input) => ({ kind: "message", input }))).pipe(Effect.map(WsNativeBatch.messageOutputs)),
       }
     },
     catch: () => new WsNativeMessage.WsNativeMessageError({ messageID: "", message: "WS message worker could not start" }),
@@ -57,13 +61,15 @@ export function openWorker(url = workerURL) {
 }
 
 export const open = Effect.gen(function* () {
-  if (availableParallelism() < 2) return { process: WsNativeBatch.process }
+  if (availableParallelism() < 2) return { run: WsNativeBatch.run, process: WsNativeBatch.process }
   const left = yield* openWorker()
   const right = yield* openWorker()
+  const run = (items: readonly WsNativeBatch.Job[]) => Effect.all([
+      left.run(items.slice(0, Math.ceil(items.length / 2))),
+      right.run(items.slice(Math.ceil(items.length / 2))),
+    ], { concurrency: 2 }).pipe(Effect.map(([first, second]) => [...first, ...second]))
   return {
-    process: (items: readonly WsNativeBatch.Input[]) => Effect.all([
-      left.process(items.slice(0, Math.ceil(items.length / 2))),
-      right.process(items.slice(Math.ceil(items.length / 2))),
-    ], { concurrency: 2 }).pipe(Effect.map(([first, second]) => [...first, ...second])),
+    run,
+    process: (items: readonly WsNativeBatch.Input[]) => run(items.map((input) => ({ kind: "message", input }))).pipe(Effect.map(WsNativeBatch.messageOutputs)),
   }
 })
