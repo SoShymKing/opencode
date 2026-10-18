@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
-import { Deferred, Effect, Fiber } from "effect"
+import { Deferred, Effect, Fiber, Schema } from "effect"
+import { Session } from "@opencode/schema/session"
+import { SessionMessage } from "@opencode/schema/session-message"
+import { decodeStoredMessage, encodeStoredMessage } from "@opencode/core/session/message-storage"
+import { normalizeMessage, normalizeMessages } from "@opencode/core/database/native-message-parts"
 import { sql } from "drizzle-orm"
 import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { WsNative } from "@opencode/core/database/ws-native"
@@ -17,6 +21,190 @@ const input = (data = richMessageData, previousNative = false): WsNativeBatch.In
   row: { id: "msg_worker", session_id: "ses_migration", type: "assistant", seq: 7, time_created: 1, time_updated: 16, data },
   parts: undefined, previousNative, store: true,
 })
+
+test("both real workers execute native preparation jobs and reject invalid validation", () => Effect.runPromise(Effect.gen(function* () {
+  const left = yield* openWorker()
+  const right = yield* openWorker()
+  expect(left.worker.threadId).not.toBe(right.worker.threadId)
+  for (const worker of [left, right]) {
+    const results = yield* worker.run([{ kind: "native-normalize", row: { id: "msg_worker", data: nativeMessageData } }])
+    expect(results[0]?.kind).toBe("native-normalize")
+    if (results[0]?.kind === "native-normalize") {
+      expect(results[0].output.parts.map((part) => part.id)).toEqual(["0", "1"])
+      expect(JSON.parse(results[0].output.data)).not.toHaveProperty("content")
+    }
+    const invalid = yield* worker.run([{ kind: "legacy-message", mode: "validate", row: {
+      id: "msg_bad", session_id: "ses_migration", time_created: 1, time_updated: 1, data: "{}",
+    } }]).pipe(Effect.result)
+    expect(invalid._tag).toBe("Failure")
+  }
+}).pipe(Effect.scoped)))
+
+for (const kind of ["legacy-message", "legacy-part"] as const) {
+  for (const mode of ["validate", "prepare"] as const) {
+    for (const amount of ["42", "1e400"]) test(`${kind} ${mode} handles JSON number ${amount}`, () => Effect.runPromise(Effect.gen(function* () {
+      const worker = yield* openWorker()
+      const row = { id: kind === "legacy-part" ? "prt_legacy" : "msg_legacy", message_id: "msg_parent", session_id: "ses_migration", time_created: 1, time_updated: 1,
+        data: kind === "legacy-part"
+          ? `{"type":"tool","callID":"pending","tool":"read","state":{"status":"pending","input":{"amount":${amount}},"raw":"{}"}}`
+          : `{"role":"user","time":{"created":1},"agent":"build","model":{"providerID":"test","modelID":"model"},"extra":{"amount":${amount}}}` }
+      const result = yield* worker.run([{ kind, mode, row }]).pipe(Effect.result)
+      expect(result._tag).toBe(mode === "validate" && amount === "1e400" ? "Failure" : "Success")
+      if (result._tag === "Success" && mode === "prepare") {
+        expect(result.success[0]).toMatchObject({ kind, mode, parsed: { value: expect.any(Object) } })
+      }
+    }).pipe(Effect.scoped)))
+  }
+}
+
+for (const operation of ["validate", "convert"] as const) test(`source ${operation} rejects non-finite legacy tool input`, () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: true })
+  const data = '{"type":"tool","callID":"pending","tool":"read","state":{"status":"pending","input":{"amount":42},"raw":"{}"}}'
+  yield* db.run(sql`UPDATE part SET data = ${data} WHERE id = 'prt_legacy'`)
+  yield* WsNative.validateSource(db)
+  yield* db.run(sql`UPDATE part SET data = ${data.replace('"amount":42', '"amount":1e400')} WHERE id = 'prt_legacy'`)
+  const result = yield* (operation === "validate" ? WsNative.validateSource(db) : WsNative.convert(db)).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.provide(tempGlobalLayer), Effect.scoped)))
+
+test("mixed jobs match native storage codecs on both threads", () => Effect.runPromise(Effect.gen(function* () {
+  const left = yield* openWorker()
+  const right = yield* openWorker()
+  const data = { agent: "build", model: { providerID: "test", id: "model" }, time: { created: 1 },
+    content: [{ type: "text", text: "first" }, { type: "reasoning", text: "reason" }, { type: "text", text: "second" }] }
+  const stored = yield* encodeStoredMessage(yield* Schema.decodeUnknownEffect(SessionMessage.Info)({ ...data, id: "msg_worker", type: "assistant" }))
+  const parent = { sessionID: Schema.decodeUnknownSync(Session.ID)("ses_migration"),
+    messageID: Schema.decodeUnknownSync(SessionMessage.ID)("msg_worker"), type: "assistant" as const, dataText: JSON.stringify(stored.envelope.data) }
+  const children = stored.parts.map((part) => ({ messageID: parent.messageID, position: part.position, id: part.id, type: part.type, dataText: JSON.stringify(part.data) }))
+  expect((yield* decodeStoredMessage(parent, children)).type).toBe("assistant")
+  const event = { id: "evt_worker", aggregate_id: "ses_migration", seq: 1, type: "session.next.revert.cleared.1", data: '{"sessionID":"ses_migration","timestamp":1}' }
+  const legacy = { id: "msg_legacy", session_id: "ses_migration", time_created: 1, time_updated: 1, data: '{"role":"user","time":{"created":1},"agent":"build","model":{"providerID":"test","modelID":"model"}}' }
+  const part = { ...legacy, id: "prt_legacy", message_id: legacy.id, data: '{"type":"text","text":"legacy"}' }
+  const jobs: readonly WsNativeBatch.Job[] = [
+    { kind: "message", input: input() }, { kind: "ws-event", row: event }, { kind: "p-event", row: { ...event, created: 1,
+      type: "session.text.ended.1", data: '{"sessionID":"ses_migration","assistantMessageID":"msg_worker","ordinal":0,"text":"first"}' } },
+    { kind: "native-encode", row: { id: "msg_worker", type: "assistant", data } }, { kind: "native-validate", parent, children },
+    { kind: "legacy-message", mode: "prepare", row: legacy }, { kind: "legacy-part", mode: "prepare", row: part },
+    { kind: "legacy-message", mode: "validate", row: legacy }, { kind: "legacy-part", mode: "validate", row: part },
+  ]
+  const expected = yield* WsNativeBatch.run(jobs)
+  for (const worker of [left, right]) {
+    const actual = yield* worker.run(jobs)
+    expect(actual).toEqual(expected)
+    const encoded = actual[3]
+    if (encoded?.kind !== "native-encode") throw new Error("Missing encoded result")
+    expect(encoded.output.data).toBe(parent.dataText)
+    expect(encoded.output.parts.map((child) => child.id)).toEqual(["0", "0", "1"])
+    const invalid = yield* worker.run([{ kind: "native-validate", parent, children: [{ ...children[0], dataText: '{}' }] }]).pipe(Effect.result)
+    expect(invalid._tag).toBe("Failure")
+    const invalidJobs: readonly WsNativeBatch.Job[] = [
+      { kind: "ws-event", row: { ...event, data: "{}" } },
+      { kind: "p-event", row: { ...event, created: 0.5 } },
+      { kind: "native-encode", row: { id: "msg_bad", type: "assistant", data: {} } },
+      { kind: "native-normalize", row: { id: "msg_bad", data: "{}" } },
+      { kind: "legacy-part", mode: "validate", row: { ...part, data: "{}" } },
+    ]
+    for (const job of invalidJobs) {
+      const result = yield* worker.run([job]).pipe(Effect.result)
+      expect(result._tag).toBe("Failure")
+      if (result._tag === "Failure") expect(result.failure.messageID).toBe(WsNativeBatch.jobID(job))
+    }
+    const skipped = yield* worker.run([{ kind: "legacy-part", mode: "prepare", row: { ...part, data: '{"type":"unknown"}' } }])
+    expect(skipped).toEqual([{ kind: "legacy-part", mode: "prepare", parsed: {
+      row: { id: part.id, message_id: part.message_id, session_id: part.session_id, time_created: 1, time_updated: 1 },
+      value: undefined, observedType: "unknown",
+    } }])
+  }
+}).pipe(Effect.scoped)))
+
+test("raw row waves bound bytes and stop at a later consumer failure", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run('CREATE TABLE "raw rows" (hash TEXT PRIMARY KEY, data TEXT, selected INTEGER)')
+  for (const [hash, size] of [["a", WsNativeScan.byteLimit + 1], ["b", 600000], ["c", 600000], ["d", 600000]] as const)
+    yield* db.run(sql`INSERT INTO "raw rows" VALUES (${hash}, ${"x".repeat(size)}, 1)`)
+  const reads: number[] = []
+  const reader = { all: <T>(query: Parameters<typeof db.all>[0]) => {
+    const result = db.all<T>(query)
+    if (!result.getQuery().sql.includes("AS bytes")) reads.push(1)
+    return result
+  } }
+  const waves: string[][] = []
+  const result = yield* WsNativeScan.rows(reader, { table: "raw rows", key: "hash", bytes: sql`octet_length(m.data)`, where: sql`m.selected = 1` },
+    (rows: readonly { hash: string; data: string }[]) => Effect.gen(function* () {
+      waves.push(rows.map((row) => row.hash))
+      expect(reads.length).toBe(waves.length)
+      expect(rows.length).toBe(1)
+      if (rows[0].hash === "c") return yield* Effect.fail("stop")
+    })).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(waves).toEqual([["a"], ["b"], ["c"]])
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("native normalization preserves raw tokens and rejects duplicate structural keys", () => Effect.runPromise(Effect.gen(function* () {
+  const raw = '{ "agent":"build", "model":{"providerID":"test","id":"model"}, "time":{"created":1}, "content":[{"type":"text","text":"first\\u0020text"}], "metadata":{ "decimal":1.2300 } }'
+  const output = yield* normalizeMessage({ id: "msg_worker", data: raw })
+  expect(output.data).toContain('"decimal":1.2300')
+  expect(output.parts[0].data).toContain('"first\\u0020text"')
+  const duplicate = yield* normalizeMessage({ id: "msg_worker", data: raw.replace('"agent":"build"', '"agent":"build","agent":"build"') })
+  expect(duplicate.data).toContain('"agent":"build","agent":"build"')
+  const invalid = yield* normalizeMessage({ id: "msg_worker", data: raw.replace('"content":', '"content":[],"content":') }).pipe(Effect.result)
+  expect(invalid._tag).toBe("Failure")
+}).pipe(Effect.scoped)))
+
+test("native validation reads all children across waves without adding ordinal constraints", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, data TEXT)")
+  yield* db.run("CREATE TABLE session_message_part (message_id TEXT, position INTEGER, id TEXT, type TEXT, data TEXT)")
+  for (let index = 0; index < 130; index++) {
+    const id = `msg_${String(index).padStart(3, "0")}`
+    yield* db.run(sql`INSERT INTO session_message VALUES (${id}, 'ses_migration', 'assistant', '{"agent":"build","model":{"providerID":"test","id":"model"},"time":{"created":1}}')`)
+    yield* db.run(sql`INSERT INTO session_message_part VALUES (${id}, 7, 'unrelated-ordinal', 'text', ${JSON.stringify({ text: index === 0 ? "x".repeat(WsNativeScan.byteLimit) : "text" })})`)
+  }
+  yield* WsNativeScan.validateNative(db)
+  yield* db.run("INSERT INTO session_message_part VALUES ('msg_129', 9, 'invalid', 'text', '{}')")
+  const invalid = yield* WsNativeScan.validateNative(db).pipe(Effect.result)
+  expect(invalid._tag).toBe("Failure")
+  if (invalid._tag === "Failure" && invalid.failure instanceof WsNativeMessage.WsNativeMessageError)
+    expect(invalid.failure.messageID).toBe("msg_129")
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("worker normalization keeps caller transaction atomic on later-wave failure", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, data TEXT)")
+  yield* db.run("CREATE TABLE session_message_part (message_id TEXT, position INTEGER, id TEXT, type TEXT, data TEXT)")
+  for (let index = 0; index < 130; index++) yield* db.run(sql`INSERT INTO session_message VALUES
+    (${`msg_${String(index).padStart(3, "0")}`}, 'ses_migration', 'assistant', ${index === 129 ? '{}' : nativeMessageData})`)
+  const result = yield* db.transaction((tx) => normalizeMessages(tx)).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(yield* db.get("SELECT count(*) AS count FROM session_message_part")).toEqual({ count: 0 })
+  expect(yield* db.get("SELECT data FROM session_message WHERE id = 'msg_000'")).toEqual({ data: nativeMessageData })
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("session normalization seeks the source sequence index across waves", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupPreviousNative(db, { directory: "/fixture", rich: false })
+  yield* db.run("CREATE TABLE session_message_part (message_id TEXT, position INTEGER, id TEXT, type TEXT, data TEXT)")
+  for (let index = 0; index < 260; index++) yield* db.run(sql`INSERT INTO session_message VALUES
+    (${`msg_${String(260 - index).padStart(3, "0")}`}, 'ses_migration', 'assistant', ${index + 51}, 1, 16, ${nativeMessageData})`)
+  const queries: Parameters<typeof db.all>[0][] = []
+  const reader = { run: db.run.bind(db), all: <T>(query: Parameters<typeof db.all>[0]) => {
+    queries.push(query)
+    return db.all<T>(query)
+  } }
+  yield* normalizeMessages(reader, "ses_migration")
+  expect(queries.length).toBe(7)
+  for (const query of queries) {
+    const plan = yield* db.all<{ detail: string }>(sql`EXPLAIN QUERY PLAN ${typeof query === "string" ? sql.raw(query) : query}`)
+    const details = plan.map((row) => row.detail).join("\n")
+    expect(details).not.toContain("TEMP B-TREE")
+    expect(details).toContain("session_message_session_type_seq_idx")
+    if (db.all(query).getQuery().sql.includes(" > ")) expect(details).toContain("seq>?")
+  }
+  expect(yield* db.get("SELECT count(*) AS count FROM session_message_part")).toEqual({ count: 522 })
+  expect(yield* db.get("SELECT data FROM session_message_part WHERE message_id = 'msg_001' AND position = 0"))
+    .toEqual({ data: '{"text":"first"}' })
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 test("source validation bounds message reads when the source exceeds one wave", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
