@@ -152,6 +152,97 @@ const it = testEffect(Layer.merge(AppNodeBuilder.build(LayerNode.group([
   Database.node, Bus.node, SessionProjector.node, SessionStore.node, App.node, PluginHooks.node, ToolOutput.node,
 ]), [Bus.node.replace(Bus.configured({ persist: true }))]), TestLLM.testLayer()))
 
+it.effect("bounds stored tool text after hooks without changing history or attachment attribution", () => Effect.gen(function* () {
+  const database = yield* Database.Service
+  const bus = yield* Bus.Service
+  const store = yield* SessionStore.Service
+  const output = yield* ToolOutput.Service
+  const hooks = yield* PluginHooks.Service
+  yield* output.transform((editor) => editor.configure({ maxLines: 2, maxBytes: 6 }))
+  const sessionID = Session.ID.make("ses_tool_bounds")
+  yield* database.db.insert(ProjectTable).values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] }).run()
+  yield* bus.publish(SessionEvent.Created, { sessionID, projectID: Project.ID.global, location: { directory: AbsolutePath.make("/project") }, slug: "bounds", version: "test" })
+  const large = "\u00e9\u00e9\n\u00e9\nthird\n".repeat(1000)
+  const native = decode({ id: "msg_bounds", type: "assistant", agent: "build", model: model.ref,
+    time: { created: 1, completed: 2 }, content: [
+      { type: "tool", id: "text", name: "read", time: { created: 1, completed: 2 },
+        state: { status: "completed", input: { large }, metadata: { truncated: false }, content: [{ type: "text", text: large }] } },
+      { type: "tool", id: "mixed", name: "read", time: { created: 1, completed: 2 },
+        state: { status: "completed", input: {}, content: [{ type: "text", text: large }, { type: "text", text: large },
+          { type: "file", mime: "image/png", uri: "data:image/png;base64,aW1hZ2U=" }] } },
+      { type: "tool", id: "json", name: "read", time: { created: 1, completed: 2 },
+        state: { status: "completed", input: {}, metadata: { large }, content: [] } },
+      { type: "tool", id: "hosted", name: "search", executed: true, recorded: { result: { type: "text", value: large } },
+        time: { created: 1, completed: 2 }, state: { status: "completed", input: {}, content: [{ type: "text", text: large }] } },
+    ] })
+  const stored = yield* encodeStoredMessage(native)
+  yield* database.db.insert(SessionMessageTable).values({ ...stored.envelope, id: native.id, session_id: sessionID, seq: 1, time_created: 0 }).run()
+  yield* insertMessageChildren(database.db, stored.parts)
+  const session = yield* store.get(sessionID)
+  if (!session) throw new Error("Missing seeded session")
+  const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer), Effect.provideService(SessionModelTransport.Service, {
+    bind: () => ({ execute: () => Effect.die("unused") }), invalidateContinuation: () => Effect.void, close: () => Effect.void, closeAll: Effect.void,
+  }))
+  const converter = createConverter()
+  const loaded = yield* store.message(native.id)
+  if (!loaded) throw new Error("Missing stored message")
+  const history = [loaded.message]
+  const base = () => SessionModelRequest.baseTranscript({ agent, model, tools, initial: "", messages: history }, converter)
+  const original = base()
+  const originalFile = original.messages.flatMap((message) => message.content).flatMap((part) => part.type === "tool-result" && part.result.type === "content" ? part.result.value : []).find((item) => item.type === "file")
+  const prepared = yield* requests.primary({ session, agent: agent.id, model, ...base() })
+  const results = prepared.request.messages.flatMap((message) => message.content).filter((part) => part.type === "tool-result")
+  expect(results.find((part) => part.id === "text")?.result).toEqual({ type: "text", value: expect.stringMatching(/^\u00e9\u00e9\n\[/) })
+  const mixed = results.find((part) => part.id === "mixed")?.result
+  if (mixed?.type !== "content") throw new Error("Expected mixed content")
+  expect(mixed.value.filter((item) => item.type === "text").map((item) => item.text).join("\n").length).toBeLessThan(100)
+  expect(mixed.value.find((item) => item.type === "file")).toEqual(originalFile)
+  expect(prepared.attachmentOrigins?.[0]?.value).toBe(mixed.value.find((item) => item.type === "file"))
+  expect(prepared.attachmentBatch).toEqual({ coverage: "complete", refs: refs([{ source: "tool", messageID: native.id, partIndex: 1, contentIndex: 2 }]) })
+  expect(results.find((part) => part.id === "json")?.result).toEqual({ type: "json", value: { large } })
+  expect(results.find((part) => part.id === "hosted")?.result).toEqual({ type: "text", value: large })
+  expect(prepared.request.messages.flatMap((message) => message.content).find((part) => part.type === "tool-call")?.input).toEqual({ large })
+  expect((yield* requests.primary({ session, agent: agent.id, model, ...base() })).request.messages).toEqual(prepared.request.messages)
+  yield* output.transform((editor) => editor.configure({ maxBytes: 7 }))
+  const resized = yield* requests.primary({ session, agent: agent.id, model, ...base() })
+  expect(resized.request.messages.flatMap((message) => message.content).filter((part) => part.type === "tool-result").find((part) => part.id === "text")?.result)
+    .toEqual({ type: "text", value: expect.stringMatching(/^\u00e9\u00e9\n\u00e9\n\[/) })
+  const source = original.messages.find((message) => message.content.some((part) => part.type === "tool-result" && part.id === "text"))
+  if (!source) throw new Error("Missing text result")
+  const opaque = [
+    Message.make({ ...source, native: { test: { large } } }),
+    Message.make({ ...source, providerMetadata: { test: { large } } }),
+    Message.make({ ...source, content: source.content.map((part) => part.type === "tool-result" ? { ...part, providerMetadata: { test: { large } } } : part) }),
+    Message.make({ ...source, content: source.content.map((part) => part.type === "tool-result" ? { ...part, result: { type: "text", value: { large } } } : part) }),
+  ]
+  expect((yield* requests.primary({ session, agent: agent.id, model, system: [], messages: opaque })).request.messages).toEqual(opaque)
+  const hook = yield* hooks.register("session", "context", (event) => Effect.sync(() => {
+    for (const message of event.messages) for (const part of message.content)
+      if (part.type === "tool-result" && part.id === "text") Object.assign(part, { result: { type: "text", value: "hook\n".repeat(1000) } })
+    event.messages.push(Message.user(large))
+  }))
+  const hooked = yield* requests.primary({ session, agent: agent.id, model, ...base() })
+  expect(hooked.request.messages.flatMap((message) => message.content).filter((part) => part.type === "tool-result").find((part) => part.id === "text")?.result)
+    .toEqual({ type: "text", value: expect.stringMatching(/^hook\n\[/) })
+  expect(hooked.request.messages.at(-1)?.content).toEqual(Message.user(large).content)
+  expect(hooked.attachmentBatch).toEqual(prepared.attachmentBatch)
+  yield* hook.dispose
+  expect(base().messages).toEqual(original.messages)
+  expect((yield* store.message(native.id))?.message).toEqual(native)
+  expect(yield* encodeStoredMessage(native)).toEqual(stored)
+  const reloaded = yield* store.message(native.id)
+  if (!reloaded) throw new Error("Missing reloaded message")
+  history[0] = decode({ ...Schema.encodeSync(SessionMessage.Info)(reloaded.message), content: [
+    { type: "tool", id: "text", name: "read", time: { created: 1, completed: 2 },
+      state: { status: "completed", input: {}, content: [{ type: "text", text: "new\nx\ny\n" }] } },
+  ] })
+  const changed = yield* requests.primary({ session, agent: agent.id, model, ...base() })
+  const cold = yield* requests.primary({ session, agent: agent.id, model, ...lower(history) })
+  expect(changed.request.messages).toEqual(cold.request.messages)
+  expect(changed.request.messages.flatMap((message) => message.content).find((part) => part.type === "tool-result")?.result)
+    .toEqual({ type: "text", value: expect.stringMatching(/^new\nx\n\[/) })
+}))
+
 it.effect("retains continuation for unknown coverage and rejects context-hook wrapper attribution", () => Effect.gen(function* () {
   const session = Schema.decodeUnknownSync(Session.Info)({
     id: "ses_reset_policy", projectID: "global", cost: 0,

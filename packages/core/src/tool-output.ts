@@ -30,6 +30,7 @@ export type Editor = {
 
 export interface Interface extends State.Transformable<Editor> {
   readonly truncate: (result: Result) => Effect.Effect<Result>
+  readonly project: (content: readonly Tool.Content[]) => Effect.Effect<readonly Tool.Content[]>
   readonly cleanup: () => Effect.Effect<void>
 }
 
@@ -64,7 +65,7 @@ const layer = Layer.effect(
       }),
     })
 
-    const truncate = Effect.fnUntraced(function* (result: Result) {
+    const truncate = Effect.fnUntraced(function* (result: Result, archive = true) {
       if (result.metadata?.truncated !== undefined) return result
       const content = result.content
       const text = content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n")
@@ -83,11 +84,13 @@ const layer = Layer.effect(
         kept.push(line)
         bytes += size
       }
-      const file = path.join(directory, fileName())
-      yield* fs.ensureDir(directory).pipe(Effect.orDie)
-      yield* fs.writeFileString(file, text).pipe(Effect.orDie)
+      const file = archive ? path.join(directory, fileName()) : undefined
+      if (file !== undefined) {
+        yield* fs.ensureDir(directory).pipe(Effect.orDie)
+        yield* fs.writeFileString(file, text).pipe(Effect.orDie)
+      }
       const shown = kept.length > 0 ? `lines 1-${kept.length}` : "0 lines"
-      const marker = `[showing ${shown} of ${lines.length}; full output saved to ${file}]`
+      const marker = `[showing ${shown} of ${lines.length}${file === undefined ? "" : `; full output saved to ${file}`}]`
       const bounded: Tool.Content[] = []
       let remaining = kept.join("\n").length
       let seenText = false
@@ -102,6 +105,12 @@ const layer = Layer.effect(
         if (remaining >= item.text.length) {
           bounded.push(item)
           remaining -= item.text.length
+          continue
+        }
+        if (!archive) {
+          bounded.push({ ...item, text: item.text.slice(0, remaining) + (marked ? "" : `\n${marker}`) })
+          remaining = 0
+          marked = true
           continue
         }
         if (remaining > 0) bounded.push({ ...item, text: item.text.slice(0, remaining) })
@@ -121,6 +130,7 @@ const layer = Layer.effect(
       transform: state.transform,
       reload: state.reload,
       truncate,
+      project: (content) => truncate({ content: [...content] }, false).pipe(Effect.map((result) => result.content)),
       cleanup: () => cleanup(fs, directory),
     })
   }),
