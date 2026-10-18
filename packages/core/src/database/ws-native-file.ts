@@ -15,18 +15,26 @@ import { DatabaseReplacement } from "./replacement"
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 const nativeIDs = [...DatabaseMigration.currentMigrationIDs]
 
-export function admit(target: string) {
+export function admit(target: string, begin: Effect.Effect<void> = Effect.void) {
   if (target === ":memory:") return Effect.void
   return Effect.gen(function* () {
     const needed = yield* Effect.gen(function* () {
       yield* DatabaseLease.shared(target)
-      if (yield* DatabaseReplacement.pending(target)) return true
+      if (yield* DatabaseReplacement.pending(target)) {
+        yield* begin
+        return true
+      }
       if (!(yield* DatabaseArtifact.exists(target))) return false
       yield* DatabaseArtifact.requireRegularFile(target)
       return yield* DatabaseLegacyV01.useDatabase(target, true, (db) => Effect.gen(function* () {
         const state = yield* DatabaseLineage.inspect(db, nativeIDs)
-        if (state.ws || state.previousNative) return true
-        yield* DatabaseMigration.preflight(db)
+        if (state.ws || state.previousNative) {
+          yield* begin
+          return true
+        }
+        const native = yield* DatabaseMigration.preflight(db)
+        if ((native.tables.has("session") || native.tables.has("session_v2")) &&
+          nativeIDs.some((id) => !native.completed.has(id))) yield* begin
         return false
       }))
     }).pipe(Effect.scoped)

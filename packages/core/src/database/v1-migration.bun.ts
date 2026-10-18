@@ -17,6 +17,7 @@ import { Project } from "@opencode/schema/project"
 import { DatabaseMigration } from "./migration.js"
 import { normalizeMessages } from "./native-message-parts.js"
 import { WsNativeProfile } from "./ws-native-profile.js"
+import { DatabasePreparation } from "./preparation.js"
 
 export type SourceMessage = {
   readonly id: string
@@ -505,10 +506,10 @@ export function status(): Effect.Effect<Status, never, Database.Service> {
   })
 }
 
-export const layer = Layer.effectDiscard(
+export const configured = (observer?: DatabasePreparation.Observer) => Layer.effectDiscard(
   Effect.gen(function* () {
     runtimeState = { status: "running", progress: { label: "Clearing old events" } }
-    yield* run().pipe(
+    yield* DatabasePreparation.track(observer, (begin) => runPrepared({}, begin)).pipe(
       Effect.matchCauseEffect({
         onFailure: (cause) =>
           Effect.sync(() => {
@@ -524,6 +525,8 @@ export const layer = Layer.effectDiscard(
   }),
 )
 
+export const layer = configured()
+
 function errorText(input: unknown): string {
   if (!(input instanceof Error)) return String(input)
   const cause = input.cause
@@ -535,17 +538,22 @@ function updateProgress(progress: Progress) {
 }
 
 export function run(options: Options = {}): Effect.Effect<RunResult, never, Database.Service | Global.Service> {
+  return runPrepared(options, Effect.void)
+}
+
+function runPrepared(options: Options, begin: Effect.Effect<void>): Effect.Effect<RunResult, never, Database.Service | Global.Service> {
   return lock.withPermit(
     Effect.gen(function* () {
       const db = (yield* Database.Service).db
       const global = yield* Global.Service
       yield* DatabaseMigration.preflight(db)
-      const profile = yield* WsNativeProfile.run(db, nextPath(options, global.data))
+      const profile = yield* WsNativeProfile.run(db, nextPath(options, global.data), begin)
       const sourcePath = profile ? undefined : nextPath(options, global.data)
       yield* countNextSessions(sourcePath)
       const state = yield* readState(db)
       if (state?.phase === "completed") return { status: "completed" as const }
       if (!(yield* hasLegacySessions(db))) return { status: "completed" as const }
+      yield* begin
       const roots = yield* db.get(sql`SELECT name FROM sqlite_schema WHERE name = '_ws_import_root'`)
       const protectedIDs = sql`SELECT aggregate_id FROM event_sequence WHERE owner_id IS NOT NULL
         AND (aggregate_id IN (SELECT id FROM session_v2) OR aggregate_id NOT IN (SELECT id FROM session))

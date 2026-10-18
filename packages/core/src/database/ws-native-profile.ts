@@ -16,7 +16,7 @@ import { DatabaseLease } from "./lease.js"
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 const identifier = DatabaseWsArchive.identifier
 
-export function run(target: Database, filename: string | undefined) {
+export function run(target: Database, filename: string | undefined, begin: Effect.Effect<void> = Effect.void) {
   return Effect.scoped(Effect.gen(function* () {
     if (!filename || !(yield* DatabaseArtifact.exists(filename))) return false
     yield* DatabaseArtifact.requireRegularFile(filename)
@@ -35,6 +35,7 @@ export function run(target: Database, filename: string | undefined) {
               return yield* Effect.fail(new DatabaseLineage.UnsafeMigrationHistoryError([...state.completed], "unrecognized profile schema"))
             return false
           }
+          yield* begin
           yield* DatabaseArtifact.snapshot(source, staged)
           return true
         }).pipe(Effect.provide(sqliteLayer({ filename, readonly: true, readwrite: false, create: false }))),

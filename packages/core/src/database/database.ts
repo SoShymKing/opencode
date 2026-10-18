@@ -2,7 +2,7 @@ export * as Database from "./database.js"
 
 import { EffectDrizzleSqlite } from "./drizzle.js"
 import { sqliteLayer, supportsForeignKeyToggle, supportsTuningPragmas } from "#sqlite"
-import { Context, Effect, Layer, Schedule, Schema, Semaphore } from "effect"
+import { Context, Effect, Layer, Schedule, Schema, Scope, Semaphore } from "effect"
 import { SqlClient } from "effect/sql"
 import { Global } from "@opencode/util/global"
 import { closeSync, existsSync, openSync } from "node:fs"
@@ -10,6 +10,7 @@ import { chmod } from "node:fs/promises"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
+import { DatabasePreparation } from "./preparation.js"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 type DatabaseShape = Effect.Success<typeof makeDatabase>
@@ -70,26 +71,27 @@ function lockFor(filename: string) {
   return lock
 }
 
-export function layer(options: Options = { path: ":memory:" }) {
-  return Layer.unwrap(
-    Effect.gen(function* () {
+export function layer(options: Options = { path: ":memory:" }, observer?: DatabasePreparation.Observer) {
+  return Layer.effectContext(
+    DatabasePreparation.track(observer, (begin) => Effect.gen(function* () {
+      const scope = yield* Scope.Scope
       const provide = (filename: string) =>
         databaseLayer(filename === ":memory:" ? Semaphore.make(1) : Effect.succeed(lockFor(filename)), filename).pipe(
           Layer.provide(sqliteLayer({ filename })),
         )
       const filename = options.path ?? ":memory:"
-      if (filename === ":memory:" || !supportsTuningPragmas) return provide(filename)
+      if (filename === ":memory:" || !supportsTuningPragmas) return yield* Layer.buildWithScope(provide(filename), scope)
       const file = isAbsolute(filename) ? filename : join((yield* Global.Service).data, filename)
       const { DatabaseLease } = yield* Effect.promise(() => import("./lease.js"))
       const { DatabaseReplacement } = yield* Effect.promise(() => import("./replacement.js"))
       const { WsNativeFile } = yield* Effect.promise(() => import("./ws-native-file.js"))
-      yield* WsNativeFile.admit(file).pipe(Effect.orDie)
+      yield* WsNativeFile.admit(file, begin).pipe(Effect.orDie)
       yield* DatabaseLease.shared(file).pipe(Effect.orDie)
       if (yield* DatabaseReplacement.pending(file).pipe(Effect.orDie))
         return yield* Effect.die(new DatabaseMigration.UnsafeMigrationHistoryError([], "replacement appeared during startup; reopen the database"))
       yield* Effect.promise(() => restrictToOwner(file))
-      return provide(file)
-    }),
+      return yield* Layer.buildWithScope(provide(file), scope)
+    })),
   )
 }
 
@@ -119,8 +121,8 @@ export const layerFromClient: Layer.Layer<Service, never, SqlClient.SqlClient | 
   Semaphore.make(1),
 )
 
-export function configured(options?: Options) {
-  return makeGlobalNode({ service: Service, layer: layer(options), deps: [Global.node] })
+export function configured(options?: Options, observer?: DatabasePreparation.Observer) {
+  return makeGlobalNode({ service: Service, layer: layer(options, observer), deps: [Global.node] })
 }
 
 export function layerFromPath(filename: string) {

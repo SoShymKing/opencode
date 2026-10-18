@@ -15,11 +15,11 @@ import { setupWs, sessionID } from "./fixture/database-ws"
 import { tempGlobalLayer } from "./fixture/global"
 import { tmpdir } from "./fixture/tmpdir"
 
-function open(target: string) {
+function open(target: string, observer?: (active: boolean) => Promise<void>) {
   return Effect.gen(function* () {
     const service = yield* Database.Service
     return yield* service.db.all<{ id: string }>("SELECT id FROM session_v2")
-  }).pipe(Effect.provide(Database.layerFromPath(target)), Effect.provide(tempGlobalLayer), Effect.scoped, Effect.runPromise)
+  }).pipe(Effect.provide(Database.layer({ path: target }, observer)), Effect.provide(tempGlobalLayer), Effect.scoped, Effect.runPromise)
 }
 
 async function fixture(directory: string, native: boolean) {
@@ -38,6 +38,18 @@ async function fixture(directory: string, native: boolean) {
   await DatabaseArtifact.write(`${target}.replacement.json`, JSON.stringify(marker)).pipe(Effect.runPromise)
   return { target, staged, marker }
 }
+
+test.each([false, true])("replacement preparation pairs publication for native=%s", async (native) => {
+  await using tmp = await tmpdir()
+  const setup = await fixture(tmp.path, native)
+  const phases: boolean[] = []
+  expect(await open(setup.target, async (active) => {
+    if (active) expect(await Bun.file(setup.staged).exists()).toBe(true)
+    if (!active) expect(await Bun.file(`${setup.target}.replacement.json`).exists()).toBe(false)
+    phases.push(active)
+  })).toEqual([{ id: sessionID }])
+  expect(phases).toEqual([true, false])
+})
 
 test.each(["prepared", "backup_ready", "postrename"])("native %s marker resumes exactly once", async (phase) => {
   await using tmp = await tmpdir()
