@@ -11,7 +11,8 @@ import { WsNative } from "@opencode/core/database/ws-native"
 import { setupWs, setupPreviousNative, messageData, richMessageData, nativeMessageData, rawJSON } from "./fixture/database-ws"
 import { WsNativeBatch } from "@opencode/core/database/ws-native-batch"
 import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
-import { openWorker } from "@opencode/core/database/ws-native-bun"
+import { open, openWith, openWorker } from "@opencode/core/database/ws-native-bun"
+import { choose, headroom, reserve, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
 import { WsNativeMessage } from "@opencode/core/database/ws-native-message"
 import { tempGlobalLayer } from "./fixture/global"
 import type { Worker } from "node:worker_threads"
@@ -21,6 +22,172 @@ const input = (data = richMessageData, previousNative = false): WsNativeBatch.In
   row: { id: "msg_worker", session_id: "ses_migration", type: "assistant", seq: 7, time_created: 1, time_updated: 16, data },
   parts: undefined, previousNative, store: true,
 })
+
+test("resource selection uses all feasible CPUs and accounts for active reservations", () => {
+  const weights = Array.from({ length: 8 }, (_, index) => 2 * 1024 ** 2 + index)
+  for (const cpu of [1, 3, 8]) {
+    expect(choose({ cpu, freeBytes: 4 * 1024 ** 3 }, weights).workers).toBe(cpu === 1 ? 0 : cpu)
+  }
+  expect(choose({ cpu: 8, freeBytes: 4 * 1024 ** 3 }, []).workers).toBe(0)
+  expect(choose({ cpu: 20, freeBytes: 4 * 1024 ** 3 }, Array(20).fill(100)).workers).toBe(0)
+  expect(choose({ cpu: 20, freeBytes: 4 * 1024 ** 3 }, Array(38).fill(8 * 27500 + 4096)).workers).toBe(4)
+  expect(choose({ cpu: 20, freeBytes: 4 * 1024 ** 3 }, Array(20).fill(2 * 1024 ** 2)).workers).toBe(20)
+  expect(choose({ cpu: 8, freeBytes: 4 * 1024 ** 3 }, [100]).workers).toBe(0)
+  expect(choose({ cpu: 8, freeBytes: 4 * workerBytes + 2 * weights.reduce((sum, weight) => sum + weight, 0) }, weights).workers).toBe(2)
+  expect(choose({ cpu: 8, freeBytes: 4 * 1024 ** 3 }, weights, { cpu: 5, bytes: 0 }).workers).toBe(3)
+  expect(choose({ cpu: 8, freeBytes: 100 }, [100]).count).toBe(0)
+  expect(choose({ cpu: 8, freeBytes: 1000 }, [100, 200, 400]).count).toBe(2)
+})
+
+test("scoped scheduler starts lazily, uses three real threads and reuses them in order", () => Effect.runPromise(Effect.gen(function* () {
+  const worker = yield* open
+  expect(worker.threadIDs()).toEqual([])
+  expect(yield* worker.run([])).toEqual([])
+  expect(worker.threadIDs()).toEqual([])
+  const jobs = [262144, 300000, 280000, 270000].map((size) => ({ kind: "message" as const,
+    input: input(richMessageData.replace('"first"', JSON.stringify("x".repeat(size)))) }))
+  const expected = yield* WsNativeBatch.run(jobs)
+  expect(yield* worker.run(jobs)).toEqual([...expected])
+  const ids = worker.threadIDs()
+  expect(new Set(ids).size).toBe(3)
+  expect(ids.every((id) => id > 0)).toBe(true)
+  expect(yield* worker.run(jobs)).toEqual([...expected])
+  expect(worker.threadIDs()).toEqual(ids)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 3, freeBytes: 2 * 1024 ** 3 })), Effect.scoped)))
+
+test("scan refuses an oversized singleton before reading its payload", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE source (id TEXT PRIMARY KEY, data TEXT)")
+  yield* db.run("INSERT INTO source VALUES ('oversized', 'payload')")
+  const reads: string[] = []
+  const reader = { all: <T>(query: Parameters<typeof db.all>[0]) => {
+    const result = db.all<T>(query)
+    reads.push(result.getQuery().sql)
+    return result
+  } }
+  const result = yield* WsNativeScan.rows(reader, { table: "source", bytes: sql`octet_length(m.data)` },
+    () => Effect.void).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  if (result._tag === "Failure") expect(result.failure).toMatchObject({ messageID: "oversized" })
+  expect(reads.length).toBe(1)
+  expect(reads[0]).toContain("AS bytes")
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 8, freeBytes: 100 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("late memory pressure rolls back prior scan writes without reading another payload", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE source (id TEXT PRIMARY KEY, data TEXT)")
+  yield* db.run("CREATE TABLE target (id TEXT)")
+  for (let index = 0; index < 129; index++) yield* db.run(sql`INSERT INTO source VALUES (${String(index).padStart(3, "0")}, 'payload')`)
+  let freeBytes = 1024 ** 3
+  const result = yield* db.transaction((tx) => WsNativeScan.rows(tx, { table: "source", bytes: sql`octet_length(m.data)` },
+    (rows: readonly { id: string }[]) => Effect.gen(function* () {
+      for (const row of rows) yield* tx.run(sql`INSERT INTO target VALUES (${row.id})`)
+      freeBytes = 100
+    }))).pipe(Effect.provideService(Resources, () => ({ cpu: 3, freeBytes })), Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(yield* db.get("SELECT count(*) AS count FROM target")).toEqual({ count: 0 })
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("single CPU conversion admits memory without a thread and releases a failed wave", () => Effect.runPromise(Effect.gen(function* () {
+  const worker = yield* open
+  const available = yield* headroom
+  expect(yield* worker.process([input()])).toEqual(yield* WsNativeBatch.process([input()]))
+  expect(worker.threadIDs()).toEqual([])
+  const result = yield* worker.process([input("{}")]).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })), Effect.scoped)))
+
+test("active reservations constrain another scope and release after worker failure", () => Effect.runPromise(Effect.gen(function* () {
+  const large = input(richMessageData.replace('"first"', JSON.stringify("x".repeat(262144))))
+  const available = yield* headroom
+  yield* Effect.scoped(Effect.gen(function* () {
+    yield* reserve([{ kind: "message", input: large }, { kind: "message", input: large }])
+    const remaining = yield* headroom
+    expect(remaining).toBeLessThan(available - 2 * workerBytes)
+    const worker = yield* open
+    yield* worker.process([large, large, large])
+    expect(worker.threadIDs().length).toBe(1)
+    expect(yield* headroom).toBe(remaining)
+  }))
+  const result = yield* Effect.scoped(Effect.gen(function* () {
+    const worker = yield* open
+    return yield* worker.process([large, input("{}"), large])
+  })).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 3, freeBytes: 420 * 1024 ** 2 })), Effect.scoped)))
+
+test("resource changes grow and shrink a live scoped worker set", () => {
+  let cpu = 1
+  return Effect.runPromise(Effect.gen(function* () {
+    const exited: number[] = []
+    const finalized: number[] = []
+    const worker = yield* openWith(openWorker().pipe(Effect.tap((opened) => Effect.gen(function* () {
+      const id = opened.worker.threadId
+      opened.worker.once("exit", () => exited.push(id))
+      yield* Effect.addFinalizer(() => Effect.sync(() => { finalized.push(id) }))
+    }))))
+    const large = input(richMessageData.replace('"first"', JSON.stringify("x".repeat(262144))))
+    const items = [large, large, large]
+    yield* worker.process(items)
+    expect(worker.threadIDs()).toEqual([])
+    cpu = 3
+    yield* worker.process(items)
+    expect(new Set(worker.threadIDs()).size).toBe(3)
+    const first = worker.threadIDs()
+    cpu = 1
+    yield* worker.process(items)
+    expect(worker.threadIDs()).toEqual([])
+    expect(exited.toSorted()).toEqual(first.toSorted())
+    expect(finalized.toSorted()).toEqual(first.toSorted())
+    cpu = 3
+    yield* worker.process(items)
+    expect(worker.threadIDs().length).toBe(3)
+    expect(worker.threadIDs().every((id) => !first.includes(id))).toBe(true)
+    return { exited, finalized }
+  }).pipe(Effect.provideService(Resources, () => ({ cpu, freeBytes: 2 * 1024 ** 3 })), Effect.scoped,
+    Effect.tap((closed) => Effect.sync(() => {
+      expect(closed.finalized.length).toBe(6)
+      expect(new Set(closed.finalized).size).toBe(6)
+      expect(closed.exited.toSorted()).toEqual(closed.finalized.toSorted())
+    }))))
+})
+
+for (const mode of ["interruption", "failure"] as const) test(`scheduler ${mode} holds reservations until every Worker exits`, () => Effect.runPromise(Effect.gen(function* () {
+  const snapshot = () => ({ cpu: 3, freeBytes: 2 * 1024 ** 3 })
+  const large = input(richMessageData.replace('"first"', JSON.stringify("x".repeat(262144))))
+  const jobs: WsNativeBatch.Job[] = Array.from({ length: 3 }, (_, index) => ({ kind: "message", input: { ...large,
+    row: { ...large.row, id: mode === "failure" && index === 0 ? "msg_error" : "msg_wait" } } }))
+  const started = yield* Deferred.make<void>()
+  const online: number[] = []
+  const exits: { available: number; workers: number }[] = []
+  const worker = yield* openWith(openWorker(new URL("./fixture/ws-native-worker-failure.ts", import.meta.url)).pipe(Effect.tap((opened) => Effect.sync(() => {
+    opened.worker.once("online", () => {
+      online.push(opened.worker.threadId)
+      if (online.length === 3) Effect.runSync(Deferred.succeed(started, undefined))
+    })
+    opened.worker.once("exit", () => {
+      exits.push(Effect.runSync(Effect.scoped(Effect.gen(function* () {
+        const available = yield* headroom
+        const selected = yield* reserve(jobs)
+        return { available, workers: selected.workers }
+      })).pipe(Effect.provideService(Resources, snapshot))))
+    })
+  }))))
+  const available = yield* headroom.pipe(Effect.provideService(Resources, snapshot))
+  const fiber = yield* worker.run(jobs).pipe(Effect.provideService(Resources, snapshot), Effect.forkChild({ startImmediately: true }))
+  const held = yield* headroom.pipe(Effect.provideService(Resources, snapshot))
+  expect(held).toBeLessThan(available)
+  if (mode === "interruption") {
+    yield* Deferred.await(started)
+    yield* Fiber.interrupt(fiber)
+  }
+  if (mode === "failure") expect((yield* Fiber.await(fiber))._tag).toBe("Failure")
+  expect(exits).toEqual(Array.from({ length: 3 }, () => ({ available: held, workers: 0 })))
+  expect(yield* headroom.pipe(Effect.provideService(Resources, snapshot))).toBe(available)
+}).pipe(Effect.scoped)))
 
 test("both real workers execute native preparation jobs and reject invalid validation", () => Effect.runPromise(Effect.gen(function* () {
   const left = yield* openWorker()
@@ -333,8 +500,10 @@ test("worker startup failure rejects conversion without serial fallback", async 
 })
 
 test("interruption terminates a worker with pending work", () => Effect.runPromise(Effect.gen(function* () {
+  const available = yield* headroom
   const started = yield* Deferred.make<Worker>()
   const fiber = yield* Effect.scoped(Effect.gen(function* () {
+    yield* reserve([{ kind: "message", input: input() }])
     const worker = yield* openWorker(new URL("./fixture/ws-native-worker-failure.ts", import.meta.url))
     yield* Deferred.succeed(started, worker.worker)
     const item = input()
@@ -344,7 +513,8 @@ test("interruption terminates a worker with pending work", () => Effect.runPromi
   const exit = new Promise<number>((resolve) => worker.once("exit", resolve))
   yield* Fiber.interrupt(fiber)
   expect(typeof (yield* Effect.promise(() => exit))).toBe("number")
-}).pipe(Effect.scoped)))
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 3, freeBytes: 1024 ** 3 })), Effect.scoped)))
 
 test("child payload budget admits an oversized message alone", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
