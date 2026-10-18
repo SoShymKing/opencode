@@ -198,9 +198,7 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
         const session = yield* db.select().from(SessionTable).where(sql`${SessionTable.id} = ${candidate.id}`).get()
         if (!session) return yield* fail(`Missing legacy session: ${candidate.id}`)
         const transformed = yield* V1Migration.prepareSession(db, session, { message: legacyMessages, part: legacyParts })
-        const projected = new Set(transformed.messages.map((row) => row.id))
-        if (transformed.warnings.length || [...transformed.sourceMessageIDs].some((id) => !projected.has(id)))
-          return yield* fail(`Legacy transform would skip source rows for ${session.id}: ${JSON.stringify(transformed.warnings)}`)
+        yield* validateLegacyProjection(transformed)
         let offset = 0
         while (offset < transformed.messages.length) {
           const wave: V1Migration.TransformResult["messages"][number][] = []
@@ -250,6 +248,14 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
         VALUES (${item.row.id}, ${item.row.session_id}, ${item.row.type}, ${item.row.data}, ${item.delivery}, ${item.row.admitted_seq}, ${item.row.time_created})`)
     }))
   }))
+}
+
+export function validateLegacyProjection(transformed: V1Migration.TransformResult & { sourceMessageIDs: ReadonlySet<string> }) {
+  const projected = new Set(transformed.messages.map((row) => row.id))
+  const missing = [...transformed.sourceMessageIDs].filter((id) => !projected.has(id) && !transformed.omittedMessageIDs.has(id))
+  if (transformed.warnings.length || missing.length)
+    return Effect.fail(fail(`Legacy transform rejected: unexplained missing source IDs ${missing.length}, warnings ${transformed.warnings.length}, reason classes ${JSON.stringify([...new Set(transformed.warnings.map((warning) => warning.reason))])}`))
+  return Effect.void
 }
 
 export function validate(db: Database) {

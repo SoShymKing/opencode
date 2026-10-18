@@ -37,6 +37,41 @@ test("large mixed legacy and WS event history converts without omitted source ro
   yield* WsNative.validate(db)
 }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.provide(tempGlobalLayer), Effect.scoped)))
 
+test("selected restore preserves an empty native prefix for an unpaired legacy compaction", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: true })
+  yield* db.run(`UPDATE part SET data = '{ "type":"compaction", "auto":false }' WHERE id = 'prt_legacy'`)
+  const originals = new Map<string, unknown[]>()
+  for (const table of ["message", "part"]) originals.set(table, yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(table)} ORDER BY id`))
+  yield* WsNative.convert(db)
+  expect(yield* db.get("SELECT id FROM session_v2 WHERE id = 'ses_legacy'")).toEqual({ id: "ses_legacy" })
+  expect(yield* db.get("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_legacy'")).toEqual({ seq: -1 })
+  expect(yield* db.all("SELECT * FROM session_message WHERE session_id = 'ses_legacy'")).toEqual([])
+  const manifest = yield* db.get<{ id: string }>("SELECT id FROM _ws_archive")
+  if (!manifest) throw new Error("Missing archive")
+  const archive = yield* DatabaseWsArchive.read(db, manifest.id)
+  if (!archive) throw new Error("Missing archive manifest")
+  for (const [table, rows] of originals) {
+    const source = DatabaseWsArchive.sourceTable(archive, table)
+    if (!source) throw new Error("Missing archived source")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(source)} ORDER BY id`)).toEqual(rows)
+  }
+  yield* db.run("DELETE FROM session_v2 WHERE id = 'ses_legacy'")
+  yield* db.run("DELETE FROM event_sequence WHERE aggregate_id = 'ses_legacy'")
+  expect(yield* db.get("SELECT id FROM session_v2 WHERE id = 'ses_legacy'")).toBeUndefined()
+  expect(yield* db.get("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_legacy'")).toBeUndefined()
+  yield* db.transaction((tx) => WsNative.restoreSessions(tx, archive, ["ses_legacy"]))
+  expect(yield* db.get("SELECT id FROM session_v2 WHERE id = 'ses_legacy'")).toEqual({ id: "ses_legacy" })
+  expect(yield* db.get("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_legacy'")).toEqual({ seq: -1 })
+  expect(yield* db.all("SELECT * FROM session_message WHERE session_id = 'ses_legacy'")).toEqual([])
+  for (const [table, rows] of originals) {
+    const source = DatabaseWsArchive.sourceTable(archive, table)
+    if (!source) throw new Error("Missing archived source")
+    expect(yield* db.all(sql`SELECT * FROM ${DatabaseWsArchive.identifier(source)} ORDER BY id`)).toEqual(rows)
+  }
+  yield* WsNative.validate(db)
+}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.provide(tempGlobalLayer), Effect.scoped)))
+
 for (const previous of [false, true]) test(`selected restore validates unrelated ${previous ? "pending" : "epoch"} corruption and rolls back`, () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* (previous ? setupPreviousNative : setupWs)(db, { directory: "/fixture", rich: true })
