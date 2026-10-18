@@ -30,6 +30,11 @@
     "./*": "./src/*.ts"
   },
   "imports": {
+    "#ws-native-worker": {
+      "workerd": "./src/database/ws-native-serial.ts",
+      "bun": "./src/database/ws-native-bun.ts",
+      "default": "./src/database/ws-native-serial.ts"
+    },
     "#sqlite": {
       "workerd": "./src/database/sqlite.workerd.ts",
       "bun": "./src/database/sqlite.bun.ts",
