@@ -34,6 +34,18 @@ const bundle = async (conditions: Array<string>) => {
 // file). The assertions pin platform-independent package.json condition
 // resolution, so Linux coverage loses nothing.
 describe.skipIf(process.platform === "win32")("sqlite bundle conditions", () => {
+  test("workerd WS scans do not import unavailable OS memory reporting", async () => {
+    const result = await Bun.build({
+      entrypoints: [join(import.meta.dir, "../src/database/ws-native-scan.ts")],
+      target: "browser",
+      conditions: ["workerd"],
+      packages: "external",
+      throw: false,
+    })
+    expect(result.success).toBe(true)
+    expect(await result.outputs[0].text()).not.toContain("node:os")
+  })
+
   test("workerd conditions select the Durable Object driver and never bun:sqlite", async () => {
     const output = await bundle(["workerd"])
     expect(output).not.toContain("bun:sqlite")

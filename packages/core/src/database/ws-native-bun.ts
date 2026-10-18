@@ -1,8 +1,8 @@
-import { availableParallelism } from "node:os"
 import { Worker } from "node:worker_threads"
-import { Effect } from "effect"
+import { Effect, Exit, Scope, Semaphore } from "effect"
 import { WsNativeBatch } from "./ws-native-batch.js"
 import { WsNativeMessage } from "./ws-native-message.js"
+import { reserve } from "./ws-native-serial.js"
 
 declare const OPENCODE_WS_NATIVE_WORKER: string | undefined
 const workerURL = new URL(typeof OPENCODE_WS_NATIVE_WORKER === "undefined"
@@ -60,16 +60,50 @@ export function openWorker(url = workerURL) {
   }), (worker) => Effect.promise(worker.close))
 }
 
-export const open = Effect.gen(function* () {
-  if (availableParallelism() < 2) return { run: WsNativeBatch.run, process: WsNativeBatch.process }
-  const left = yield* openWorker()
-  const right = yield* openWorker()
-  const run = (items: readonly WsNativeBatch.Job[]) => Effect.all([
-      left.run(items.slice(0, Math.ceil(items.length / 2))),
-      right.run(items.slice(Math.ceil(items.length / 2))),
-    ], { concurrency: 2 }).pipe(Effect.map(([first, second]) => [...first, ...second]))
+export const openWith = (acquire: ReturnType<typeof openWorker>) => Effect.gen(function* () {
+  const parent = yield* Effect.scope
+  const scope = yield* Scope.fork(parent)
+  const lock = yield* Semaphore.make(1)
+  const workers: { readonly worker: Effect.Success<ReturnType<typeof openWorker>>; readonly scope: Scope.Closeable }[] = []
+  const run = (items: readonly WsNativeBatch.Job[]) => lock.withPermits(1)(Effect.gen(function* () {
+    const results: WsNativeBatch.Result[] = []
+    let offset = 0
+    while (offset < items.length) {
+      const output = yield* Effect.gen(function* () {
+        const selected = yield* reserve(items.slice(offset))
+        const jobs = items.slice(offset, offset + selected.count)
+        while (workers.length > selected.workers) {
+          const worker = workers.pop()
+          if (worker) yield* Scope.close(worker.scope, Exit.void)
+        }
+        if (!selected.workers) return yield* WsNativeBatch.run(jobs)
+        while (workers.length < selected.workers) {
+          const child = yield* Scope.fork(scope)
+          const worker = yield* acquire.pipe(Scope.provide(child),
+            Effect.onExit((exit) => Exit.isFailure(exit) ? Scope.close(child, exit) : Effect.void))
+          workers.push({ worker, scope: child })
+        }
+        const groups = workers.map<{ weight: number; items: { readonly index: number; readonly job: WsNativeBatch.Job }[] }>(() => ({ weight: 0, items: [] }))
+        for (const item of jobs.map((job, index) => ({ job, index, weight: selected.weights[index] })).sort((left, right) => right.weight - left.weight)) {
+          const group = groups.reduce((left, right) => left.weight <= right.weight ? left : right)
+          group.weight += item.weight
+          group.items.push(item)
+        }
+        const replies = yield* Effect.all(groups.map((group, index) => workers[index].worker.run(group.items.map((item) => item.job)).pipe(
+          Effect.map((outputs) => outputs.map((output, index) => ({ index: group.items[index].index, output }))),
+        )), { concurrency: selected.workers })
+        return replies.flat().sort((left, right) => left.index - right.index).map((item) => item.output)
+      }).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? Scope.close(scope, exit) : Effect.void), Effect.scoped)
+      results.push(...output)
+      offset += output.length
+    }
+    return results
+  }))
   return {
     run,
+    threadIDs: () => workers.map((record) => record.worker.worker.threadId),
     process: (items: readonly WsNativeBatch.Input[]) => run(items.map((input) => ({ kind: "message", input }))).pipe(Effect.map(WsNativeBatch.messageOutputs)),
   }
 })
+
+export const open = openWith(openWorker())

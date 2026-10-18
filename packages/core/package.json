@@ -30,6 +30,10 @@
     "./*": "./src/*.ts"
   },
   "imports": {
+    "#ws-native-os": {
+      "workerd": "./src/database/ws-native-os.workerd.ts",
+      "default": "./src/database/ws-native-os.ts"
+    },
     "#ws-native-worker": {
       "workerd": "./src/database/ws-native-serial.ts",
       "bun": "./src/database/ws-native-bun.ts",
