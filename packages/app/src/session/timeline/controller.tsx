@@ -25,6 +25,7 @@ import { useServer } from "@/runtime/server/current"
 import { getSessionMessageHandoff } from "@/session/handoff"
 import type { ReasoningMode } from "@opencode/session-ui/timeline/projection"
 import { archiveHomeSession } from "@/home/sessions/archive"
+import { errorMessage } from "@/shell/layout/helpers"
 
 const emptyMessages: SessionMessageInfo[] = []
 
@@ -341,21 +342,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
     },
     action: {
       rename,
-      archive: async (id: string) => {
-        const session = data.session.get(id)
-
-        if (!session) return
-        await archiveHomeSession({
-          server: server.key,
-          session,
-          api: serverSDK.api.session,
-          remember: (time) => {
-            data.session.remember({ ...(data.session.get(id) ?? session), time })
-          },
-          onError: (cause) =>
-            showToast({ title: language.t("common.requestFailed"), description: errorMessage(cause) }),
-        })
-      },
+      archive: useSessionArchive(),
       export: exportSession,
       showDelete: (id: string) => dialog.show(() => <DeleteDialog sessionID={id} />),
       navigateParent: () => {
@@ -368,3 +355,29 @@ export function createTimelineController(input: { session: TimelineSessionSource
 }
 
 export type TimelineController = ReturnType<typeof createTimelineController>
+
+export function useSessionArchive() {
+  const server = useServer()
+  const serverSDK = useServerSDK()
+  const data = server.ctx.data
+  const language = useLanguage()
+
+  return async (id: string) => {
+    const session = data.session.get(id)
+
+    if (!session) return
+    await archiveHomeSession({
+      server: server.key,
+      session,
+      api: serverSDK.api.session,
+      remember: (time) => {
+        data.session.remember({ ...(data.session.get(id) ?? session), time })
+      },
+      onError: (cause) =>
+        showToast({
+          title: language.t("common.requestFailed"),
+          description: errorMessage(cause, language.t("common.requestFailed")),
+        }),
+    })
+  }
+}
