@@ -1,11 +1,112 @@
 import { expect, test, type Page } from "@playwright/test"
-import { expectPath, holdRoute, NO_PROVIDER, project, REMOTE_SERVER, seed, sessionHref } from "../utils/app"
+import { expectPath, holdRoute, NO_PROVIDER, project, REMOTE_SERVER, seed, SERVER, sessionHref } from "../utils/app"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { fixture, mockStressTimeline } from "../utils/session-fixture"
-import { mockRemoteServer } from "../utils/workspace"
+import { mockRemoteServer, mockWorkspace } from "../utils/workspace"
 import { APP_READY_TIMEOUT, expectAppVisible } from "../utils/waits"
 
 test.use({ serviceWorkers: "block" })
+
+for (const surface of ["Home", "session"] as const) {
+  test(`archived metadata and non-title search use cached projects from ${surface}`, async ({ page }) => {
+    const directory = "C:/OpenCode/Archive metadata"
+    const worktree = `${directory}/.worktrees/willow-branch`
+    const requests: string[] = []
+    page.on("request", (request) => {
+      if (/^\/api\/(project|workspace|location)(\/|$)/.test(new URL(request.url()).pathname)) requests.push(request.url())
+    })
+    await mockWorkspace(page, {
+      name: "Archive metadata",
+      directory,
+      project: { name: "Orchid project", sandboxes: [worktree] },
+      sessions: [
+        { id: "ses_metadata_live", title: "Current work" },
+        {
+          id: "ses_metadata_archived",
+          title: "Quiet refactor",
+          directory: worktree,
+          time: { created: 1623758400000, updated: 1655294400000, archived: 1686830400000 },
+        },
+        {
+          id: "ses_metadata_unresolved",
+          title: "Unrelated notes",
+          projectID: "proj_unresolved",
+          directory: "D:/Notes/plain-path",
+          time: { created: 1705320000000, updated: 1718452800000, archived: 1734264000000 },
+        },
+      ],
+      seed: { locale: "en", tabs: ["ses_metadata_live"] },
+    })
+
+    const bootstrap = surface === "session"
+      ? page.waitForResponse((response) => {
+          const url = new URL(response.url())
+
+          return url.origin === SERVER && url.pathname === "/api/location" &&
+            url.searchParams.get("location[directory]") === directory && response.request().method() === "GET"
+        }).then(async (response) => {
+          expect(response.ok()).toBe(true)
+          await response.finished()
+        })
+      : undefined
+
+    await page.goto(surface === "Home" ? "/" : sessionHref("ses_metadata_live"))
+    await bootstrap
+    const metadataRequests: string[] = []
+
+    if (surface === "Home") {
+      await expect(page.locator('[data-component="home-project-row"]').filter({ hasText: "Orchid project" })).toBeVisible()
+      metadataRequests.push(...requests)
+      await page.getByRole("button", { name: "Archived sessions", exact: true }).click()
+    }
+
+    if (surface === "session") {
+      await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
+      await expect(page.locator('[data-session-title]').getByRole("button", { name: "Orchid project", exact: true })).toBeVisible()
+      metadataRequests.push(...requests)
+      await page.keyboard.press("ControlOrMeta+Shift+P")
+      const palette = page.getByRole("dialog")
+      await palette.getByRole("textbox").fill("archived sessions")
+      await palette.getByRole("option", { name: "Archived sessions", exact: true }).click()
+    }
+
+    const dialog = page.getByRole("dialog", { name: "Archived sessions", exact: true })
+    const target = dialog.getByRole("button", { name: /Quiet refactor/ })
+    await expect(target.getByText("Orchid project", { exact: true })).toBeVisible()
+    await expect(target.getByText("willow-branch", { exact: true })).toBeVisible()
+    await expect(target.getByText(worktree, { exact: true })).toBeVisible()
+
+    const times = await page.evaluate(() =>
+      [1655294400000, 1686830400000].map((time) =>
+        new Date(time).toLocaleString("en", { dateStyle: "medium", timeStyle: "short" }),
+      ),
+    )
+
+    await expect(target.getByText(/^Archived /)).toHaveText(`Archived ${times[1]}`)
+    await expect(target.getByText(/^Updated /)).toHaveText(`Updated ${times[0]}`)
+    await expect(dialog.getByRole("button", { name: /Unrelated notes/ }).getByText("plain-path", { exact: true })).toBeVisible()
+    const search = dialog.getByRole("textbox", { name: "Search archived sessions" })
+
+    for (const query of ["Orchid project", "willow-branch", worktree, "2022", "2023"]) {
+      await search.fill(query)
+      await expect(dialog.locator('[data-slot="list-item"]')).toHaveCount(1)
+      await expect(target).toBeVisible()
+    }
+
+    await search.fill("D:/Notes/plain-path")
+    await expect(dialog.locator('[data-slot="list-item"]')).toHaveCount(1)
+    await expect(dialog.getByRole("button", { name: /Unrelated notes/ })).toBeVisible()
+    expect(requests).toEqual(metadataRequests)
+    await search.fill("Orchid project")
+    await expect(target).toBeVisible()
+    const restored = page.waitForRequest(`${SERVER}/api/session/ses_metadata_archived/restore`)
+    await target.click()
+    expect((await restored).method()).toBe("POST")
+    await expect(dialog).toHaveCount(0)
+    await expectPath(page, sessionHref("ses_metadata_archived"))
+    await expect(page.getByRole("heading", { name: "Quiet refactor", exact: true })).toBeVisible()
+  })
+}
 
 const row = (page: Page, title: string) =>
   page.locator('[data-component="home-session-row"]').filter({ hasText: title })

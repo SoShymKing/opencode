@@ -317,6 +317,7 @@ export function createHomeSessionsController(home: HomeController) {
       <ArchivedSessionsDialog
         api={api}
         directories={selectedDirectories}
+        resolveProject={(session) => homeProjectForSession(session, projects) ?? ctx.projects.forSession(session)}
         onRestore={(session) => {
           ctx.data.session.remember(session)
           void queryClient.invalidateQueries({ queryKey: ["home-sessions", conn], exact: true })

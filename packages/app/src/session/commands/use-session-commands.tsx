@@ -334,6 +334,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       (x) => dialog.show(() => (
         <x.ArchivedSessionsDialog
           api={api}
+          resolveProject={projects.forSession}
           onRestore={(session) => {
             data.session.remember(session)
             const directory = projects.forSession(session)?.worktree ?? session.location.directory

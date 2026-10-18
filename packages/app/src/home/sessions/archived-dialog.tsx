@@ -1,19 +1,23 @@
 import type { SessionApi, SessionInfo } from "@opencode/client/promise"
 import { Dialog, DialogBody, DialogHeader, DialogTitle } from "@opencode/ui/dialog"
 import { List } from "@opencode/ui/list"
+import { displayName } from "@opencode/ui/project-avatar"
 import { useDialog } from "@opencode/ui/context/dialog"
-import { onMount } from "solid-js"
+import { createMemo, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/runtime/i18n/language"
 import { errorMessage } from "@/shell/layout/helpers"
 import { showToast } from "@/shell/notifications/toast"
 import { listAllSessions } from "@/session/list"
 import { sessionLabel } from "@/session/title"
+import type { LocalProject } from "@/shell/state/layout"
 import { restoreHomeSession } from "./archive"
+import { homeSessionLocation } from "./records"
 
 export function ArchivedSessionsDialog(props: {
   api: Pick<SessionApi, "list" | "restore" | "get">
   directories?: string[]
+  resolveProject: (session: SessionInfo) => LocalProject | undefined
   onRestore: (session: SessionInfo) => void
 }) {
   const language = useLanguage()
@@ -25,6 +29,22 @@ export function ArchivedSessionsDialog(props: {
     restoring?: string
     error?: string
   }>({ sessions: [], loading: true })
+
+  const date = createMemo(() => new Intl.DateTimeFormat(language.intl(), { dateStyle: "medium", timeStyle: "short" }))
+
+  const sessions = createMemo(() =>
+    state.sessions.map((session) => ({
+      session,
+      title: sessionLabel(session),
+      projectName: displayName(props.resolveProject(session) ?? { worktree: session.location.directory }),
+      worktree: homeSessionLocation(session.location.directory).worktree,
+      directory: session.location.directory,
+      archivedLabel: session.time.archived === undefined
+        ? undefined
+        : language.t("dialog.archivedSessions.archived", { time: date().format(session.time.archived) }),
+      updatedLabel: language.t("dialog.archivedSessions.updated", { time: date().format(session.time.updated) }),
+    })),
+  )
 
   onMount(() => {
     void Promise.all(
@@ -68,20 +88,32 @@ export function ArchivedSessionsDialog(props: {
               ? language.t("dialog.archivedSessions.loading")
               : state.error ?? language.t("dialog.archivedSessions.empty")
           }
-          key={(session) => session.id}
-          items={state.sessions}
-          filterKeys={["title"]}
-          onSelect={restore}
+          key={(item) => item.session.id}
+          items={sessions()}
+          filterKeys={["title", "projectName", "worktree", "directory", "archivedLabel", "updatedLabel"]}
+          onSelect={(item) => restore(item?.session)}
         >
-          {(session) => (
+          {(item) => (
             <div class="flex min-w-0 w-full items-center justify-between gap-3 text-start">
               <div class="flex min-w-0 flex-col">
-                <span dir="auto" class="truncate">{sessionLabel(session)}</span>
-                <span dir="ltr" class="truncate text-v2-text-text-muted">{session.location.directory}</span>
+                <span dir="auto" class="truncate">{item.title}</span>
+                <div class="flex min-w-0 gap-3 text-v2-text-text-muted">
+                  <span dir="auto" class="truncate">{item.projectName}</span>
+                  <Show when={item.worktree !== item.projectName}>
+                    <span dir="auto" class="truncate">{item.worktree}</span>
+                  </Show>
+                </div>
+                <span dir="ltr" class="truncate text-v2-text-text-muted">{item.directory}</span>
+                <div class="flex flex-wrap gap-x-3 text-v2-text-text-muted">
+                  <Show when={item.archivedLabel}>
+                    {(label) => <span>{label()}</span>}
+                  </Show>
+                  <span>{item.updatedLabel}</span>
+                </div>
               </div>
               <span class="shrink-0 text-v2-text-text-muted">
                 {language.t(
-                  state.restoring === session.id ? "dialog.archivedSessions.restoring" : "dialog.archivedSessions.restore",
+                  state.restoring === item.session.id ? "dialog.archivedSessions.restoring" : "dialog.archivedSessions.restore",
                 )}
               </span>
             </div>
