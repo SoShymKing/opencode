@@ -8,7 +8,8 @@ import { hasPtyConnectTicketURL } from "@opencode/protocol/groups/pty"
 import { hasPersistentPtyConnectTicketURL } from "@opencode/protocol/groups/persistent-pty"
 import { isPairingConnectURL } from "@opencode/protocol/groups/server"
 import { Global } from "@opencode/util/global"
-import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope } from "effect"
+import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope, Semaphore } from "effect"
+import type { DatabasePreparation } from "@opencode/core/database/preparation"
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { NetAddress } from "effect/net"
 import { createServer } from "node:http"
@@ -22,6 +23,7 @@ import { Status } from "./service-status"
 import type { ServerOptions } from "./options"
 
 export interface Lifecycle<E = never, R = never> {
+  readonly onDatabasePreparation?: DatabasePreparation.Observer
   readonly onListen: (
     address: NetAddress.SocketAddress,
     shutdown: Effect.Effect<void>,
@@ -86,8 +88,29 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
 
   const parentScope = yield* Scope.Scope
   const applicationScope = yield* Scope.fork(parentScope)
+  const preparationLock = yield* Semaphore.make(1)
+  const preparationContext = yield* Effect.context<never>()
+  let preparations = 0
+  let preparationClosed = false
+  const preparationObserver = lifecycle?.onDatabasePreparation
+  const publishPreparation = (active: boolean) => (preparationObserver
+    ? Effect.promise(() => preparationObserver(active))
+    : Effect.void).pipe(Effect.andThen(Effect.logInfo("database preparation phase changed", { active })))
+  const observePreparation: DatabasePreparation.Observer = (active) => Effect.runPromiseWith(preparationContext)(
+    preparationLock.withPermit(Effect.gen(function* () {
+      if (preparationClosed) return
+      preparations += active ? 1 : -1
+      if (preparations === (active ? 1 : 0)) yield* publishPreparation(active)
+    })).pipe(Effect.uninterruptible),
+  )
+  const closePreparation = preparationLock.withPermit(Effect.gen(function* () {
+    if (preparationClosed) return
+    preparationClosed = true
+    if (preparations > 0) yield* publishPreparation(false)
+  })).pipe(Effect.uninterruptible)
   yield* Effect.addFinalizer(() =>
-    status.beginStopping.pipe(
+    closePreparation.pipe(
+      Effect.andThen(status.beginStopping),
       Effect.andThen(Ref.set(application, Option.none())),
       Effect.andThen(Effect.sync(() => bound.server.closeAllConnections())),
     ),
@@ -101,6 +124,8 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
           password,
         },
         urls,
+        [],
+        observePreparation,
       ).pipe(Layer.provideMerge(NodeHttpServer.layerHttpServices)),
       applicationScope,
     )
@@ -121,8 +146,9 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
     }
   }).pipe(
     Effect.catchCause((cause) => {
-      if (!lifecycle || Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
-      return status.fail.pipe(
+      if (!lifecycle || Cause.hasInterruptsOnly(cause)) return closePreparation.pipe(Effect.andThen(Effect.failCause(cause)))
+      return closePreparation.pipe(
+        Effect.andThen(status.fail),
         Effect.andThen(
           Scope.close(applicationScope, Exit.failCause(cause)).pipe(
             Effect.catchCause((cleanupCause) =>

@@ -1,5 +1,6 @@
 import { Database } from "@opencode/core/database/database"
 import { V1Migration } from "@opencode/core/database/v1-migration"
+import type { DatabasePreparation } from "@opencode/core/database/preparation"
 import { App } from "@opencode/core/app"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Node } from "@opencode/util/effect/app-node"
@@ -82,6 +83,7 @@ export function createRoutes(
   options: ServerOptions = {},
   serviceURLs: () => ReadonlyArray<string> = () => [],
   overrides: LayerNode.Replacements = [],
+  observer?: DatabasePreparation.Observer,
 ) {
   return makeRoutes(
     options.password
@@ -90,6 +92,8 @@ export function createRoutes(
     options,
     serviceURLs,
     overrides,
+    undefined,
+    observer,
   )
 }
 
@@ -112,9 +116,10 @@ function makeRoutes<AuthError, AuthServices>(
   // Runtime-profile replacements (e.g. workerd) applied after the standard set, so later entries win.
   overrides: LayerNode.Replacements,
   instances?: InstanceNode,
+  observer?: DatabasePreparation.Observer,
 ) {
   const standard: LayerNode.Replacements = [
-    Database.node.replace(Database.configured(options.database)),
+    Database.node.replace(Database.configured(options.database, observer)),
     PersistentPty.node.replace(PersistentPty.configured(options.pty)),
     Bus.node.replace(Bus.configured({ persist: options.events?.persist })),
     App.node.replace(App.configured(options.app)),
@@ -187,7 +192,7 @@ function makeRoutes<AuthError, AuthServices>(
         Layer.provideMerge(services),
         Layer.provideMerge(HttpRouter.layer),
       )
-      return Layer.merge(api, V1Migration.layer.pipe(Layer.provide(services)))
+      return Layer.merge(api, V1Migration.configured(observer).pipe(Layer.provide(services)))
     }),
   )
 }

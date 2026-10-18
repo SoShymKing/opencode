@@ -91,6 +91,8 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       const instanceID = randomUUID()
       const transform = yield* WebUi.handler()
       const remote = { urls: [] as ReadonlyArray<string> }
+      const context = yield* Effect.context<never>()
+      let onDatabasePreparation = async (_active: boolean): Promise<void> => {}
       const launch = start(
         {
           app: {
@@ -139,16 +141,19 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
         serviceOptions === undefined
           ? undefined
           : {
+              onDatabasePreparation: (active) => onDatabasePreparation(active),
               onListen: (address, shutdown) =>
                 Effect.gen(function* () {
                   if (!config.password) yield* ServiceConfig.password(password)
-                  return yield* ServiceRegistration.register({
+                  const owner = yield* ServiceRegistration.acquire({
                     address,
                     password,
                     id: instanceID,
                     file: serviceOptions.file,
                     shutdown,
                   })
+                  onDatabasePreparation = (active) => Effect.runPromiseWith(context)(owner.setPreparation(active).pipe(Effect.orDie))
+                  return owner.cleanup
                 }),
             },
         transform,
@@ -199,12 +204,11 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
       const url = HttpServer.formatAddress(server.address)
       console.log(options.mode === "stdio" ? JSON.stringify({ url }) : `server listening on ${url}`)
       if (foreground && !environmentPassword) console.log(`server password ${password}`)
-      return yield* options.mode === "service"
-        ? server.shutdown
-        : options.mode === "stdio"
-          ? waitForStdinClose()
-          : Effect.never
-    }).pipe(Effect.annotateLogs({ role: "server" })),
+      return yield* options.mode === "service" ? server.shutdown : Effect.never
+    }).pipe(
+      (effect) => options.mode === "stdio" ? Effect.raceFirst(waitForStdinClose(), effect) : effect,
+      Effect.annotateLogs({ role: "server" }),
+    ),
   )
 })
 

@@ -1,11 +1,29 @@
 import { expect, test } from "bun:test"
-import fs from "node:fs/promises"
-import os from "node:os"
 import path from "node:path"
 import { isolatedEnv } from "./fixture/environment"
+import { tmpdir } from "../../core/test/fixture/tmpdir"
+
+test("stdio EOF before launch does not acquire the database", async () => {
+  await using directory = await tmpdir("opencode-cli-early-eof-")
+  const root = directory.path
+  const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "../src/index.ts"), "serve", "--stdio", "--port", "0"], {
+    env: isolatedEnv(root), stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  })
+  const stderr = new Response(child.stderr).text()
+  try {
+    child.stdin.end()
+    expect(await child.exited).toBe(0)
+    expect(await stderr).toBe("")
+    expect(await Bun.file(path.join(root, "opencode.db")).exists()).toBe(false)
+  } finally {
+    child.kill()
+    await child.exited
+  }
+})
 
 test("standalone server exits when its owner is killed", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-cli-standalone-"))
+  await using directory = await tmpdir("opencode-cli-standalone-")
+  const root = directory.path
   const owner = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixture/standalone-owner.ts")], {
     cwd: path.join(import.meta.dir, ".."),
     env: isolatedEnv(root, { OPENCODE_SERVER_USERNAME: "custom" }),
@@ -34,7 +52,6 @@ test("standalone server exits when its owner is killed", async () => {
     owner.kill("SIGKILL")
     await owner.exited
     if (running(pid)) process.kill(pid, "SIGKILL")
-    await fs.rm(root, { recursive: true, force: true })
   }
 })
 
