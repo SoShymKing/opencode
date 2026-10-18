@@ -4,6 +4,7 @@ import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { Database } from "@opencode/core/database/database"
 import { DatabaseMigration } from "@opencode/core/database/migration"
 import { V1Migration } from "@opencode/core/database/v1-migration"
+import { V1MigrationRows } from "@opencode/core/database/v1-migration-rows"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionTable } from "@opencode/core/session/sql"
@@ -128,6 +129,35 @@ const transform = (messages: V1Migration.SourceMessage[], parts: V1Migration.Sou
 }
 
 describe("V1Migration.transformSession", () => {
+  test("parses plain encoded values with SQL identities and preserves negative zero", () => {
+    const source = user("msg_sql", { id: "msg_json", sessionID: "ses_json", format: { type: "text" } })
+    const parsed = V1MigrationRows.parseMessage(source)
+    expect(parsed.row).not.toHaveProperty("data")
+    expect(parsed.value).toMatchObject({ id: "msg_sql", sessionID: "ses_test", format: { type: "text" } })
+    if (parsed.value?.role !== "user") throw new Error("Expected user")
+    expect(Object.getPrototypeOf(parsed.value.format)).toBe(Object.prototype)
+    const parsedPart = V1MigrationRows.parsePart(part("prt_sql", source.id,
+      '{"type":"text","text":"value","metadata":{"zero":-0},"id":"prt_json","messageID":"msg_json"}'))
+    expect(parsedPart.row).not.toHaveProperty("data")
+    expect(parsedPart.value).toMatchObject({ id: "prt_sql", messageID: source.id, sessionID: "ses_test" })
+    if (parsedPart.value?.type !== "text") throw new Error("Expected text")
+    expect(Object.is(parsedPart.value.metadata?.zero, -0)).toBe(true)
+  })
+
+  test("uses the first valid summary even when failed or already encountered", () => {
+    const compact = user("msg_compact", {}, 30)
+    const failed = assistant("msg_failed", compact.id, {
+      summary: true, error: { name: "UnknownError", data: { message: "failed" } },
+    }, 10)
+    const successful = assistant("msg_successful", compact.id, { summary: true }, 40)
+    const result = transform([successful, compact, failed], [
+      part("prt_compact", compact.id, { type: "compaction", auto: true }),
+      part("prt_summary", successful.id, { type: "text", text: "summary" }),
+    ])
+    expect(result.messages.map((message) => message.id)).toEqual([failed.id, successful.id])
+    expect(result.session.cost).toBe(2)
+  })
+
   test("maps ordinary user text, agents, ignored fields, order, and timestamps", () => {
     const message = user("msg_000000000001aaaaaaaaaaaaaa", {
       system: "discard",
@@ -886,6 +916,74 @@ describe("V1Migration database workflow", () => {
         return yield* effect.pipe(Effect.provideService(Database.Service, { db }))
       }),
     )
+
+  test("prepares one session across worker waves with ordered compaction, subtasks, synthetic IDs and warnings", async () => {
+    const messages = Array.from({ length: 270 }, (_, index) => user(`msg_${String(index).padStart(4, "0")}`, {}, Math.floor(index / 2)))
+    const compact = user("msg_0270", {}, 140)
+    const summary = assistant("msg_0271", compact.id, { summary: true }, 141)
+    const subtask = user("msg_0272", {}, 142)
+    const child = assistant("msg_0273", subtask.id, {}, 143)
+    const invalid = { ...user("msg_0274"), data: "{" }
+    const failedCompact = user("msg_0275", {}, 144)
+    messages[1] = assistant("msg_0001", failedCompact.id, {
+      summary: true, error: { name: "UnknownError", data: { message: "failed" } },
+    }, 0)
+    const laterSummary = assistant("msg_0276", failedCompact.id, { summary: true }, 145)
+    messages.push(compact, summary, subtask, child, invalid, failedCompact, laterSummary)
+    messages.push({ ...user("msg_0277", {}, -1), data: "{" })
+    const parts = messages.slice(0, 270).map((message, index) => part(`prt_${String(index).padStart(4, "0")}`, message.id,
+      { type: "text", text: `text ${index}` }))
+    parts.push(
+      part("prt_0270", messages[0].id, { type: "text", text: "synthetic", synthetic: true }),
+      part("prt_0271", compact.id, { type: "compaction", auto: true, tail_start_id: messages[127].id }),
+      part("prt_0272", summary.id, { type: "text", text: "summary" }),
+      part("prt_0273", subtask.id, { type: "subtask", prompt: "work", description: "work", agent: "build" }),
+      part("prt_0274", child.id, { type: "tool", callID: "call_task", tool: "task", state: { status: "pending", input: {}, raw: "" } }),
+      part("prt_0275", invalid.id, { type: "text", text: "invalid parent" }),
+      part("prt_0276", invalid.id, { type: "unknown" }),
+      part("prt_0277", "msg_missing", { type: ["unknown", "orphan"] }),
+      part("prt_0278", "msg_missing", "{"),
+      part("prt_0279", failedCompact.id, { type: "compaction", auto: true }),
+      part("prt_0280", laterSummary.id, { type: "text", text: "later summary" }),
+    )
+    const expected = transform(messages, parts)
+    await database(Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      yield* db.run("CREATE INDEX message_session_time_created_id_idx ON message(session_id, time_created, id)")
+      yield* db.run("CREATE INDEX part_session_idx ON part(session_id)")
+      for (const message of messages.toReversed()) yield* db.run(sql`
+        INSERT INTO message VALUES (${message.id}, ${message.session_id}, ${message.time_created}, ${message.time_updated}, ${message.data})`)
+      for (const item of parts.toReversed()) yield* db.run(sql`
+        INSERT INTO part VALUES (${item.id}, ${item.message_id}, ${item.session_id}, ${item.time_created}, ${item.time_updated}, ${item.data})`)
+      const queries: Parameters<typeof db.all>[0][] = []
+      const reader = { get: db.get.bind(db), all: <T>(query: Parameters<typeof db.all>[0]) => {
+        const result = db.all<T>(query)
+        queries.push(query)
+        return result
+      } }
+      const actual = yield* V1Migration.prepareSession(reader, session())
+      expect(queries.length).toBeGreaterThan(4)
+      for (const query of queries) {
+        const plan = yield* db.all<{ detail: string }>(sql`EXPLAIN QUERY PLAN ${typeof query === "string" ? sql.raw(query) : query}`)
+        const details = plan.map((row) => row.detail).join("\n")
+        expect(details).not.toContain("TEMP B-TREE")
+        const text = db.all(query).getQuery().sql
+        if (text.includes("AS bytes")) {
+          expect(details).toContain(text.includes('"time_created"') ? "message_session_time_created_id_idx" : "part_session_idx")
+          if (text.includes(" > ")) expect(details).toContain(text.includes('"time_created"') ? "(time_created,id)>(?,?)" : "rowid>?")
+        }
+      }
+      expect(actual).toEqual({ ...expected, sourceMessageIDs: new Set(messages.map((message) => message.id)) })
+      expect(actual.warnings.map((warning) => [warning.reason, warning.observedType])).toEqual([
+        ["invalid-message", undefined], ["invalid-message", undefined], ["invalid-part", "unknown"], ["orphan-part", "unknown,orphan"], ["orphan-part", undefined],
+      ])
+      expect(actual.messages.find((message) => message.id === compact.id)?.data.recent).toContain("text 127")
+      expect(actual.messages.some((message) => message.id === subtask.id || message.id === child.id)).toBe(false)
+      expect(actual.messages.some((message) => message.id === failedCompact.id)).toBe(false)
+      expect(actual.messages.some((message) => message.id === laterSummary.id)).toBe(true)
+      expect(actual.session.cost).toBe(4)
+    }))
+  })
 
   test("reports required and completed status and completes an empty database idempotently", async () => {
     await database(

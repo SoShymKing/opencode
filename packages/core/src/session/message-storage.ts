@@ -6,14 +6,14 @@ import { SessionMessage } from "./message.js"
 import { SessionSchema } from "./schema.js"
 import { SessionMessagePartTable, SessionMessageTable } from "./sql.js"
 
-type EnvelopeRow = {
+export type EnvelopeRow = {
   readonly sessionID: SessionSchema.ID
   readonly messageID: SessionMessage.ID
   readonly type: SessionMessage.Type
   readonly dataText: string
 }
 
-type ChildRow = {
+export type ChildRow = {
   readonly sessionID: SessionSchema.ID
   readonly messageID: SessionMessage.ID
   readonly position: number
@@ -92,6 +92,19 @@ export const decodeChild = Effect.fn("MessageStorage.decodeChild")(function* (ro
   )
 })
 
+export const decodeStoredMessage = Effect.fn("MessageStorage.decodeStoredMessage")(function* (
+  parent: EnvelopeRow, children: readonly Omit<ChildRow, "sessionID">[],
+) {
+  const envelope = yield* decodeEnvelope(parent)
+  if (envelope.type !== "assistant") {
+    if (children.length > 0) return yield* failure(parent)
+    return envelope
+  }
+  const content = yield* Effect.forEach(children, (child) => decodeChild({ ...child, sessionID: parent.sessionID }))
+  const encoded = yield* encodeMessage({ ...envelope, content }).pipe(Effect.mapError(() => failure(parent)))
+  return yield* decodeMessage(encoded).pipe(Effect.mapError(() => failure(parent)))
+})
+
 export const hydrateSelection = Effect.fn("MessageStorage.hydrateSelection")(function* (input: HydrateInput) {
   const order = input.order === "desc" ? desc(SessionMessageTable.seq) : asc(SessionMessageTable.seq)
   const raw = yield* input.db
@@ -137,15 +150,7 @@ export const hydrateSelection = Effect.fn("MessageStorage.hydrateSelection")(fun
   const childrenByMessage = Map.groupBy(raw.children, (child) => child.messageID)
   return yield* Effect.forEach(raw.parents, (parent) =>
     Effect.gen(function* () {
-      const envelope = yield* decodeEnvelope(parent)
-      const children = childrenByMessage.get(parent.messageID) ?? []
-      if (envelope.type !== "assistant") {
-        if (children.length > 0) return yield* failure(parent)
-        return { sessionID: parent.sessionID, seq: parent.seq, message: envelope }
-      }
-      const content = yield* Effect.forEach(children, (child) => decodeChild({ ...child, sessionID: parent.sessionID }))
-      const encoded = yield* encodeMessage({ ...envelope, content }).pipe(Effect.mapError(() => failure(parent)))
-      const message = yield* decodeMessage(encoded).pipe(Effect.mapError(() => failure(parent)))
+      const message = yield* decodeStoredMessage(parent, childrenByMessage.get(parent.messageID) ?? [])
       return { sessionID: parent.sessionID, seq: parent.seq, message }
     }),
   )

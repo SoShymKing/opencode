@@ -1,6 +1,6 @@
 export * as V1Migration from "./v1-migration.js"
 
-import { Cause, Effect, Layer, Option, Schema, Semaphore } from "effect"
+import { Cause, Effect, Layer, Semaphore } from "effect"
 import { Database } from "./database.js"
 import { SessionMessageTable, SessionTable } from "../session/sql.js"
 import { SessionV1 } from "@opencode/schema/session-v1"
@@ -18,23 +18,14 @@ import { DatabaseMigration } from "./migration.js"
 import { normalizeMessages } from "./native-message-parts.js"
 import { WsNativeProfile } from "./ws-native-profile.js"
 import { DatabasePreparation } from "./preparation.js"
-
-export type SourceMessage = {
-  readonly id: string
-  readonly session_id: string
-  readonly time_created: number
-  readonly time_updated: number
-  readonly data: string
-}
-
-export type SourcePart = {
-  readonly id: string
-  readonly message_id: string
-  readonly session_id: string
-  readonly time_created: number
-  readonly time_updated: number
-  readonly data: string
-}
+import { V1MigrationRows } from "./v1-migration-rows.js"
+import { open } from "#ws-native-worker"
+import { WsNativeScan } from "./ws-native-scan.js"
+import type { EffectDrizzleSqlite } from "./drizzle.js"
+import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
+import type { WsNativeMessage } from "./ws-native-message.js"
+import type { SourceMessage, SourcePart } from "./v1-migration-rows.js"
+export type { SourceMessage, SourcePart } from "./v1-migration-rows.js"
 
 export type TransformInput = {
   readonly session: typeof SessionTable.$inferSelect
@@ -218,32 +209,78 @@ type NextMessage = {
 const lock = Semaphore.makeUnsafe(1)
 const MIGRATION_STATE_KEY = "migration.v1-v2"
 const EVENT_DELETE_BATCH_SIZE = 1_000
-const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
-const decodeMessage = Schema.decodeUnknownOption(SessionV1.Info)
-const decodePart = Schema.decodeUnknownOption(SessionV1.Part)
 let runtimeState: RuntimeState = { status: "idle" }
 
 export function transformSession(input: TransformInput): TransformResult {
+  return projectSession({
+    session: input.session,
+    messages: input.messages.map(V1MigrationRows.parseMessage),
+    parts: input.parts.map(V1MigrationRows.parsePart),
+    sourceMessageIDs: new Set(input.messages.map((row) => row.id)),
+  })
+}
+
+export function prepareSession(
+  db: Pick<EffectDrizzleSqlite.EffectSQLiteDatabase, "all" | "get">,
+  session: TransformInput["session"],
+  tables = { message: "message", part: "part" },
+): Effect.Effect<TransformResult & { sourceMessageIDs: ReadonlySet<string> }, EffectDrizzleQueryError | WsNativeMessage.WsNativeMessageError> {
+  return Effect.scoped(Effect.gen(function* () {
+    const converter = yield* open
+    const messages: V1MigrationRows.ParsedMessage[] = []
+    const parts: V1MigrationRows.ParsedPart[] = []
+    const sourceMessageIDs = new Set<string>()
+    yield* WsNativeScan.rows(db, {
+      table: tables.message,
+      key: { first: "time_created", then: "id" },
+      bytes: sql`octet_length(m.data)`,
+      where: sql`m.session_id = ${session.id}`,
+    }, (rows: readonly SourceMessage[]) => Effect.gen(function* () {
+      for (const row of rows) sourceMessageIDs.add(row.id)
+      const results = yield* converter.run(rows.map((row) => ({ kind: "legacy-message" as const, mode: "prepare" as const, row })))
+      for (const result of results) {
+        if (result.kind !== "legacy-message" || result.mode !== "prepare")
+          return yield* Effect.die(new Error("Unexpected legacy message preparation result"))
+        messages.push(result.parsed)
+      }
+    }))
+    yield* WsNativeScan.rows(db, {
+      table: tables.part,
+      key: "rowid",
+      bytes: sql`octet_length(m.data)`,
+      where: sql`m.session_id = ${session.id}`,
+    }, (rows: readonly SourcePart[]) => Effect.gen(function* () {
+      const results = yield* converter.run(rows.map((row) => ({ kind: "legacy-part" as const, mode: "prepare" as const, row })))
+      for (const result of results) {
+        if (result.kind !== "legacy-part" || result.mode !== "prepare")
+          return yield* Effect.die(new Error("Unexpected legacy part preparation result"))
+        parts.push(result.parsed)
+      }
+    }))
+    messages.sort((left, right) => left.row.id < right.row.id ? -1 : left.row.id > right.row.id ? 1 : 0)
+    parts.sort((left, right) => left.row.id < right.row.id ? -1 : left.row.id > right.row.id ? 1 : 0)
+    return { ...projectSession({ session, messages, parts, sourceMessageIDs }), sourceMessageIDs }
+  }))
+}
+
+function projectSession(input: {
+  readonly session: TransformInput["session"]
+  readonly messages: readonly V1MigrationRows.ParsedMessage[]
+  readonly parts: readonly V1MigrationRows.ParsedPart[]
+  readonly sourceMessageIDs: ReadonlySet<string>
+}): TransformResult {
   const warnings: Warning[] = []
   const messages = input.messages
-    .map((row) => {
-      const value = Option.getOrUndefined(decodeJson(row.data))
-      const decoded =
-        value && typeof value === "object"
-          ? Option.getOrUndefined(decodeMessage({ ...value, id: row.id, sessionID: row.session_id }))
-          : undefined
+    .map(({ row, value: decoded }) => {
       if (decoded) return { row, value: decoded }
       warnings.push({ reason: "invalid-message", sessionID: input.session.id, messageID: row.id })
       return undefined
     })
     .filter((item): item is NonNullable<typeof item> => item !== undefined)
     .sort((a, b) => a.row.time_created - b.row.time_created || a.row.id.localeCompare(b.row.id))
-  const messageIDs = new Set(input.messages.map((row) => row.id))
   const parts = input.parts
-    .map((row) => {
-      const value = Option.getOrUndefined(decodeJson(row.data))
-      const observedType = value && typeof value === "object" && "type" in value ? String(value.type) : undefined
-      if (!messageIDs.has(row.message_id)) {
+    .map(({ row, value: decoded, observedType }) => {
+      if (!input.sourceMessageIDs.has(row.message_id)) {
         warnings.push({
           reason: "orphan-part",
           sessionID: input.session.id,
@@ -253,12 +290,6 @@ export function transformSession(input: TransformInput): TransformResult {
         })
         return undefined
       }
-      const decoded =
-        value && typeof value === "object"
-          ? Option.getOrUndefined(
-              decodePart({ ...value, id: row.id, messageID: row.message_id, sessionID: row.session_id }),
-            )
-          : undefined
       if (decoded) return { row, value: decoded }
       warnings.push({
         reason: "invalid-part",
@@ -272,6 +303,15 @@ export function transformSession(input: TransformInput): TransformResult {
     .filter((item): item is NonNullable<typeof item> => item !== undefined)
     .sort((a, b) => a.row.id.localeCompare(b.row.id))
   const byMessage = Map.groupBy(parts, (item) => item.row.message_id)
+  const byID = new Map<string, (typeof messages)[number]>()
+  const indices = new Map<string, number>()
+  const summaries = new Map<string, (typeof messages)[number] & { value: typeof SessionV1.Assistant.Encoded }>()
+  for (const [index, item] of messages.entries()) {
+    if (!byID.has(item.row.id)) byID.set(item.row.id, item)
+    if (!indices.has(item.row.id)) indices.set(item.row.id, index)
+    if (item.value.role === "assistant" && item.value.summary === true && !summaries.has(item.value.parentID))
+      summaries.set(item.value.parentID, { row: item.row, value: item.value })
+  }
   const paired = new Set<string>()
   const used = new Set(messages.map((item) => item.row.id))
   const projected = messages
@@ -279,27 +319,22 @@ export function transformSession(input: TransformInput): TransformResult {
       if (paired.has(item.row.id)) return []
       const owned = byMessage.get(item.row.id)?.map((part) => part.value) ?? []
       if (item.value.role === "user") {
-        const compaction = owned.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+        const compaction = owned.find((part) => part.type === "compaction")
         if (compaction) {
-          const pairedSummary = messages.find(
-            (candidate): candidate is (typeof messages)[number] & { value: SessionV1.Assistant } =>
-              candidate.value.role === "assistant" &&
-              candidate.value.parentID === item.row.id &&
-              candidate.value.summary === true,
-          )
+          const pairedSummary = summaries.get(item.row.id)
           if (!pairedSummary) return []
           paired.add(pairedSummary.row.id)
           if (pairedSummary.value.error || pairedSummary.value.time.completed === undefined) return []
           const summary = pairedSummary
           const summaryText = (byMessage.get(summary.row.id) ?? [])
             .map((part) => part.value)
-            .filter((part): part is SessionV1.TextPart => part.type === "text" && part.text.length > 0)
+            .filter((part): part is typeof SessionV1.TextPart.Encoded => part.type === "text" && part.text.length > 0)
             .map((part) => part.text)
             .join("\n\n")
           const tailIndex = compaction.tail_start_id
-            ? messages.findIndex((candidate) => candidate.row.id === compaction.tail_start_id)
+            ? (indices.get(compaction.tail_start_id) ?? -1)
             : -1
-          const compactionIndex = messages.findIndex((candidate) => candidate.row.id === item.row.id)
+          const compactionIndex = indices.get(item.row.id) ?? -1
           const tail = tailIndex < 0 ? [] : messages.slice(tailIndex, compactionIndex)
           return [
             row(
@@ -317,9 +352,9 @@ export function transformSession(input: TransformInput): TransformResult {
           ]
         }
         const subtasks = owned.filter((part) => part.type === "subtask")
-        const visible = owned.filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
-        const files = owned.filter((part): part is SessionV1.FilePart => part.type === "file")
-        const agents = owned.filter((part): part is SessionV1.AgentPart => part.type === "agent")
+        const visible = owned.filter((part): part is typeof SessionV1.TextPart.Encoded => part.type === "text" && !part.ignored)
+        const files = owned.filter((part) => part.type === "file")
+        const agents = owned.filter((part) => part.type === "agent")
         if (subtasks.length > 0 && visible.length === 0 && files.length === 0 && agents.length === 0) return []
         const ordinary = visible.filter((part) => !part.synthetic)
         const synthetic = visible.filter((part) => part.synthetic)
@@ -374,7 +409,7 @@ export function transformSession(input: TransformInput): TransformResult {
       }
       if (item.value.role !== "assistant") return []
       const assistant = item.value
-      const parent = messages.find((candidate) => candidate.row.id === assistant.parentID)
+      const parent = byID.get(assistant.parentID)
       const parentParts = parent ? (byMessage.get(parent.row.id)?.map((part) => part.value) ?? []) : []
       if (
         parentParts.some((part) => part.type === "subtask") &&
@@ -460,7 +495,7 @@ export function transformSession(input: TransformInput): TransformResult {
         ]
   const assistants = messages
     .map((item) => item.value)
-    .filter((item): item is SessionV1.Assistant => item.role === "assistant")
+    .filter((item) => item.role === "assistant")
   const latestUser = messages.findLast((item) => {
     if (item.value.role !== "user") return false
     const owned = byMessage.get(item.row.id) ?? []
@@ -654,13 +689,7 @@ function runPrepared(options: Options, begin: Effect.Effect<void>): Effect.Effec
                 .where(eq(SessionTable.id, SessionSchema.ID.make(nextID.id)))
                 .get()
               if (!next) return yield* Effect.die(new Error(`Failed to copy V1 session ${nextID.id}`))
-              const sourceMessages = yield* tx.all<SourceMessage>(
-                sql`SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ${next.id}`,
-              )
-              const sourceParts = yield* tx.all<SourcePart>(
-                sql`SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ${next.id}`,
-              )
-              const transformed = transformSession({ session: next, messages: sourceMessages, parts: sourceParts })
+              const transformed = yield* prepareSession(tx, next)
               yield* Effect.forEach(transformed.warnings, (warning) =>
                 Effect.logWarning("Skipped V1 migration row", warning),
               )
@@ -773,10 +802,11 @@ function importNextDatabase(
         }),
       )
       const projects = new Map(
-        selectNextRows<NextProject>(source, "project", NEXT_PROJECT_COLUMNS).map((project) => [project.id, project]),
+        Array.from(selectNextRows<NextProject>(source, "project", NEXT_PROJECT_COLUMNS), (project) => [project.id, project]),
       )
       const sessions = selectNextRows<NextSession>(source, "session", NEXT_SESSION_COLUMNS)
-      for (const [index, session] of sessions.entries()) {
+      let completed = 0
+      for (const session of sessions) {
         const project = projects.get(session.project_id)
         const projectID = project ? session.project_id : Project.ID.global
         if (!project) {
@@ -785,12 +815,6 @@ function importNextDatabase(
             projectID: session.project_id,
           })
         }
-        const messages = source
-          .query<
-            NextMessage,
-            [string]
-          >("SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq")
-          .all(session.id)
         yield* db
           .transaction((tx) =>
             Effect.gen(function* () {
@@ -830,8 +854,11 @@ function importNextDatabase(
                   ${session.time_archived}, ${session.time_suspended}
                 )
               `)
-              yield* Effect.forEach(messages, (message) =>
-                tx
+              let watermark = -1
+              for (const message of source.query<NextMessage, [string]>(
+                "SELECT id, session_id, type, seq, time_created, time_updated, data FROM session_message WHERE session_id = ? ORDER BY seq",
+              ).iterate(session.id)) {
+                yield* tx
                   .insert(SessionMessageTable)
                   .values({
                     id: SessionMessage.ID.make(message.id),
@@ -842,21 +869,22 @@ function importNextDatabase(
                     time_updated: message.time_updated,
                     data: sql`${message.data}`,
                   })
-                  .run(),
-              )
+                  .run()
+                watermark = message.seq
+              }
               yield* normalizeMessages(tx, session.id)
               yield* tx
                 .insert(EventSequenceTable)
-                .values({ aggregate_id: session.id, seq: messages.at(-1)?.seq ?? -1 })
+                .values({ aggregate_id: session.id, seq: watermark })
                 .onConflictDoUpdate({
                   target: EventSequenceTable.aggregate_id,
-                  set: { seq: messages.at(-1)?.seq ?? -1, owner_id: null },
+                  set: { seq: watermark, owner_id: null },
                 })
                 .run()
             }),
           )
           .pipe(Effect.orDie)
-        onProgress(index + 1)
+        onProgress(++completed)
         yield* Effect.yieldNow
       }
       source.run("COMMIT")
@@ -900,11 +928,11 @@ function selectNextRows<A>(source: SQLiteDatabase, table: "project" | "session",
   })
   return source
     .query<A, []>(`SELECT ${projection.join(", ")} FROM "${table}"${table === "session" ? ' ORDER BY "id" DESC' : ""}`)
-    .all()
+    .iterate()
 }
 
 function row(
-  source: SourceMessage,
+  source: Omit<SourceMessage, "data">,
   message: {
     readonly id: string
     readonly type: SessionMessage.Type
@@ -976,7 +1004,7 @@ function legacyToolNotice(messages: ReadonlyArray<TransformResult["messages"][nu
   return ["The available tools have changed.", ...parts].join("\n\n")
 }
 
-function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
+function migrateTool(part: typeof SessionV1.ToolPart.Encoded, fallback: number) {
   const base = {
     type: "tool" as const,
     id: part.callID,
@@ -1031,7 +1059,7 @@ function migrateTool(part: typeof SessionV1.ToolPart.Type, fallback: number) {
   }
 }
 
-function migrateError(error: NonNullable<(typeof SessionV1.Assistant.Type)["error"]>) {
+function migrateError(error: NonNullable<(typeof SessionV1.Assistant.Encoded)["error"]>) {
   const message =
     "message" in error.data
       ? error.data.message
@@ -1064,7 +1092,7 @@ function normalizeFinish(finish: string | undefined) {
   )
 }
 
-function migrateFile(part: SessionV1.FilePart) {
+function migrateFile(part: typeof SessionV1.FilePart.Encoded) {
   if (!part.url.startsWith("data:")) return []
   const comma = part.url.indexOf(",")
   if (comma < 0) return []
@@ -1087,7 +1115,7 @@ function migrateFile(part: SessionV1.FilePart) {
   ]
 }
 
-function unavailableFile(part: SessionV1.FilePart) {
+function unavailableFile(part: typeof SessionV1.FilePart.Encoded) {
   const label = part.filename ?? (part.source?.type === "resource" ? part.source.uri : part.url)
   return `[Attachment unavailable after migration: ${label} (${part.mime})]`
 }
@@ -1111,8 +1139,8 @@ function syntheticID(source: string, used: Set<string>) {
 }
 
 function serializeRecent(
-  messages: ReadonlyArray<{ row: SourceMessage; value: typeof SessionV1.Info.Type }>,
-  parts: Map<string, Array<{ row: SourcePart; value: typeof SessionV1.Part.Type }>>,
+  messages: ReadonlyArray<{ row: Omit<SourceMessage, "data">; value: typeof SessionV1.Info.Encoded }>,
+  parts: Map<string, Array<{ row: Omit<SourcePart, "data">; value: typeof SessionV1.Part.Encoded }>>,
 ) {
   return messages
     .flatMap((message) => {
