@@ -6,11 +6,10 @@ import type { EffectDrizzleSqlite } from "./drizzle.js"
 import { DatabaseLineage } from "./lineage.js"
 import { DatabaseMigration } from "./migration.js"
 import { DatabaseWsArchive } from "./ws-archive.js"
-import { WsNativeMessage } from "./ws-native-message.js"
+import { WsNativeScan } from "./ws-native-scan.js"
 import { WsNativeWorkspace } from "./ws-native-workspace.js"
 import { WsNativeSource } from "./ws-native-source.js"
 import { WsNativePrevious } from "./ws-native-previous.js"
-import { WsNativeJson } from "./ws-native-json.js"
 import { Instructions } from "../instructions/index.js"
 import { SessionTable } from "../session/sql.js"
 import { SessionMessage } from "../session/message.js"
@@ -92,7 +91,8 @@ export function validateSource(db: Reader) {
     if (yield* db.get(sql`SELECT 1 FROM session s LEFT JOIN workspace w ON w.id = s.workspace_id WHERE s.workspace_id IS NOT NULL AND w.id IS NULL LIMIT 1`))
       return yield* fail("Missing session workspace")
     yield* watermark(db, "session", "session_message", "event")
-    yield* messages(db, "session_message", !state.previousNative && state.tables.has("session_message_part") ? "session_message_part" : undefined, state.previousNative)
+    yield* WsNativeScan.consume(db, { parent: "session_message", child: !state.previousNative && state.tables.has("session_message_part") ? "session_message_part" : undefined,
+      previousNative: state.previousNative }, () => Effect.void)
     yield* WsNativeSource.read(db, undefined, state.previousNative)
     if (state.previousNative) yield* WsNativePrevious.read(db)
     return state
@@ -182,18 +182,14 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
       yield* db.run(sql`UPDATE session_v2 SET permission = ${JSON.stringify(permission.rules)} WHERE id = ${permission.id}`)
     const parent = DatabaseWsArchive.sourceTable(archive, "session_message")
     if (!parent) return yield* fail("Archive is missing session_message")
-    for (const item of yield* messages(db, parent, previousNative ? undefined : DatabaseWsArchive.sourceTable(archive, "session_message_part"), previousNative)) {
-      if (!owns(item.row.session_id)) continue
-      const stored = yield* encodeStoredMessage(item.converted.message)
+    yield* WsNativeScan.consume(db, { parent, child: previousNative ? undefined : DatabaseWsArchive.sourceTable(archive, "session_message_part"),
+      previousNative, store: owns }, (row, stored) => Effect.gen(function* () {
+      if (!stored) return
       yield* db.run(sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
-        VALUES (${item.row.id}, ${item.row.session_id}, ${stored.envelope.type}, ${item.row.seq}, ${item.row.time_created}, ${item.row.time_updated}, ${WsNativeJson.preserve(item.row.data, stored.envelope.data)})`)
-      yield* insertMessageChildren(db, stored.parts)
-      for (const part of stored.parts) {
-        const original = item.sourceParts[part.position]
-        if (original === undefined) continue
-        yield* db.run(sql`UPDATE session_message_part SET data = ${WsNativeJson.preserve(original, part.data)} WHERE message_id = ${part.message_id} AND position = ${part.position}`)
-      }
-    }
+        VALUES (${row.id}, ${row.session_id}, ${stored.type}, ${row.seq}, ${row.time_created}, ${row.time_updated}, ${stored.data})`)
+      for (const part of stored.parts) yield* db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data)
+        VALUES (${row.id}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`)
+    }))
     const legacyMessages = DatabaseWsArchive.sourceTable(archive, "message")
     const legacyParts = DatabaseWsArchive.sourceTable(archive, "part")
     if (!legacyMessages || !legacyParts) return yield* fail("Archive is missing legacy message or part tables")
@@ -276,20 +272,5 @@ function watermark(db: Reader, sessions: string, parent: string, events: string)
       if (yield* db.get(sql`SELECT 1 FROM ${identifier(table)} m LEFT JOIN event_sequence e ON e.aggregate_id = m.${identifier(owner)} WHERE e.aggregate_id IS NULL OR m.seq > e.seq OR m.seq < 0 OR typeof(m.seq) != 'integer' LIMIT 1`))
         return yield* fail(`Invalid ${table} sequence watermark`)
     }
-  })
-}
-
-function messages(db: Reader, parent: string, child: string | undefined, previousNative = false) {
-  return Effect.gen(function* () {
-    const rows = yield* db.all<{ id: string; session_id: string; type: string; seq: number; time_created: number; time_updated: number; data: string }>(sql`SELECT * FROM ${identifier(parent)} ORDER BY session_id, seq`)
-    return yield* Effect.forEach(rows, (row) => Effect.gen(function* () {
-      const parts = child ? yield* db.all<{ position: number; id: string; type: string; data: string }>(sql`SELECT position, id, type, data FROM ${identifier(child)} WHERE message_id = ${row.id} ORDER BY position`) : undefined
-      const converted = previousNative ? { message: yield* WsNativePrevious.message(row) }
-        : yield* WsNativeMessage.convert({ id: row.id, sessionID: row.session_id, type: row.type, data: row.data, parts })
-      const sourceParts = parts?.map((part) => part.data) ?? (yield* Effect.try({
-        try: () => WsNativeJson.children(row.data), catch: (cause) => fail(`Invalid message JSON ${row.id}: ${String(cause)}`),
-      }))
-      return { row, converted, sourceParts }
-    }))
   })
 }
