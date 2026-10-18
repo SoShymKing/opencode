@@ -1,6 +1,7 @@
 export * as ConfigMigration from "./migrate"
 
 import { TuiConfigV1 } from "@opencode/tui/config/v1"
+import { Flock } from "@opencode/util/flock"
 import { TuiKeybind } from "@opencode/tui/config/v1/keybind"
 import { Definitions } from "@opencode/tui/config/keybind"
 import { Effect, FileSystem, Option, Schema } from "effect"
@@ -8,6 +9,9 @@ import { randomUUID } from "crypto"
 import { applyEdits, createScanner, modify, parse, parseTree, type Node, type ParseError } from "jsonc-parser"
 import path from "path"
 import { Info, SchemaURL } from "./schema"
+import { OPENCODE_CHANNEL } from "../version"
+import { SESSION_LIST_REQUEST_WINDOW_KEY, sessionListRequestWindow } from "../../../tui/src/util/session-list-window"
+import { writeJsonAtomic } from "../../../tui/src/util/persistence"
 
 const decodeV1 = Schema.decodeUnknownOption(TuiConfigV1.Info)
 const decodeInfo = Schema.decodeUnknownOption(Info)
@@ -114,6 +118,28 @@ export const run = Effect.fn("cli.config.migrate")(function* (input: {
       to: input.file,
     })
   return result
+})
+
+export const sessionList = Effect.fn("cli.config.migrate-session-list")(function* (state: string, info: Info) {
+  const legacy = yield* readJson(path.join(state, "kv.json"))
+  if (legacy === undefined || !Object.hasOwn(legacy, SESSION_LIST_REQUEST_WINDOW_KEY)) return
+  const channel = process.env.OPENCODE_TUI_CHANNEL ?? OPENCODE_CHANNEL
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(channel) || channel === "." || channel === "..")
+    return yield* Effect.fail(new TypeError(`Invalid storage segment: ${channel}`))
+  const file = path.join(state, channel, "tui", "session-list.json")
+  yield* Effect.scoped(
+    Effect.gen(function* () {
+      yield* Flock.effect(file, { dir: path.join(state, channel, "locks") })
+      const current = yield* readJson(file)
+      if (current !== undefined && Object.hasOwn(current, SESSION_LIST_REQUEST_WINDOW_KEY)) return
+      yield* Effect.promise(() =>
+        writeJsonAtomic(file, {
+          ...(current ?? { allProjects: info.tabs?.scope === "global" }),
+          [SESSION_LIST_REQUEST_WINDOW_KEY]: sessionListRequestWindow(legacy[SESSION_LIST_REQUEST_WINDOW_KEY]),
+        }),
+      )
+    }),
+  )
 })
 
 function findKeybindProperties(text: string, name: string) {

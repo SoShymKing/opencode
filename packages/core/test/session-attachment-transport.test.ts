@@ -8,6 +8,7 @@ import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
 import { SessionModelTransport } from "@opencode/core/session/model-transport"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { ToolOutput } from "@opencode/core/tool-output"
 import { Agent } from "@opencode/schema/agent"
 import { Session } from "@opencode/schema/session"
 import { SessionMessage } from "@opencode/schema/session-message"
@@ -91,5 +92,5 @@ testEffect(WebSocketConstructor.layer).live("attachment calls and quarantined re
     expect(state).toEqual({ connections: 3, http: 0 })
     expect(frames[3]).toHaveProperty("previous_response_id", "resp_3")
     expect(frames[4]).toHaveProperty("previous_response_id", "resp_4")
-  }).pipe(Effect.provide(Layer.mergeAll(transport, client, LayerNode.compile(LayerNode.group([App.node, PluginHooks.node])))))
+  }).pipe(Effect.provide(Layer.mergeAll(transport, client, LayerNode.compile(LayerNode.group([App.node, PluginHooks.node, ToolOutput.node])))))
 }))

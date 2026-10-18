@@ -183,6 +183,8 @@ const toolResult = (
         tool.executed === true && tool.recorded !== undefined && Object.hasOwn(tool.recorded, "result")
           ? tool.recorded.result
           : ToolOutput.toResultValue({ structured: tool.state.metadata, content }),
+      metadata: tool.executed !== true && tool.state.metadata?.truncated === true && typeof tool.state.metadata.outputPath === "string"
+        ? { outputPath: tool.state.metadata.outputPath } : undefined,
       providerExecuted: tool.executed,
       providerMetadata,
     })

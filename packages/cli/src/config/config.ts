@@ -62,7 +62,12 @@ export const layer = Layer.effect(
         ),
       )
     const load = Effect.fnUntraced(function* (migration?: Info) {
-      return merge(migration ?? Option.getOrUndefined(decode(yield* readJson())), content)
+      const info = merge(migration ?? Option.getOrUndefined(decode(yield* readJson())), content)
+      yield* ConfigMigration.sessionList(global.state, info).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.catchCause((cause) => Effect.logWarning("failed to migrate session-list preferences", { cause })),
+      )
+      return info
     })
 
     const get = Effect.fn("cli.config.get")(() =>

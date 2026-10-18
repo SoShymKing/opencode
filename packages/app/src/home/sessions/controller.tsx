@@ -148,6 +148,13 @@ export function createHomeSessionsController(home: HomeController) {
 
   command.register("home.palette", () => [
     {
+      id: "session.archived.list",
+      title: language.t("command.session.archived.list"),
+      category: language.t("command.category.session"),
+      disabled: !home.server.focusedContext(),
+      onSelect: () => showArchived(),
+    },
+    {
       id: "command.palette",
       title: language.t("command.palette"),
       hidden: true,
@@ -304,14 +311,17 @@ export function createHomeSessionsController(home: HomeController) {
 
     if (!conn || !ctx) return
     const selectedDirectories = projectDirectories()
+    const api = ctx.sdk.api.session
+    const projects = home.project.list()
     void dialog.show(() => (
       <ArchivedSessionsDialog
-        api={ctx.sdk.api.session}
+        api={api}
         directories={selectedDirectories}
+        resolveProject={(session) => homeProjectForSession(session, projects) ?? ctx.projects.forSession(session)}
         onRestore={(session) => {
           ctx.data.session.remember(session)
           void queryClient.invalidateQueries({ queryKey: ["home-sessions", conn], exact: true })
-          const directory = homeProjectForSession(session, home.project.list())?.worktree ?? session.location.directory
+          const directory = homeProjectForSession(session, projects)?.worktree ?? session.location.directory
           ctx.projects.open(directory)
           ctx.projects.touch(directory)
           const tab = tabs.addSessionTab({ server: ServerConnection.key(conn), sessionId: session.id })

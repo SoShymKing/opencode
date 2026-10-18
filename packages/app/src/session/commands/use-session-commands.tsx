@@ -7,7 +7,8 @@ import { useLanguage } from "@/runtime/i18n/language"
 import { useLayout } from "@/shell/state/layout"
 import { useComposerState } from "@/composer/persistence"
 import { useServerSDK } from "@/runtime/server/client"
-import { useData } from "@/runtime/server/current"
+import { useData, useServer } from "@/runtime/server/current"
+import { useTabs } from "@/shell/tabs/tabs"
 import { formatServerError } from "@/runtime/server/errors"
 import { projectSettingsKey, useSettings } from "@/settings/model"
 import { showToast } from "@/shell/notifications/toast"
@@ -18,6 +19,7 @@ import type { SessionRevert } from "@/session/revert"
 import { Command } from "@opencode/gui-extensions/sdk"
 import { useExtensionHost } from "@/runtime/extension/host"
 import type { Region } from "@/runtime/extension/panels"
+import { useSessionArchive } from "@/session/timeline/controller"
 
 type SessionCommandSource = {
   identity: SessionModel["identity"]
@@ -56,10 +58,13 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
   const prompt = useComposerState()
   const serverSDK = useServerSDK()
   const data = useData()
+  const server = useServer()
+  const tabs = useTabs()
   const settings = useSettings()
   const platform = usePlatform()
   const layout = useLayout()
   const host = useExtensionHost()
+  const archive = useSessionArchive()
 
   const openDialog = async <T,>(load: () => Promise<T>, show: (value: T) => void) => {
     const owner = actions.session.ownership.capture()
@@ -321,7 +326,45 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     )
   }
 
+  const showArchived = () => {
+    const api = serverSDK.api.session
+    const projects = server.ctx.projects
+    void openDialog(
+      () => import("@/home/sessions/archived-dialog"),
+      (x) => dialog.show(() => (
+        <x.ArchivedSessionsDialog
+          api={api}
+          resolveProject={projects.forSession}
+          onRestore={(session) => {
+            data.session.remember(session)
+            const directory = projects.forSession(session)?.worktree ?? session.location.directory
+            projects.open(directory)
+            projects.touch(directory)
+            const tab = tabs.addSessionTab({ server: server.key, sessionId: session.id })
+            tabs.select(tab)
+          }}
+        />
+      )),
+    )
+  }
+
   const sessionCmds = () => [
+    sessionCommand({
+      id: "session.archive",
+      title: language.t("common.archive"),
+      keybind: "mod+shift+backspace",
+      disabled: !actions.session.data.info() || !!actions.session.data.info()?.time.archived,
+      onSelect: () => {
+        const id = actions.session.identity.params.id
+
+        if (id) void archive(id)
+      },
+    }),
+    sessionCommand({
+      id: "session.archived.list",
+      title: language.t("command.session.archived.list"),
+      onSelect: showArchived,
+    }),
     sessionCommand({
       id: "session.new",
       title: language.t("command.session.new"),

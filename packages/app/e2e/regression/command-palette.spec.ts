@@ -1,7 +1,128 @@
 import { expect, test } from "@playwright/test"
 import { captureConsoleWarnings, openCommandPalette, paletteSession } from "../utils/command-palette"
+import { expectPath, holdRoute, REMOTE_SERVER, SERVER, sessionHref } from "../utils/app"
+import { mockRemoteServer, mockWorkspace, openSession } from "../utils/workspace"
 
 test.use({ serviceWorkers: "block", permissions: ["clipboard-read", "clipboard-write"] })
+
+for (const entry of ["palette", "shortcut", "override"] as const) {
+  test(`archive command uses the native flow from ${entry}`, async ({ page }) => {
+    const workspace = await openSession(page, {
+      name: "Archive commands",
+      sessions: [{ id: "ses_archive_command", title: "Archive command target" }],
+      seed: entry === "override" ? { settings: { keybinds: { "session.archive": "mod+shift+y" } } } : undefined,
+    })
+
+    const archive = await holdRoute(page, /\/api\/session\/[^/]+\/archive$/, { method: "POST" })
+
+    if (entry === "palette") {
+      await page.keyboard.press("ControlOrMeta+Shift+P")
+      const palette = page.getByRole("dialog")
+      await palette.getByRole("textbox").fill("archive")
+      await palette.getByRole("option", { name: /^Archive(?:\s|$)/ }).click()
+      await expect(palette).toHaveCount(0)
+    }
+
+    if (entry !== "palette") {
+      await page.keyboard.press(entry === "override" ? "ControlOrMeta+Shift+y" : "ControlOrMeta+Shift+Backspace")
+    }
+
+    expect((await archive.arrived).url()).toBe(`${SERVER}/api/session/ses_archive_command/archive`)
+    archive.release()
+    await expect(page.locator(`[data-titlebar-tab-link][href="${sessionHref(workspace.session.id)}"]`)).toHaveCount(0)
+    await expect(page).toHaveURL("/")
+    await expect(page.getByRole("button", { name: "Archived sessions", exact: true })).toBeEnabled()
+  })
+}
+
+for (const surface of ["home", "session"] as const) {
+  test(`archived-list command restores its captured server from ${surface}`, async ({ page }) => {
+    const workspace = await mockWorkspace(page, {
+      name: "Archive list",
+      sessions: [
+        { id: "ses_archive_live", title: "Local live session" },
+        {
+          id: "ses_archive_saved",
+          title: "Local archived target",
+          time: { created: 1700000000000, updated: 1700000000000, archived: 1700000000001 },
+        },
+      ],
+      seed: { tabs: ["ses_archive_live", { session: "ses_archive_remote", server: REMOTE_SERVER }] },
+    })
+
+    await mockRemoteServer(page, { sessions: [{ id: "ses_archive_remote", title: "Remote live session" }] })
+    const restores: string[] = []
+    const gets: string[] = []
+    page.on("request", (request) => {
+      const url = new URL(request.url())
+
+      if (url.pathname.endsWith("/restore")) restores.push(request.url())
+
+      if (url.pathname === "/api/session/ses_archive_saved") gets.push(request.url())
+    })
+    await page.goto(surface === "home" ? "/" : sessionHref("ses_archive_live"))
+
+    if (surface === "home") await expect(page.getByRole("button", { name: "Archived sessions", exact: true })).toBeEnabled()
+
+    if (surface === "session") await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
+
+    await page.keyboard.press("ControlOrMeta+Shift+P")
+    const palette = page.getByRole("dialog")
+    await palette.getByRole("textbox").fill("archived sessions")
+    await expect(palette.getByRole("option", { name: "Archived sessions", exact: true })).toHaveCount(1)
+
+    const listing = page.waitForRequest((request) => {
+      const url = new URL(request.url())
+
+      return url.pathname === "/api/session" && url.searchParams.get("archived") === "true"
+    })
+
+    await palette.getByRole("option", { name: "Archived sessions", exact: true }).click()
+    expect(new URL((await listing).url()).origin).toBe(SERVER)
+    const dialog = page.getByRole("dialog", { name: "Archived sessions", exact: true })
+    const restore = await holdRoute(page, /\/api\/session\/ses_archive_saved\/restore$/, { method: "POST" })
+    const target = dialog.getByRole("button", { name: /Local archived target/ })
+    await expect(target).toContainText(workspace.directory)
+    await target.click()
+    expect((await restore.arrived).url()).toBe(`${SERVER}/api/session/ses_archive_saved/restore`)
+    await dialog.getByRole("textbox").press("Escape")
+    await expect(dialog).toHaveCount(0)
+    await page.locator(`[data-titlebar-tab-link][href="${sessionHref("ses_archive_remote", REMOTE_SERVER)}"]`).click()
+    await expect(page.getByRole("heading", { name: "Remote live session", exact: true })).toBeVisible()
+    restore.release()
+    await expectPath(page, sessionHref("ses_archive_saved"))
+    await expect(page.getByRole("heading", { name: "Local archived target", exact: true })).toBeVisible()
+    expect(restores).toEqual([`${SERVER}/api/session/ses_archive_saved/restore`])
+    expect(gets).toContain(`${SERVER}/api/session/ses_archive_saved`)
+    expect(gets.every((url) => new URL(url).origin === SERVER)).toBe(true)
+  })
+}
+
+test("archive command keeps its captured target while another server becomes active", async ({ page }) => {
+  await mockWorkspace(page, {
+    name: "Archive switch",
+    sessions: [{ id: "ses_archive_source", title: "Archive source" }],
+    seed: { tabs: ["ses_archive_source", { session: "ses_archive_other", server: REMOTE_SERVER }] },
+  })
+  await mockRemoteServer(page, { sessions: [{ id: "ses_archive_other", title: "Other server target" }] })
+  const archives: string[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/archive")) archives.push(request.url())
+  })
+  await page.goto(sessionHref("ses_archive_source"))
+  await expect(page.locator('[data-component="composer-editor"]')).toBeEditable()
+  const archive = await holdRoute(page, /\/api\/session\/[^/]+\/archive$/, { method: "POST" })
+  await page.keyboard.press("ControlOrMeta+Shift+Backspace")
+  expect((await archive.arrived).url()).toBe(`${SERVER}/api/session/ses_archive_source/archive`)
+  const other = sessionHref("ses_archive_other", REMOTE_SERVER)
+  await page.locator(`[data-titlebar-tab-link][href="${other}"]`).click()
+  await expect(page.getByRole("heading", { name: "Other server target", exact: true })).toBeVisible()
+  archive.release()
+  await expect(page.locator(`[data-titlebar-tab-link][href="${sessionHref("ses_archive_source")}"]`)).toHaveCount(0)
+  await expectPath(page, other)
+  await expect(page.getByRole("heading", { name: "Other server target", exact: true })).toBeVisible()
+  expect(archives).toEqual([`${SERVER}/api/session/ses_archive_source/archive`])
+})
 
 test("copies the session ID while file and session searches are still pending", async ({ page }) => {
   const warnings = captureConsoleWarnings(page)
@@ -197,6 +318,9 @@ test("navigation replaces commands without retaining disposed owners", async ({ 
   await expect(dialog.getByRole("textbox")).toHaveAttribute("placeholder", "Search files, commands, and sessions")
   await dialog.getByRole("textbox").fill("copy session")
   await expect(dialog.getByRole("option", { name: "Copy Session ID", exact: true })).toHaveCount(0)
+  await dialog.getByRole("textbox").fill("archive")
+  await expect(dialog.getByRole("option", { name: /^Archive(?:\s|$)/ })).toHaveCount(0)
+  await expect(dialog.getByRole("option", { name: "Archived sessions", exact: true })).toHaveCount(0)
   await dialog.getByRole("textbox").press("Escape")
   await expect(dialog).toHaveCount(0)
   const tabs = page.locator("[data-titlebar-tab-link]")

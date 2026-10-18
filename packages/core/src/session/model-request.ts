@@ -31,6 +31,7 @@ import { Permission } from "../permission.js"
 import { PluginHooks } from "../plugin/hooks.js"
 import { QuestionTool } from "../tool/plugin/question.js"
 import { Tool } from "../tool.js"
+import { ToolOutput } from "../tool-output.js"
 import { SessionAffinity } from "./affinity.js"
 import { SessionModelTransport } from "./model-transport.js"
 import { SessionProviderContext } from "./provider-context.js"
@@ -248,6 +249,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
+    const output = yield* ToolOutput.Service
     const app = yield* App.Metadata
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
@@ -300,9 +302,28 @@ export const layer = Layer.effect(
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
       const affinity = SessionAffinity.get(session)
       const supported = unsupportedParts(shaped.messages, model.capabilities, model.model.provider)
-      const messages = boundImages(supported)
-      const attachmentOrigins = AttachmentQuarantine.afterReplacement(supported, messages,
+      const images = boundImages(supported)
+      const imageOrigins = AttachmentQuarantine.afterReplacement(supported, images,
         AttachmentQuarantine.afterReplacement(shaped.messages, supported, draftOrigins))
+      const messages = yield* Effect.forEach(images, (message) => Effect.gen(function* () {
+        if (message.native !== undefined || message.providerMetadata !== undefined) return message
+        const content = yield* Effect.forEach(message.content, (part) => Effect.gen(function* () {
+          if (part.type !== "tool-result" || part.providerExecuted || part.providerMetadata !== undefined) return part
+          const outputPath = typeof part.metadata?.outputPath === "string" ? part.metadata.outputPath : undefined
+          if (part.result.type === "text" && typeof part.result.value === "string") {
+            const value = yield* output.project([{ type: "text", text: part.result.value }], outputPath)
+            const text = value.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")
+            return text === part.result.value ? part : { ...part, result: { ...part.result, value: text } }
+          }
+          if (part.result.type !== "content") return part
+          const previous = part.result.value
+          const value = yield* output.project(previous, outputPath)
+          return value.every((item, index) => item === previous[index]) && value.length === previous.length
+            ? part : { ...part, result: { ...part.result, value } }
+        }))
+        return content.every((part, index) => part === message.content[index]) ? message : new Message({ ...message, content })
+      }))
+      const attachmentOrigins = AttachmentQuarantine.afterReplacement(images, messages, imageOrigins)
       const base = LLM.request({
         model: model.model,
         http: {
@@ -473,5 +494,5 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [PluginHooks.node, SessionModelTransport.node, App.node],
+  deps: [PluginHooks.node, SessionModelTransport.node, ToolOutput.node, App.node],
 })
