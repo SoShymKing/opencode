@@ -107,6 +107,12 @@ export function capture(source: string, target: string) {
     yield* DatabaseReplacement.requireNoSidecars(snapshot)
     const changed = JSON.stringify(marker.source.evidence) !== JSON.stringify(before.evidence)
     if (changed && marker.phase !== "handoff") return yield* failure("Database source changed since WS stage preparation")
+    const { WsSnapshotRecovery } = yield* Effect.promise(() => import("./ws-snapshot-recovery.js"))
+    const recovered = yield* WsSnapshotRecovery.recover(source, target, { marker, before })
+    if (recovered) {
+      yield* write(target, recovered)
+      return { ...captured, marker: recovered, before }
+    }
     if (changed || marker.source.evidence.wal || before.evidence.wal) {
       const { WsNativeFile } = yield* Effect.promise(() => import("./ws-native-file.js"))
       yield* WsNativeFile.requireSameSource(source, snapshot)
