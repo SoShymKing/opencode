@@ -6,8 +6,11 @@ import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { WsNativeSource } from "@opencode/core/database/ws-native-source"
 import { WsNativePrevious } from "@opencode/core/database/ws-native-previous"
 import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
-import { choose, estimate, Resources } from "@opencode/core/database/ws-native-serial"
-import { setupWs, setupPreviousNative, instructionInitialHash, instructionCurrentHash } from "./fixture/database-ws"
+import { choose, estimate, headroom, lease, pipeline, Resources } from "@opencode/core/database/ws-native-serial"
+import { openWith, openWorker } from "@opencode/core/database/ws-native-bun"
+import { WsNativeBatch } from "@opencode/core/database/ws-native-batch"
+import type { Worker } from "node:worker_threads"
+import { setupWs, setupPreviousNative, instructionInitialHash, instructionCurrentHash, messageData } from "./fixture/database-ws"
 
 for (const previous of [false, true]) test(`${previous ? "P" : "WS"} event validation bounds real database reads`, () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
@@ -44,6 +47,110 @@ for (const previous of [false, true]) test(`${previous ? "P" : "WS"} event valid
 }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 class VisitorValue extends Context.Service<VisitorValue, { readonly value: string }>()("SourceScanVisitorValue") {}
+
+test("pipeline reads during gated compute and computes its second batch during blocked writes", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE pipeline_source (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+  const data = messageData.replace('"first"', JSON.stringify("x".repeat(270000)))
+  for (const [seq, id] of ["msg_first", "msg_gate", "msg_second", "msg_third", "msg_fourth", "msg_fifth"].entries())
+    yield* db.run(sql`INSERT INTO pipeline_source VALUES (${id}, 'ses_migration', 'assistant', ${seq}, 1, 16, ${data})`)
+  const workers: Worker[] = []
+  const converter = yield* openWith(openWorker(new URL("./fixture/ws-native-worker-gated.ts", import.meta.url)).pipe(
+    Effect.tap((opened) => Effect.sync(() => { workers.push(opened.worker) }))))
+  const available = yield* headroom
+  const readAhead = yield* Deferred.make<void>()
+  const writing = yield* Deferred.make<void>()
+  const written = yield* Deferred.make<void>()
+  const computed = yield* Deferred.make<void>()
+  let reads = 0
+  let batches = 0
+  const seen: string[] = []
+  const read = Effect.gen(function* () {
+    yield* lease(2 * estimate(Buffer.byteLength(data)), "page")
+    const rows = yield* db.all<WsNativeBatch.Row>(sql`SELECT * FROM pipeline_source ORDER BY seq LIMIT 2 OFFSET ${reads * 2}`)
+    reads++
+    if (reads === 2) yield* Deferred.succeed(readAhead, undefined)
+    if (!rows.length) return undefined
+    return rows.map((row): WsNativeBatch.Job => ({ kind: "message", input: { row, parts: undefined, previousNative: false, store: true } }))
+  })
+  const compute = (jobs: readonly WsNativeBatch.Job[], emit: (result: WsNativeBatch.Result, index: number) => Effect.Effect<void>) => Effect.gen(function* () {
+    const batch = ++batches
+    yield* converter.stream(jobs, emit, true)
+    if (batch === 2) yield* Deferred.succeed(computed, undefined)
+  })
+  const fiber = yield* pipeline(read, compute, (job, output) => Effect.gen(function* () {
+    expect(output.kind).toBe("message")
+    seen.push(WsNativeBatch.jobID(job))
+    if (seen.length !== 1) return
+    yield* Deferred.succeed(writing, undefined)
+    yield* Deferred.await(written)
+  })).pipe(Effect.forkChild)
+  yield* Deferred.await(writing)
+  yield* Deferred.await(readAhead)
+  expect(reads).toBe(2)
+  expect(seen).toEqual(["msg_first"])
+  workers.forEach((worker) => worker.postMessage("release"))
+  yield* Deferred.await(computed)
+  expect(converter.threadIDs().length).toBe(2)
+  expect(reads).toBe(2)
+  expect(seen).toEqual(["msg_first"])
+  expect(yield* headroom).toBe(available - 4 * estimate(Buffer.byteLength(data)))
+  yield* Deferred.succeed(written, undefined)
+  yield* Fiber.join(fiber)
+  expect(seen).toEqual(["msg_first", "msg_gate", "msg_second", "msg_third", "msg_fourth", "msg_fifth"])
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 2, freeBytes: 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("pipeline waits for a payload lease instead of rejecting a fitting next page", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: false })
+  for (let index = 0; index < 260; index++) yield* db.run(sql`INSERT INTO session_message VALUES
+    (${`msg_memory_${index}`}, 'ses_migration', 'assistant', ${index + 51}, 1, 16, ${messageData})`)
+  let reads = 0
+  const reader = { get: db.get.bind(db), all: <T>(query: Parameters<typeof db.all>[0]) => {
+    const result = db.all<T>(query)
+    if (result.getQuery().sql.includes("SELECT id, session_id")) reads++
+    return result
+  } }
+  const entered = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  let consumed = 0
+  const fiber = yield* WsNativeScan.consume(reader,
+    { parent: "session_message", child: undefined, previousNative: false, store: () => true },
+    () => Effect.gen(function* () {
+      if (consumed++ !== 0) return
+      yield* Deferred.succeed(entered, undefined)
+      yield* Deferred.await(release)
+    })).pipe(Effect.forkChild)
+  yield* Deferred.await(entered)
+  yield* Effect.yieldNow
+  expect(reads).toBe(1)
+  yield* Deferred.succeed(release, undefined)
+  yield* Fiber.join(fiber)
+  expect(consumed).toBe(261)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 2 * 128 * estimate(Buffer.byteLength(messageData)) })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("bounded pipeline retains the caller transaction after late conversion failure", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", rich: false })
+  yield* db.run("CREATE TABLE pipeline_target (id TEXT PRIMARY KEY, data TEXT)")
+  for (let index = 0; index < 260; index++) yield* db.run(sql`INSERT INTO session_message VALUES
+    (${`msg_pipeline_${index}`}, 'ses_migration', 'assistant', ${index + 51}, 1, 16, ${index === 259 ? '{}' : messageData})`)
+  let writes = 0
+  const result = yield* db.transaction((tx) => WsNativeScan.consume(tx,
+    { parent: "session_message", child: undefined, previousNative: false, store: () => true },
+    (row, output) => Effect.gen(function* () {
+      expect((yield* VisitorValue).value).toBe("transaction")
+      yield* tx.run(sql`INSERT INTO pipeline_target VALUES (${row.id}, ${output?.data ?? ''})`)
+      writes++
+    }))).pipe(Effect.provideService(VisitorValue, { value: "transaction" }), Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(writes).toBeGreaterThan(0)
+  expect(yield* db.get("SELECT count(*) AS count FROM pipeline_target")).toEqual({ count: 0 })
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 test("worker row waves span bounded SQL pages and feed twenty CPUs", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()

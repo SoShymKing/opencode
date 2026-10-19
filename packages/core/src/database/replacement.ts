@@ -27,8 +27,12 @@ export function activateLocked(target: string) {
     if (!(yield* pending(target))) return
     const markerPath = `${target}.replacement.json`
     const marker = yield* readMarker(markerPath)
-    if (marker.phase === "prepared") return yield* prepare(target, markerPath, marker)
-    return yield* replace(target, markerPath, marker)
+    if (marker.version === 2) {
+      const { WsNativeFile } = yield* Effect.promise(() => import("./ws-native-file"))
+      yield* WsNativeFile.requireStagedSource(target)
+    }
+    yield* marker.phase === "prepared" ? prepare(target, marker) : replace(target, marker)
+    return marker.staged
   })
 }
 
@@ -38,12 +42,12 @@ export function pending(target: string) {
 
 function prepare(
   target: string,
-  markerPath: string,
   marker: Extract<DatabaseLegacyV01.PendingReplacement, { readonly phase: "prepared" }>,
 ) {
   return Effect.gen(function* () {
     const staged = join(dirname(target), marker.staged.name)
     yield* validate(staged, marker.staged)
+    yield* requireNoSidecars(staged)
     yield* validateStage(staged, marker.version)
     if (marker.version === 2) yield* requirePreimage(target, marker.targetPreimage)
     const targetExists = yield* DatabaseArtifact.exists(target)
@@ -64,15 +68,15 @@ function prepare(
       staged: marker.staged,
       ...(backup ? { backup } : {}),
     } satisfies DatabaseLegacyV01.PendingReplacement
-    yield* DatabaseArtifact.replaceWithText(markerPath, `${JSON.stringify(next)}\n`)
-    yield* replace(target, markerPath, next)
+    yield* DatabaseArtifact.replaceWithText(`${target}.replacement.json`, `${JSON.stringify(next)}\n`)
+    yield* replace(target, next, marker.staged)
   })
 }
 
 function replace(
   target: string,
-  markerPath: string,
   marker: Extract<DatabaseLegacyV01.PendingReplacement, { readonly phase: "backup_ready" }>,
+  validatedStage?: DatabaseLegacyV01.PendingReplacement["staged"],
 ) {
   return Effect.gen(function* () {
     if (marker.backup) {
@@ -86,9 +90,13 @@ function replace(
       yield* requireNoSidecars(backup)
     }
     const staged = join(dirname(target), marker.staged.name)
-    if (yield* DatabaseArtifact.exists(staged)) {
+    const stagedExists = yield* DatabaseArtifact.exists(staged)
+    if (stagedExists) {
       yield* validate(staged, marker.staged)
-      yield* validateStage(staged, marker.version)
+      if (validatedStage !== marker.staged) {
+        yield* requireNoSidecars(staged)
+        yield* validateStage(staged, marker.version)
+      }
       yield* requireNoSidecars(staged)
       const targetExists = yield* DatabaseArtifact.exists(target)
       if (marker.backup && !targetExists) return yield* failure("replacement target disappeared after backup")
@@ -99,8 +107,8 @@ function replace(
     }
     yield* requireNoSidecars(target)
     yield* validate(target, marker.staged)
-    yield* validateStage(target, marker.version)
-    yield* DatabaseArtifact.remove(markerPath)
+    if (!stagedExists) yield* validateStage(target, marker.version)
+    yield* DatabaseArtifact.remove(`${target}.replacement.json`)
     return yield* Effect.void
   })
 }

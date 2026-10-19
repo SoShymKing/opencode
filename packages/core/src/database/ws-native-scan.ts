@@ -8,7 +8,7 @@ import { DatabaseWsArchive } from "./ws-archive.js"
 import { WsNativeBatch } from "./ws-native-batch.js"
 import { WsNativeMessage } from "./ws-native-message.js"
 import type { EnvelopeRow, ChildRow } from "../session/message-storage.js"
-import { estimate, planning, memoryError } from "./ws-native-serial.js"
+import { estimate, planning, memoryError, lease, pipeline, readingPlan } from "./ws-native-serial.js"
 
 export const rowLimit = 128
 export const byteLimit = 1024 * 1024
@@ -90,10 +90,12 @@ export function validateNative(db: Pick<EffectDrizzleSqlite.EffectSQLiteDatabase
       workers: true,
     }, (parents: readonly EnvelopeRow[]) => Effect.gen(function* () {
       const jobs: WsNativeBatch.Job[] = []
-      for (const parent of parents) {
+      for (let offset = 0; offset < parents.length; offset += rowLimit) {
+        const page = parents.slice(offset, offset + rowLimit)
         const children = yield* tx.all<Omit<ChildRow, "sessionID">>(sql`SELECT message_id AS messageID, position, id, type, data AS dataText
-          FROM session_message_part WHERE message_id = ${parent.messageID} ORDER BY position`)
-        jobs.push({ kind: "native-validate", parent, children })
+          FROM session_message_part WHERE message_id IN (${sql.join(page.map((parent) => sql`${parent.messageID}`), sql`, `)}) ORDER BY message_id, position`)
+        const grouped = Map.groupBy(children, (child) => child.messageID)
+        for (const parent of page) jobs.push({ kind: "native-validate", parent, children: grouped.get(parent.messageID) ?? [] })
       }
       yield* worker.run(jobs)
     })))
@@ -111,72 +113,69 @@ export function consume<E, R>(db: Pick<EffectDrizzleSqlite.EffectSQLiteDatabase,
   return Effect.scoped(Effect.gen(function* () {
     let cursor: { session_id: string; seq: number; id: string } | undefined
     const converter = yield* open
-    const batch: WsNativeBatch.Input[] = []
-    let needed = 0
-    const flush = Effect.gen(function* () {
-      const outputs = yield* converter.process(batch)
-      for (const [index, item] of batch.entries()) yield* accept(item.row, outputs[index])
-      batch.length = 0
-      needed = 0
-    })
-    while (true) {
-      const candidates = yield* db.all<{ id: string; session_id: string; seq: number; bytes: number; rows: number }>(sql`
+    const read = Effect.gen(function* () {
+      const batch: WsNativeBatch.Input[] = []
+      let needed = 0
+      while (true) {
+        const candidates = yield* db.all<{ id: string; session_id: string; seq: number; bytes: number; rows: number }>(sql`
         SELECT m.id, m.session_id, m.seq, octet_length(m.data) + ${source.child
           ? sql`coalesce((SELECT sum(octet_length(p.data)) FROM ${identifier(source.child)} p WHERE p.message_id = m.id), 0)` : sql`0`} AS bytes,
           ${source.child ? sql`1 + (SELECT count(*) FROM ${identifier(source.child)} p WHERE p.message_id = m.id)` : sql`1`} AS rows
         FROM ${identifier(source.parent)} m
         WHERE ${cursor ? sql`(m.session_id, m.seq, m.id) > (${cursor.session_id}, ${cursor.seq}, ${cursor.id})` : sql`1`}
         ORDER BY m.session_id, m.seq, m.id LIMIT ${rowLimit}`)
-      if (!candidates.length) {
-        if (batch.length) yield* flush
-        return
-      }
-      const admitted: typeof candidates = []
-      const { available } = yield* planning(needed, batch.length)
-      let bytes = 0
-      let childRows = 0
-      for (const candidate of candidates) {
-        if (admitted.length && (bytes + candidate.bytes > byteLimit || childRows + candidate.rows - 1 > rowLimit)) break
-        const size = estimate(candidate.bytes, candidate.rows)
-        if (needed + size > available) {
-          if (batch.length || admitted.length) break
-          return yield* memoryError(candidate.id, size, available)
+        if (!candidates.length) return batch.length ? batch : undefined
+        const admitted: typeof candidates = []
+        const target = yield* readingPlan(needed, batch.length)
+        let bytes = 0
+        let childRows = 0
+        let pageBytes = 0
+        for (const candidate of candidates) {
+          if (admitted.length && (bytes + candidate.bytes > byteLimit || childRows + candidate.rows - 1 > rowLimit)) break
+          const size = estimate(candidate.bytes, candidate.rows)
+          if (pageBytes + size > target.available && (batch.length || admitted.length)) break
+          admitted.push(candidate)
+          bytes += candidate.bytes
+          childRows += candidate.rows - 1
+          needed += size
+          pageBytes += size
+          const next = yield* readingPlan(needed, batch.length + admitted.length)
+          if (batch.length + admitted.length >= next.countLimit || (next.workers && next.ready)) break
         }
-        admitted.push(candidate)
-        bytes += candidate.bytes
-        childRows += candidate.rows - 1
-        needed += size
-        const target = yield* planning(needed, batch.length + admitted.length)
-        if (target.workers && target.ready) break
-      }
-      if (!admitted.length) {
-        yield* flush
-        continue
-      }
-      const ids = sql.join(admitted.map((candidate) => sql`${candidate.id}`), sql`, `)
-      const parents = yield* db.all<WsNativeBatch.Row>(sql`SELECT id, session_id, type, seq, time_created, time_updated, data
+        if (!admitted.length) return batch
+        yield* lease(pageBytes, admitted[0].id)
+        const ids = sql.join(admitted.map((candidate) => sql`${candidate.id}`), sql`, `)
+        const parents = yield* db.all<WsNativeBatch.Row>(sql`SELECT id, session_id, type, seq, time_created, time_updated, data
         FROM ${identifier(source.parent)} WHERE id IN (${ids}) ORDER BY session_id, seq, id`)
-      const byID = new Map(parents.map((row) => [row.id, row]))
-      for (const candidate of admitted) {
-        const row = byID.get(candidate.id)
-        if (!row || row.session_id !== candidate.session_id || row.seq !== candidate.seq)
-          return yield* new WsNativeMessage.WsNativeMessageError({ messageID: candidate.id, message: "Source rows changed during scan" })
-      }
-      const children = source.child ? yield* db.all<NonNullable<WsNativeBatch.Input["parts"]>[number] & { message_id: string }>(sql`
+        const byID = new Map(parents.map((row) => [row.id, row]))
+        for (const candidate of admitted) {
+          const row = byID.get(candidate.id)
+          if (!row || row.session_id !== candidate.session_id || row.seq !== candidate.seq)
+            return yield* new WsNativeMessage.WsNativeMessageError({ messageID: candidate.id, message: "Source rows changed during scan" })
+        }
+        const children = source.child ? yield* db.all<NonNullable<WsNativeBatch.Input["parts"]>[number] & { message_id: string }>(sql`
         SELECT message_id, position, id, type, data FROM ${identifier(source.child)} WHERE message_id IN (${ids}) ORDER BY message_id, position`) : undefined
-      const parts = new Map<string, NonNullable<WsNativeBatch.Input["parts"]>[number][]>()
-      for (const child of children ?? []) {
-        const group = parts.get(child.message_id)
-        if (group) group.push(child)
-        else parts.set(child.message_id, [child])
+        const parts = new Map<string, NonNullable<WsNativeBatch.Input["parts"]>[number][]>()
+        for (const child of children ?? []) {
+          const group = parts.get(child.message_id)
+          if (group) group.push(child)
+          else parts.set(child.message_id, [child])
+        }
+        for (const candidate of admitted) {
+          const row = byID.get(candidate.id)
+          if (row) batch.push({ row, parts: children === undefined ? undefined : parts.get(row.id) ?? [],
+            previousNative: source.previousNative, store: source.store?.(row.session_id) ?? false })
+        }
+        cursor = admitted[admitted.length - 1]
+        const next = yield* readingPlan(needed, batch.length)
+        if (next.ready || batch.length >= next.countLimit) return batch
       }
-      for (const candidate of admitted) {
-        const row = byID.get(candidate.id)
-        if (row) batch.push({ row, parts: children === undefined ? undefined : parts.get(row.id) ?? [],
-          previousNative: source.previousNative, store: source.store?.(row.session_id) ?? false })
-      }
-      cursor = admitted[admitted.length - 1]
-      if ((yield* planning(needed, batch.length)).ready) yield* flush
-    }
+    })
+    const compute = (items: readonly WsNativeBatch.Input[], emit: (result: WsNativeBatch.Result, index: number) => Effect.Effect<void>) =>
+      converter.stream(items.map((input) => ({ kind: "message", input })), emit, true)
+    yield* pipeline(read, compute, (item, result) => {
+      if (result.kind !== "message") return Effect.die(new Error("Expected message result"))
+      return accept(item.row, result.output)
+    })
   }))
 }

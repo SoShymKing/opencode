@@ -12,7 +12,7 @@ import { setupWs, setupPreviousNative, messageData, richMessageData, nativeMessa
 import { WsNativeBatch } from "@opencode/core/database/ws-native-batch"
 import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
 import { open, openWith, openWorker } from "@opencode/core/database/ws-native-bun"
-import { choose, estimate, headroom, plan, reserve, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
+import { choose, estimate, headroom, lease, pipeline, plan, reserve, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
 import { WsNativeMessage } from "@opencode/core/database/ws-native-message"
 import { tempGlobalLayer } from "./fixture/global"
 import type { Worker } from "node:worker_threads"
@@ -447,7 +447,7 @@ test("two real workers preserve serial JSON, independent ordinals and native tim
   expect(results[0]?.[1]?.parts.map((part) => part.data)).toEqual(['{"text":"first"}', '{"text":"second"}'])
 }).pipe(Effect.scoped)))
 
-test("scan waits for consumption before reading another wave and preserves tied sequence order", () => Effect.runPromise(Effect.gen(function* () {
+test("scan prefetches a bounded window while writes block and preserves tied sequence order", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* setupWs(db, { directory: "/fixture", rich: false })
   yield* db.run("DROP INDEX session_message_session_seq_idx")
@@ -456,12 +456,16 @@ test("scan waits for consumption before reading another wave and preserves tied 
   const entered = yield* Deferred.make<void>()
   const release = yield* Deferred.make<void>()
   const pages: number[] = []
+  const prefetched = yield* Deferred.make<void>()
   const order: string[] = []
   const reader = {
     get: db.get.bind(db),
     all: <T>(query: Parameters<typeof db.all>[0]) => {
       const result = db.all<T>(query)
-      if (result.getQuery().sql.includes("AS bytes")) pages.push(1)
+      if (result.getQuery().sql.includes("AS bytes")) {
+        pages.push(1)
+        if (pages.length === 2) Effect.runSync(Deferred.succeed(prefetched, undefined))
+      }
       return result
     },
   }
@@ -474,13 +478,95 @@ test("scan waits for consumption before reading another wave and preserves tied 
       yield* Deferred.await(release)
     })).pipe(Effect.forkChild)
   yield* Deferred.await(entered)
-  expect(pages.length).toBe(1)
+  yield* Deferred.await(prefetched)
+  expect(pages.length).toBe(2)
+  expect(order.length).toBe(1)
   yield* Deferred.succeed(release, undefined)
   yield* Fiber.join(fiber)
   expect(order).toEqual([...Array.from({ length: 260 }, (_, index) => `msg_bulk_${String(index).padStart(3, "0")}`), "msg_migration"])
   expect(pages.length).toBe(4)
 }).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })),
   Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+test("stream writes the ready prefix before an unrelated worker is released", () => Effect.runPromise(Effect.gen(function* () {
+  const workers: Worker[] = []
+  const converter = yield* openWith(openWorker(new URL("./fixture/ws-native-worker-gated.ts", import.meta.url)).pipe(
+    Effect.tap((opened) => Effect.sync(() => { workers.push(opened.worker) }))))
+  const large = input(richMessageData.replace('"first"', JSON.stringify("x".repeat(270000))))
+  const jobs: WsNativeBatch.Job[] = ["msg_first", "msg_gate"].map((id) => ({ kind: "message", input: { ...large, row: { ...large.row, id } } }))
+  const seen: number[] = []
+  expect(typeof converter.stream).toBe("function")
+  yield* converter.stream(jobs, (output, index) => Effect.sync(() => {
+    expect(output.kind).toBe("message")
+    seen.push(index)
+    if (index === 0) workers.forEach((worker) => worker.postMessage("release"))
+  }))
+  expect(seen).toEqual([0, 1])
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 2, freeBytes: 1024 ** 3 })), Effect.scoped)))
+
+test("stream retains payload memory while its ordered consumer is blocked", () => Effect.runPromise(Effect.gen(function* () {
+  const converter = yield* open
+  const available = yield* headroom
+  const entered = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  const fiber = yield* converter.stream([{ kind: "message", input: input() }], () => Effect.gen(function* () {
+    yield* Deferred.succeed(entered, undefined)
+    yield* Deferred.await(release)
+  })).pipe(Effect.forkChild)
+  yield* Deferred.await(entered)
+  expect(yield* headroom).toBeLessThan(available)
+  yield* Deferred.succeed(release, undefined)
+  yield* Fiber.join(fiber)
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })), Effect.scoped)))
+
+test("pipeline interruption terminates workers before releasing payload leases", () => Effect.runPromise(Effect.gen(function* () {
+  const snapshot = () => ({ cpu: 2, freeBytes: 1024 ** 3 })
+  const large = input(richMessageData.replace('"first"', JSON.stringify("x".repeat(270000))))
+  const jobs: WsNativeBatch.Job[] = ["msg_first", "msg_gate"].map((id) => ({ kind: "message", input: { ...large, row: { ...large.row, id } } }))
+  const exits: number[] = []
+  const converter = yield* openWith(openWorker(new URL("./fixture/ws-native-worker-gated.ts", import.meta.url)).pipe(
+    Effect.tap((opened) => Effect.sync(() => {
+      opened.worker.once("exit", () => exits.push(Effect.runSync(headroom.pipe(Effect.provideService(Resources, snapshot)))))
+    }))))
+  const available = yield* headroom
+  const started = yield* Deferred.make<void>()
+  let read = false
+  const producer = Effect.gen(function* () {
+    if (read) return undefined
+    read = true
+    yield* lease(2 * estimate(Buffer.byteLength(large.row.data)), "page")
+    return jobs
+  })
+  const compute = (items: readonly WsNativeBatch.Job[], emit: (result: WsNativeBatch.Result, index: number) => Effect.Effect<void>) =>
+    converter.stream(items, emit, true)
+  const fiber = yield* pipeline(producer, compute, () => Deferred.succeed(started, undefined).pipe(Effect.asVoid)).pipe(Effect.forkChild)
+  yield* Deferred.await(started)
+  const held = yield* headroom
+  expect(held).toBeLessThan(available)
+  yield* Fiber.interrupt(fiber)
+  expect(exits).toEqual([held, held])
+  expect(yield* headroom).toBe(available)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 2, freeBytes: 1024 ** 3 })), Effect.scoped)))
+
+test("workerd serial streaming keeps array APIs and scoped memory accounting", async () => {
+  const serial = await import("@opencode/core/database/ws-native-serial")
+  await Effect.runPromise(Effect.gen(function* () {
+    const converter = yield* serial.open
+    const available = yield* headroom
+    const jobs: WsNativeBatch.Job[] = [{ kind: "message", input: input() }]
+    const expected = yield* WsNativeBatch.run(jobs)
+    const seen: WsNativeBatch.Result[] = []
+    yield* converter.stream(jobs, (result) => Effect.gen(function* () {
+      expect(yield* headroom).toBeLessThan(available)
+      seen.push(result)
+    }))
+    expect(seen).toEqual([...expected])
+    expect(yield* converter.run(jobs)).toEqual([...expected])
+    expect(yield* converter.process([input()])).toEqual(WsNativeBatch.messageOutputs(expected))
+    expect(yield* headroom).toBe(available)
+  }).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })), Effect.scoped))
+})
 
 for (const previousNative of [false, true]) test(`large ${previousNative ? "previous-native" : "WS"} conversion preserves storage and rolls back invalid input`, () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
@@ -568,9 +654,11 @@ test("child payload budget admits an oversized message alone", () => Effect.runP
   yield* WsNativeScan.consume(reader, { parent: "session_message", child: "session_message_part", previousNative: false, store: () => true },
     (row) => Effect.sync(() => {
       consumed.push(row.id)
-      expect(reads.length).toBe(consumed.length)
+      expect(reads.length).toBeGreaterThanOrEqual(consumed.length)
+      expect(reads.length).toBeLessThanOrEqual(consumed.length + 1)
     }))
   expect(consumed).toEqual(["msg_migration", "msg_next"])
+  expect(reads.length).toBe(2)
 }).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })),
   Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
