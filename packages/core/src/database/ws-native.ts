@@ -14,6 +14,7 @@ import { Instructions } from "../instructions/index.js"
 import { SessionTable } from "../session/sql.js"
 import azureCredential from "./migration/20261007190000_azure_cli_external_credential.js"
 import type { V1Migration } from "./v1-migration.js"
+import { estimate, planning, memoryError } from "./ws-native-serial.js"
 import schema from "./schema.gen.js"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
@@ -205,12 +206,23 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
         let offset = 0
         while (offset < transformed.messages.length) {
           const wave: V1Migration.TransformResult["messages"][number][] = []
+          const target = yield* planning()
           let bytes = 0
-          for (const row of transformed.messages.slice(offset, offset + WsNativeScan.rowLimit)) {
-            const size = Buffer.byteLength(JSON.stringify(row.data))
-            if (wave.length && bytes + size > WsNativeScan.byteLimit) break
+          let payload = 0
+          for (let index = offset; index < transformed.messages.length; index++) {
+            const row = transformed.messages[index]
+            const raw = Buffer.byteLength(JSON.stringify(row.data))
+            const size = estimate(raw)
+            if (!target.workers && wave.length && (wave.length >= WsNativeScan.rowLimit ||
+              payload + raw > WsNativeScan.byteLimit)) break
+            if (bytes + size > target.available) {
+              if (wave.length) break
+              return yield* memoryError(row.id, size, target.available)
+            }
             wave.push(row)
             bytes += size
+            payload += raw
+            if (target.workers && (yield* planning(bytes, wave.length)).ready) break
           }
           const results = yield* worker.run(wave.map((row) => ({ kind: "native-encode", row: { id: row.id, type: row.type, data: row.data } })))
           for (const [index, row] of wave.entries()) {
