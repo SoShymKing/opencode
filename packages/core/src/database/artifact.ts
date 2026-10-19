@@ -4,7 +4,8 @@ import { createHash, randomUUID } from "node:crypto"
 import { createReadStream } from "node:fs"
 import { link, lstat, open, rename, rm, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
-import type { EffectDrizzleSqlite } from "./drizzle.js"
+import { EffectDrizzleSqlite } from "./drizzle.js"
+import { sqliteLayer } from "#sqlite"
 import { sql } from "drizzle-orm"
 import { Effect, Exit } from "effect"
 
@@ -45,11 +46,37 @@ export class Error extends globalThis.Error {
 export function snapshot(db: Database, destination: string) {
   const partial = `${destination}.${process.pid}-${randomUUID()}.partial`
   return db.run(sql`VACUUM INTO ${partial}`).pipe(
+    Effect.andThen(restoreEmptySequence(db, partial)),
     Effect.mapError((cause) => new Error("snapshot", { cause })),
     Effect.andThen(syncFile(partial)),
     Effect.andThen(publish(partial, destination)),
     Effect.onExit((exit) => (Exit.isFailure(exit) ? removeOwned(partial) : Effect.void)),
   )
+}
+
+export function hasEmptyOrphanSequence(db: Database) {
+  return Effect.gen(function* () {
+    if (!(yield* db.get("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence'"))) return false
+    if (yield* db.get("SELECT 1 FROM sqlite_sequence LIMIT 1")) return false
+    return !(yield* db.get("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND upper(sql) LIKE '%AUTOINCREMENT%'"))
+  })
+}
+
+export function restoreEmptySequence(source: Database, destination: string) {
+  return Effect.gen(function* () {
+    if (!(yield* hasEmptyOrphanSequence(source))) return
+    yield* Effect.gen(function* () {
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      if (yield* db.get("SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence'")) return
+      const names = yield* db.all<{ name: string }>("SELECT name FROM sqlite_schema")
+      const occupied = new Set(names.map((row) => row.name.toLowerCase()))
+      let name = "_snapshot_sequence"
+      while (occupied.has(name)) name += "_"
+      yield* db.transaction((tx) => tx.run(sql`CREATE TABLE ${sql.identifier(name)} (id INTEGER PRIMARY KEY AUTOINCREMENT)`).pipe(
+        Effect.andThen(tx.run(sql`DROP TABLE ${sql.identifier(name)}`)),
+      ))
+    }).pipe(Effect.provide(sqliteLayer({ filename: destination, create: false })), Effect.scoped)
+  })
 }
 
 export function digest(filename: string) {

@@ -9,6 +9,67 @@ import { sqliteLayer } from "../src/database/sqlite.bun"
 import { WsNativeFile } from "../src/database/ws-native-file"
 import { tmpdir } from "./fixture/tmpdir"
 
+test("source equality accepts a production snapshot with an empty orphan sqlite_sequence", async () => {
+  await using temp = await tmpdir()
+  const source = join(temp.path, "source.db")
+  const snapshot = join(temp.path, "snapshot.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* db.run("CREATE TABLE facts (id INTEGER PRIMARY KEY, value TEXT)")
+    yield* db.run("INSERT INTO facts VALUES (1, 'retained')")
+    yield* db.run("CREATE TABLE discarded (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+    yield* db.run("DROP TABLE discarded")
+    expect(yield* db.all("SELECT * FROM sqlite_sequence")).toEqual([])
+    yield* DatabaseArtifact.snapshot(db, snapshot)
+    yield* db.run(sql`ATTACH DATABASE ${snapshot} AS replacement_backup`)
+    expect(yield* db.all("SELECT type, name, tbl_name, sql FROM replacement_backup.sqlite_schema ORDER BY name"))
+      .toEqual(yield* db.all("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY name"))
+    expect(yield* db.all("SELECT * FROM replacement_backup.sqlite_sequence")).toEqual([])
+  }).pipe(Effect.provide(sqliteLayer({ filename: source })), Effect.scoped))
+  await WsNativeFile.requireSameSource(source, snapshot).pipe(Effect.runPromise)
+})
+
+test("source equality rejects a sequence-only mutation with a retained AUTOINCREMENT table", async () => {
+  await using temp = await tmpdir()
+  const source = join(temp.path, "source.db")
+  const snapshot = join(temp.path, "snapshot.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* db.run("CREATE TABLE facts (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)")
+    yield* db.run("INSERT INTO facts (value) VALUES ('retained')")
+    yield* DatabaseArtifact.snapshot(db, snapshot)
+  }).pipe(Effect.provide(sqliteLayer({ filename: source })), Effect.scoped))
+  await WsNativeFile.requireSameSource(source, snapshot).pipe(Effect.runPromise)
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* db.run("UPDATE sqlite_sequence SET seq = 42 WHERE name = 'facts'")
+  }).pipe(Effect.provide(sqliteLayer({ filename: source })), Effect.scoped))
+  await expect(WsNativeFile.requireSameSource(source, snapshot).pipe(Effect.runPromise)).rejects.toThrow("replacement target differs from its backup")
+})
+
+for (const layout of [
+  { ddl: "CREATE TABLE facts (id TEXT PRIMARY KEY, value TEXT)", rows: "(2, 'one', 'retained'), (7, 'two', 'retained')" },
+  { ddl: "CREATE TABLE facts (id TEXT, value TEXT)", rows: "(2, 'same', 'retained'), (7, 'same', 'retained')" },
+]) test(`source equality accepts a production snapshot with gapped hidden rowids: ${layout.ddl}`, async () => {
+  await using temp = await tmpdir()
+  const source = join(temp.path, "source.db")
+  const snapshot = join(temp.path, "snapshot.db")
+  const rowids = await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* db.run(layout.ddl)
+    yield* db.run(`INSERT INTO facts (rowid, id, value) VALUES ${layout.rows}`)
+    yield* DatabaseArtifact.snapshot(db, snapshot)
+    yield* db.run(sql`ATTACH DATABASE ${snapshot} AS replacement_backup`)
+    expect(yield* db.all("SELECT id, value FROM replacement_backup.facts ORDER BY rowid"))
+      .toEqual(yield* db.all("SELECT id, value FROM main.facts ORDER BY rowid"))
+    return {
+      source: yield* db.all<{ rowid: number }>("SELECT rowid FROM main.facts ORDER BY rowid"),
+      snapshot: yield* db.all<{ rowid: number }>("SELECT rowid FROM replacement_backup.facts ORDER BY rowid"),
+    }
+  }).pipe(Effect.provide(sqliteLayer({ filename: source })), Effect.scoped))
+  await expect(WsNativeFile.requireSameSource(source, snapshot).pipe(Effect.runPromise), JSON.stringify(rowids)).resolves.toBeUndefined()
+})
+
 for (const encoding of ["UTF-8", "UTF-16le"]) {
   for (const change of [
     "UPDATE facts SET text_value = 'A' || char(0) || 'z'",
