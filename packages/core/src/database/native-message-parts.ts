@@ -19,7 +19,7 @@ export function normalizeMessages(db: Database, sessionID?: string) {
     const { WsNativeScan } = yield* Effect.promise(() => import("./ws-native-scan.js"))
     const { open } = yield* Effect.promise(() => import("#ws-native-worker"))
     const worker = yield* open
-    yield* WsNativeScan.rows(db, { table: "session_message", bytes: sql`octet_length(m.data)`,
+    yield* WsNativeScan.rows(db, { table: "session_message", bytes: sql`octet_length(m.data)`, workers: true,
       key: sessionID === undefined ? "id" : "seq",
       columns: sql`m.id, m.data`, where: sql`m.type = 'assistant' ${sessionID === undefined ? sql`` : sql`AND m.session_id = ${sessionID}`}` },
     (rows: readonly { id: string; data: string }[]) => Effect.gen(function* () {

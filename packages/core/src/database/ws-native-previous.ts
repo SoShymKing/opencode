@@ -99,7 +99,7 @@ export function read<E = never, R = never>(db: Reader, archive?: DatabaseWsArchi
       return source
     }
     const table = (name: string) => DatabaseWsArchive.identifier(source(name))
-    yield* WsNativeScan.rows(db, { table: source("event"), bytes: sql`octet_length(m.data)` },
+    yield* WsNativeScan.rows(db, { table: source("event"), bytes: sql`octet_length(m.data)`, workers: true },
       (rows: readonly (WsEventCodec.Row & { created: number })[]) => worker.run(rows.map((row) => ({ kind: "p-event", row }))).pipe(Effect.asVoid))
     yield* WsNativeScan.rows(db, { table: source("instruction_blob"), key: "hash", bytes: sql`coalesce(octet_length(m.value), 0)` },
       (rows: readonly { hash: string; value: string | null }[]) => Effect.forEach(rows, (row) => Effect.gen(function* () {
