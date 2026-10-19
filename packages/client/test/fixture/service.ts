@@ -97,7 +97,7 @@ const server = Bun.serve({
       while (!(await Bun.file(registration + ".release").exists())) await Bun.sleep(5)
       return new Response(null, { status: 503 })
     }
-    if (mode === "starting" && !(await Bun.file(registration + ".release").exists()))
+    if ((mode === "starting" || mode === "database" || mode === "database-old") && !(await Bun.file(registration + ".release").exists()))
       return Response.json(
         { version, pid: process.pid, urls: [server.url.toString()], paths: { tmp: "/tmp/opencode" } },
         { status: 503 },
