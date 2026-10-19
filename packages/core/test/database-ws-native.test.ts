@@ -11,12 +11,54 @@ import type { Global } from "@opencode/util/global"
 import { tempGlobalLayer } from "./fixture/global"
 import { DatabaseWsArchive } from "@opencode/core/database/ws-archive"
 import { sql } from "drizzle-orm"
+import { SQLiteDialect } from "drizzle-orm/sqlite-core"
 
 const run = <A, E>(effect: Effect.Effect<A, E, SqlClient | Global.Service>) => Effect.runPromise(effect.pipe(
   Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.provide(tempGlobalLayer), Effect.scoped,
 ))
 const lineages: WsLineage[] = ["v01", "v02", "expanded", "expanded-alias", "split-alias", "historical-part"]
 const rawEvent = '{ "sessionID":"ses_migration", "timestamp":49, "attempt":1.00, "error":{"message":"retry","isRetryable":true} }'
+for (const count of [0, 9, 35]) test(`restores ${count} raw parts in bounded inserts`, () => run(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* setupWs(db, { directory: "/fixture", lineage: "v02", rich: false })
+  yield* db.run("DELETE FROM session_message_part")
+  const parts = Array.from({ length: count }, (_, position) => ({
+    position, id: String(Math.floor(position / 2)), type: position % 2 ? "reasoning" : "text",
+    data: position % 2 ? `  { "text":"part ${position} \\u03bb", "time":{ "created":1.00, "completed":2e0 } }\n`
+      : `  { "text":"part ${position} \\u03bb" }\n`,
+  }))
+  for (const part of parts) yield* db.run(sql`INSERT INTO session_message_part VALUES ('msg_migration', ${part.position}, ${part.id}, ${part.type}, ${part.data})`)
+  yield* WsNative.convert(db)
+  expect(yield* db.all("SELECT position, id, type, data FROM session_message_part ORDER BY position")).toEqual(parts)
+  const manifest = yield* db.get<{ id: string }>("SELECT id FROM _ws_archive")
+  if (!manifest) throw new Error("Missing archive")
+  const archive = yield* DatabaseWsArchive.read(db, manifest.id)
+  if (!archive) throw new Error("Missing manifest")
+  yield* db.run("DELETE FROM session_v2")
+  const dialect = new SQLiteDialect()
+  const statements: { sql: string; params: unknown[] }[] = []
+  yield* db.transaction((tx) => Effect.gen(function* () {
+    const execute = tx.run.bind(tx)
+    tx.run = (query) => {
+      const compiled = typeof query === "string" ? { sql: query, params: [] } : dialect.sqlToQuery(query.getSQL())
+      if (/^INSERT INTO session_message(?:_part)?\s/.test(compiled.sql)) statements.push(compiled)
+      return execute(query)
+    }
+    yield* WsNative.restoreSessions(tx, archive)
+  }))
+  expect(statements.length).toBe(1 + Math.ceil(count / 16))
+  expect(statements.every((statement) => statement.params.length <= 80)).toBe(true)
+  expect(yield* db.all("SELECT position, id, type, data FROM session_message_part ORDER BY position")).toEqual(parts)
+  if (count !== 35) return
+  yield* db.run("DELETE FROM session_v2")
+  yield* db.run("CREATE TRIGGER reject_later_part BEFORE INSERT ON session_message_part WHEN NEW.position = 32 BEGIN SELECT RAISE(ABORT, 'later chunk'); END")
+  const result = yield* db.transaction((tx) => WsNative.restoreSessions(tx, archive)).pipe(Effect.result)
+  expect(result._tag).toBe("Failure")
+  expect(yield* db.all("SELECT * FROM session_v2")).toEqual([])
+  expect(yield* db.all("SELECT * FROM session_message")).toEqual([])
+  expect(yield* db.all("SELECT * FROM session_message_part")).toEqual([])
+})))
+
 for (const lineage of lineages) test(`minimal WS ${lineage} becomes native once`, () => run(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* setupWs(db, { directory: "/fixture", lineage, rich: false })

@@ -182,8 +182,9 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
       if (!stored) return
       yield* db.run(sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
         VALUES (${row.id}, ${row.session_id}, ${stored.type}, ${row.seq}, ${row.time_created}, ${row.time_updated}, ${stored.data})`)
-      for (const part of stored.parts) yield* db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data)
-        VALUES (${row.id}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`)
+      for (let offset = 0; offset < stored.parts.length; offset += 16)
+        yield* db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data) VALUES ${sql.join(
+          stored.parts.slice(offset, offset + 16).map((part) => sql`(${row.id}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`), sql`, `)}`)
     }))
     const legacyMessages = DatabaseWsArchive.sourceTable(archive, "message")
     const legacyParts = DatabaseWsArchive.sourceTable(archive, "part")
@@ -215,8 +216,9 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
             if (result.kind !== "native-encode") return yield* fail(`Unexpected legacy encode result: ${row.id}`)
             yield* db.run(sql`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
               VALUES (${row.id}, ${row.session_id}, ${row.type}, ${row.seq}, ${row.time_created}, ${row.time_updated}, ${result.output.data})`)
-            for (const part of result.output.parts) yield* db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data)
-              VALUES (${row.id}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`)
+            for (let offset = 0; offset < result.output.parts.length; offset += 16)
+              yield* db.run(sql`INSERT INTO session_message_part (message_id, position, id, type, data) VALUES ${sql.join(
+                result.output.parts.slice(offset, offset + 16).map((part) => sql`(${row.id}, ${part.position}, ${part.id}, ${part.type}, ${part.data})`), sql`, `)}`)
           }
           offset += wave.length
         }
