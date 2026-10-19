@@ -233,6 +233,7 @@ export function prepareSession(
     const sourceMessageIDs = new Set<string>()
     yield* WsNativeScan.rows(db, {
       table: tables.message,
+      workers: true,
       key: { first: "time_created", then: "id" },
       bytes: sql`octet_length(m.data)`,
       where: sql`m.session_id = ${session.id}`,
@@ -247,6 +248,7 @@ export function prepareSession(
     }))
     yield* WsNativeScan.rows(db, {
       table: tables.part,
+      workers: true,
       key: "rowid",
       bytes: sql`octet_length(m.data)`,
       where: sql`m.session_id = ${session.id}`,

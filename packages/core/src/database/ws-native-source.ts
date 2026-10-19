@@ -49,7 +49,7 @@ export function read<E = never, R = never>(db: Reader, archive?: DatabaseWsArchi
       return source
     }
     const table = (name: string) => DatabaseWsArchive.identifier(source(name))
-    if (!previousNative) yield* WsNativeScan.rows(db, { table: source("event"), bytes: sql`octet_length(m.data)` },
+    if (!previousNative) yield* WsNativeScan.rows(db, { table: source("event"), bytes: sql`octet_length(m.data)`, workers: true },
       (rows: readonly WsEventCodec.Row[]) => worker.run(rows.map((row) => ({ kind: "ws-event", row }))).pipe(
         Effect.mapError((error) => fail(`Invalid source event ${error.messageID}: ${error.message}`)), Effect.asVoid))
     const permissions = yield* Effect.forEach(
@@ -106,13 +106,13 @@ export function read<E = never, R = never>(db: Reader, archive?: DatabaseWsArchi
       if (visitors.input) yield* visitors.input(input)
     }), { discard: true }))
     const legacyOnly = sql`NOT EXISTS (SELECT 1 FROM ${table("session_message")} n WHERE n.session_id = m.session_id)`
-    yield* WsNativeScan.rows(db, { table: source("message"), bytes: sql`octet_length(m.data)`, where: legacyOnly },
+    yield* WsNativeScan.rows(db, { table: source("message"), bytes: sql`octet_length(m.data)`, where: legacyOnly, workers: true },
       (rows: readonly { id: string; session_id: string; data: string; time_created: number; time_updated: number }[]) =>
         worker.run(rows.map((row) => ({ kind: "legacy-message", mode: "validate", row }))).pipe(Effect.asVoid))
     const orphan = yield* db.get<{ id: string }>(sql`SELECT m.id FROM ${table("part")} m WHERE ${legacyOnly}
       AND NOT EXISTS (SELECT 1 FROM ${table("message")} p WHERE p.id = m.message_id AND p.session_id = m.session_id) LIMIT 1`)
     if (orphan) return yield* fail(`Orphan legacy part ${orphan.id}`)
-    yield* WsNativeScan.rows(db, { table: source("part"), bytes: sql`octet_length(m.data)`, where: legacyOnly },
+    yield* WsNativeScan.rows(db, { table: source("part"), bytes: sql`octet_length(m.data)`, where: legacyOnly, workers: true },
       (rows: readonly { id: string; message_id: string; session_id: string; data: string; time_created: number; time_updated: number }[]) =>
         worker.run(rows.map((row) => ({ kind: "legacy-part", mode: "validate", row }))).pipe(Effect.asVoid))
     return { permissions, grants }

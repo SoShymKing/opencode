@@ -26,6 +26,13 @@ export function choose(snapshot: { readonly cpu: number; readonly freeBytes: num
   return { count, workers, bytes: bytes + workers * workerBytes, available }
 }
 export const headroom = Effect.map(Resources, (snapshot) => Math.max(0, Math.floor(snapshot().freeBytes / 2) - reserved.bytes))
+export function plan(snapshot: { readonly cpu: number; readonly freeBytes: number }, bytes: number, count: number, active = { cpu: 0, bytes: 0 }) {
+  const available = Math.max(0, Math.floor(snapshot.freeBytes / 2) - active.bytes)
+  const workers = snapshot.cpu < 2 ? 0 : Math.max(0, Math.min(snapshot.cpu - active.cpu,
+    Math.floor(available / (workerBytes + minWorkPerWorker)), Math.floor((available - bytes) / workerBytes)))
+  return { available, workers, ready: !workers || (count >= workers && bytes >= Math.max(2, workers) * minWorkPerWorker) }
+}
+export const planning = (bytes = 0, count = 0) => Effect.map(Resources, (snapshot) => plan(snapshot(), bytes, count, reserved))
 export function memoryError(messageID: string, needed: number, available: number) {
   return new WsNativeMessage.WsNativeMessageError({ messageID, message: `WS conversion needs an estimated ${needed} bytes; ${available} bytes available` })
 }
