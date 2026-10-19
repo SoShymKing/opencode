@@ -45,7 +45,7 @@ export async function ensure(options: EnsureOptions = {}): Promise<Endpoint> {
     const current = await read(options.file)
     if (preparing(current) || (current !== undefined && (expected === undefined || !same(current, expected)))) return
     try {
-      return spawnServiceContender(command, args, env)
+      pool.add(spawnServiceContender(command, args, env))
     } catch (cause) {
       throw new Error("Failed to start server", { cause })
     }
@@ -95,6 +95,7 @@ export async function ensure(options: EnsureOptions = {}): Promise<Endpoint> {
         if (decision._tag === "fail") throw decision.error
         if (decision._tag === "reuse") {
           await PtyHandoff.complete(options.file ?? fallback(), service.info)
+          pool.adopt(service.info.pid)
           return service.endpoint
         }
         if (decision._tag === "replace") {
@@ -111,14 +112,13 @@ export async function ensure(options: EnsureOptions = {}): Promise<Endpoint> {
         if (failed !== undefined) throw failed
         if (pool.shouldRecruit(registration.info !== undefined)) {
           announce("missing")
-          const contender = await spawnContender(latest)
-          if (contender !== undefined) pool.add(contender)
+          await spawnContender(latest)
         }
       }
       await delay(timing.pollInterval)
     }
   } finally {
-    pool.releaseAll()
+    await pool.releaseAll()
   }
 }
 

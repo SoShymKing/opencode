@@ -77,7 +77,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
       const current = yield* read(options.file)
       if (preparing(current) || (current !== undefined && (expected === undefined || !same(current, expected)))) return
       return yield* Effect.try({
-        try: () => spawnServiceContender(command, args, env),
+        try: () => pool.add(spawnServiceContender(command, args, env)),
         catch: (cause) => new Error("Failed to start server", { cause }),
       })
     })
@@ -122,6 +122,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
       if (decision._tag === "fail") return yield* Effect.fail(decision.error)
       if (decision._tag === "reuse") {
         yield* Effect.tryPromise(() => PtyHandoff.complete(options.file ?? fallback(), service.info))
+        pool.adopt(service.info.pid)
         return Option.some(service)
       }
       if (decision._tag === "replace") {
@@ -141,8 +142,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
     if (failed !== undefined) return yield* Effect.fail(failed)
     if (pool.shouldRecruit(info !== undefined)) {
       yield* announce("missing")
-      const contender = yield* spawnContender(latest)
-      if (contender !== undefined) pool.add(contender)
+      yield* spawnContender(latest)
     }
     return Option.none()
   }).pipe(
@@ -150,7 +150,7 @@ export const ensure = Effect.fn("service.ensure")(function* (options: EnsureOpti
       until: Option.isSome,
       schedule: Schedule.spaced(timing.pollInterval),
     }),
-    Effect.ensuring(Effect.sync(() => pool.releaseAll())),
+    Effect.ensuring(Effect.promise(() => pool.releaseAll())),
   )
   if (Option.isNone(found))
     return yield* Effect.fail(pool.failure() ?? new Error("Timed out waiting for the background service to start"))

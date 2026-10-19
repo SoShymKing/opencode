@@ -60,6 +60,8 @@ export function spawnServiceContender(
  */
 export function contenderPool(timing: EnsureTiming) {
   const contenders = new Set<ServiceContender>()
+  const owned = new Set<ServiceContender>()
+  let cleanup: Promise<void> | undefined
   let failure: Error | undefined
   let spawnDelay = timing.spawnDelay
   let lastSpawn = 0
@@ -109,12 +111,40 @@ export function contenderPool(timing: EnsureTiming) {
     },
     add(contender: ServiceContender) {
       contenders.add(contender)
+      owned.add(contender)
       lastSpawn = Date.now()
     },
+    adopt(pid: number) {
+      for (const contender of owned) {
+        if (contender.child.pid !== pid) continue
+        contender.release()
+        owned.delete(contender)
+      }
+    },
     releaseAll() {
-      contenders.forEach((contender) => contender.release())
+      return cleanup ??= Promise.allSettled([...owned].map((contender) =>
+        stopContender(contender, timing).finally(() => contender.release()),
+      )).then((results) => {
+        owned.clear()
+        const failures = results.filter((result) => result.status === "rejected")
+        if (failures.length) throw new AggregateError(failures.map((result) => result.reason), "Failed to stop startup children")
+      })
     },
   }
+}
+
+async function stopContender(contender: ServiceContender, timing: EnsureTiming) {
+  const child = contender.child
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal)
+    for (let attempt = 0; attempt <= timing.stopPollAttempts; attempt++) {
+      if (child.exitCode !== null || child.signalCode !== null) return
+      if (attempt < timing.stopPollAttempts)
+        await new Promise<void>((resolve) => setTimeout(resolve, timing.stopPollInterval))
+    }
+  }
+  throw new Error(`Server process ${child.pid} is still running`)
 }
 
 function contenderFailure(contender: ServiceContender) {

@@ -139,7 +139,7 @@ test("reports overlapping contender failures without recruiting replacements", a
   expect(await fixture.starts()).toHaveLength(2)
 })
 
-test("retains a contender failure until the deadline while its survivor stalls", async () => {
+test("retains a contender failure until the deadline and stops its stalled survivor", async () => {
   await using fixture = await serviceFixture()
   const started = Date.now()
   const pending = ensure({ file: fixture.registration, version: "test", command: fixture.command("controlled") }).catch(
@@ -155,7 +155,7 @@ test("retains a contender failure until the deadline while its survivor stalls",
   expect(error.message).toContain("Server process exited with code 23")
   expect(error.message).toContain("storage initialization denied")
   expect(await fixture.starts()).toHaveLength(2)
-  expect(() => process.kill(second, 0)).not.toThrow()
+  expect(() => process.kill(second, 0)).toThrow()
 })
 
 test("accepts a surviving contender after a failure without recruiting replacements", async () => {
