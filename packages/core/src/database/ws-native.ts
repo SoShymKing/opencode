@@ -238,13 +238,16 @@ export function restoreSessions(db: Database, archive: DatabaseWsArchive.Archive
     })))
     yield* db.run(sql`INSERT INTO event_sequence (aggregate_id, seq, owner_id)
       SELECT s.id, coalesce(max(m.seq), -1), NULL FROM session_v2 s LEFT JOIN session_message m ON m.session_id = s.id
-      WHERE ${selected("s.id")} AND NOT EXISTS (SELECT 1 FROM event_sequence e WHERE e.aggregate_id = s.id) GROUP BY s.id`)
+      WHERE ${selected("s.id")} GROUP BY s.id
+      ON CONFLICT (aggregate_id) DO UPDATE SET seq = max(event_sequence.seq, excluded.seq)`)
     const rich = yield* WsNativeSource.read(db, archive, previousNative, {
       epoch: (epoch) => Effect.gen(function* () {
         if (!owns(epoch.sessionID)) return
         yield* db.run(sql`INSERT INTO instruction_state
       (session_id, epoch_start, through_seq, frozen_baseline, initial_values, current_values, imported_removals)
-      VALUES (${epoch.sessionID}, ${epoch.baselineSeq}, ${epoch.throughSeq}, ${epoch.baseline}, '{}',
+      VALUES (${epoch.sessionID}, ${epoch.baselineSeq},
+        (SELECT coalesce(r.through_seq, e.seq) FROM event_sequence e LEFT JOIN _ws_import_root r ON r.aggregate_id = e.aggregate_id WHERE e.aggregate_id = ${epoch.sessionID}),
+        ${epoch.baseline}, '{}',
         ${JSON.stringify(Object.fromEntries(Object.entries(epoch.snapshot).map(([key, entry]) => [key, Instructions.hash(entry.value)])))},
          ${JSON.stringify(Object.fromEntries(Object.entries(epoch.snapshot).flatMap(([key, entry]) => entry.removed === undefined ? [] : [[key, entry.removed]])))})`)
       }),
