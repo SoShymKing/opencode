@@ -12,7 +12,7 @@ import { setupWs, setupPreviousNative, messageData, richMessageData, nativeMessa
 import { WsNativeBatch } from "@opencode/core/database/ws-native-batch"
 import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
 import { open, openWith, openWorker } from "@opencode/core/database/ws-native-bun"
-import { choose, headroom, reserve, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
+import { choose, estimate, headroom, plan, reserve, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
 import { WsNativeMessage } from "@opencode/core/database/ws-native-message"
 import { tempGlobalLayer } from "./fixture/global"
 import type { Worker } from "node:worker_threads"
@@ -37,6 +37,20 @@ test("resource selection uses all feasible CPUs and accounts for active reservat
   expect(choose({ cpu: 8, freeBytes: 4 * 1024 ** 3 }, weights, { cpu: 5, bytes: 0 }).workers).toBe(3)
   expect(choose({ cpu: 8, freeBytes: 100 }, [100]).count).toBe(0)
   expect(choose({ cpu: 8, freeBytes: 1000 }, [100, 200, 400]).count).toBe(2)
+})
+
+test("wave planning uses CPU and memory headroom without reserving a second time", () => {
+  const snapshot = { cpu: 20, freeBytes: 4 * 1024 ** 3 }
+  const size = estimate(27500)
+  expect(plan(snapshot, size * 38, 38)).toMatchObject({ workers: 20, ready: false })
+  const count = Math.ceil(20 * 2 * 1024 ** 2 / size)
+  expect(plan(snapshot, size * count, count)).toMatchObject({ workers: 20, ready: true })
+  expect(choose(snapshot, Array(count).fill(size)).workers).toBe(20)
+  expect(plan({ cpu: 64, freeBytes: 16 * 1024 ** 3 }, 0, 0).workers).toBe(64)
+  expect(plan(snapshot, 0, 0, { cpu: 18, bytes: 0 }).workers).toBe(2)
+  expect(plan({ cpu: 1, freeBytes: snapshot.freeBytes }, 0, 0)).toMatchObject({ workers: 0, ready: true })
+  expect(plan({ cpu: 20, freeBytes: 4 * workerBytes }, workerBytes, 1)).toMatchObject({ workers: 1, ready: true })
+  expect(plan({ cpu: 20, freeBytes: 4 * workerBytes }, 2 * workerBytes, 1)).toMatchObject({ workers: 0, ready: true })
 })
 
 test("scoped scheduler starts lazily, uses three real threads and reuses them in order", () => Effect.runPromise(Effect.gen(function* () {
@@ -65,7 +79,7 @@ test("scan refuses an oversized singleton before reading its payload", () => Eff
     reads.push(result.getQuery().sql)
     return result
   } }
-  const result = yield* WsNativeScan.rows(reader, { table: "source", bytes: sql`octet_length(m.data)` },
+  const result = yield* WsNativeScan.rows(reader, { table: "source", bytes: sql`octet_length(m.data)`, workers: true },
     () => Effect.void).pipe(Effect.result)
   expect(result._tag).toBe("Failure")
   if (result._tag === "Failure") expect(result.failure).toMatchObject({ messageID: "oversized" })
@@ -78,14 +92,28 @@ test("late memory pressure rolls back prior scan writes without reading another 
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* db.run("CREATE TABLE source (id TEXT PRIMARY KEY, data TEXT)")
   yield* db.run("CREATE TABLE target (id TEXT)")
-  for (let index = 0; index < 129; index++) yield* db.run(sql`INSERT INTO source VALUES (${String(index).padStart(3, "0")}, 'payload')`)
-  let freeBytes = 1024 ** 3
-  const result = yield* db.transaction((tx) => WsNativeScan.rows(tx, { table: "source", bytes: sql`octet_length(m.data)` },
+  for (let index = 0; index < 220; index++) yield* db.run(sql`INSERT INTO source VALUES (${String(index).padStart(3, "0")}, ${"x".repeat(27500)})`)
+  let freeBytes = 4 * 1024 ** 3
+  let writes = 0
+  let payloads = 0
+  const result = yield* db.transaction((tx) => WsNativeScan.rows({ all: <T>(query: Parameters<typeof tx.all>[0]) => {
+    const result = tx.all<T>(query)
+    if (!result.getQuery().sql.includes("AS bytes")) {
+      expect(writes).toBe(0)
+      payloads++
+    }
+    return result
+  } }, { table: "source", bytes: sql`octet_length(m.data)`, workers: true },
     (rows: readonly { id: string }[]) => Effect.gen(function* () {
-      for (const row of rows) yield* tx.run(sql`INSERT INTO target VALUES (${row.id})`)
+      for (const row of rows) {
+        yield* tx.run(sql`INSERT INTO target VALUES (${row.id})`)
+        writes++
+      }
       freeBytes = 100
-    }))).pipe(Effect.provideService(Resources, () => ({ cpu: 3, freeBytes })), Effect.result)
+    }))).pipe(Effect.provideService(Resources, () => ({ cpu: 20, freeBytes })), Effect.result)
   expect(result._tag).toBe("Failure")
+  expect(payloads).toBeGreaterThan(1)
+  expect(writes).toBeGreaterThan(128)
   expect(yield* db.get("SELECT count(*) AS count FROM target")).toEqual({ count: 0 })
 }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
@@ -342,8 +370,13 @@ test("worker normalization keeps caller transaction atomic on later-wave failure
   yield* db.run("CREATE TABLE session_message_part (message_id TEXT, position INTEGER, id TEXT, type TEXT, data TEXT)")
   for (let index = 0; index < 130; index++) yield* db.run(sql`INSERT INTO session_message VALUES
     (${`msg_${String(index).padStart(3, "0")}`}, 'ses_migration', 'assistant', ${index === 129 ? '{}' : nativeMessageData})`)
-  const result = yield* db.transaction((tx) => normalizeMessages(tx)).pipe(Effect.result)
+  let writes = 0
+  const result = yield* db.transaction((tx) => normalizeMessages({ all: tx.all.bind(tx), run: (query) => {
+    writes++
+    return tx.run(query)
+  } })).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 2 * 128 * estimate(Buffer.byteLength(nativeMessageData)) })), Effect.result)
   expect(result._tag).toBe("Failure")
+  expect(writes).toBeGreaterThan(0)
   expect(yield* db.get("SELECT count(*) AS count FROM session_message_part")).toEqual({ count: 0 })
   expect(yield* db.get("SELECT data FROM session_message WHERE id = 'msg_000'")).toEqual({ data: nativeMessageData })
 }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
@@ -446,7 +479,8 @@ test("scan waits for consumption before reading another wave and preserves tied 
   yield* Fiber.join(fiber)
   expect(order).toEqual([...Array.from({ length: 260 }, (_, index) => `msg_bulk_${String(index).padStart(3, "0")}`), "msg_migration"])
   expect(pages.length).toBe(4)
-}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 for (const previousNative of [false, true]) test(`large ${previousNative ? "previous-native" : "WS"} conversion preserves storage and rolls back invalid input`, () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
@@ -523,10 +557,10 @@ test("child payload budget admits an oversized message alone", () => Effect.runP
   yield* db.run("INSERT INTO session_message SELECT 'msg_next', session_id, type, 8, time_created, time_updated, data FROM session_message")
   const reads: string[] = []
   const reader = {
-    all: db.all.bind(db),
-    get: <T>(query: Parameters<typeof db.get>[0]) => {
-      const result = db.get<T>(query)
-      reads.push(result.getQuery().sql)
+    get: db.get.bind(db),
+    all: <T>(query: Parameters<typeof db.all>[0]) => {
+      const result = db.all<T>(query)
+      if (result.getQuery().sql.includes("SELECT id, session_id")) reads.push(result.getQuery().sql)
       return result
     },
   }
@@ -537,7 +571,8 @@ test("child payload budget admits an oversized message alone", () => Effect.runP
       expect(reads.length).toBe(consumed.length)
     }))
   expect(consumed).toEqual(["msg_migration", "msg_next"])
-}).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 1, freeBytes: 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 test("selected restore still rejects invalid unselected archived messages", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()

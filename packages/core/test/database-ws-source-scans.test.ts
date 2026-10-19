@@ -5,6 +5,8 @@ import { sql } from "drizzle-orm"
 import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { WsNativeSource } from "@opencode/core/database/ws-native-source"
 import { WsNativePrevious } from "@opencode/core/database/ws-native-previous"
+import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
+import { choose, estimate, Resources } from "@opencode/core/database/ws-native-serial"
 import { setupWs, setupPreviousNative, instructionInitialHash, instructionCurrentHash } from "./fixture/database-ws"
 
 for (const previous of [false, true]) test(`${previous ? "P" : "WS"} event validation bounds real database reads`, () => Effect.runPromise(Effect.gen(function* () {
@@ -42,6 +44,97 @@ for (const previous of [false, true]) test(`${previous ? "P" : "WS"} event valid
 }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 class VisitorValue extends Context.Service<VisitorValue, { readonly value: string }>()("SourceScanVisitorValue") {}
+
+test("worker row waves span bounded SQL pages and feed twenty CPUs", () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE source (id TEXT PRIMARY KEY, time_created INTEGER, data TEXT)")
+  for (let index = 0; index < 220; index++) yield* db.run(sql`INSERT INTO source VALUES
+    (${String(index).padStart(3, "0")}, ${Math.floor(index / 3)}, ${"x".repeat(27500)})`)
+  let reads = 0
+  const reader = { all: <T>(query: Parameters<typeof db.all>[0]) => {
+    const result = db.all<T>(query)
+    const execute = result.execute
+    result.execute = () => execute().pipe(Effect.tap((rows) => Effect.sync(() => {
+      expect(rows.length).toBeLessThanOrEqual(128)
+      const bytes = rows.reduce((sum, row) => sum + (typeof row === "object" && row !== null && "data" in row && typeof row.data === "string"
+        ? Buffer.byteLength(row.data) : 0), 0)
+      expect(bytes).toBeLessThanOrEqual(1024 * 1024)
+      reads++
+    })))
+    return result
+  } }
+  const seen: string[] = []
+  let waves = 0
+  yield* WsNativeScan.rows(reader, { table: "source", key: { first: "time_created", then: "id" }, bytes: sql`octet_length(m.data)`, workers: true },
+    (rows: readonly { id: string; data: string }[]) => Effect.sync(() => {
+      if (!waves++) {
+        expect(choose({ cpu: 20, freeBytes: 4 * 1024 ** 3 }, rows.map((row) => estimate(Buffer.byteLength(row.data)))).workers).toBe(20)
+        expect(reads).toBeGreaterThan(4)
+      }
+      seen.push(...rows.map((row) => row.id))
+    }))
+  expect(seen).toEqual(Array.from({ length: 220 }, (_, index) => String(index).padStart(3, "0")))
+  expect(waves).toBe(2)
+}).pipe(Effect.provideService(Resources, () => ({ cpu: 20, freeBytes: 4 * 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
+
+for (const cpu of [1, 20]) test(`consume on ${cpu} CPUs batches bounded parent/child reads before awaited writes`, () => Effect.runPromise(Effect.gen(function* () {
+  const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+  yield* db.run("CREATE TABLE source (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+  yield* db.run("CREATE TABLE children (message_id TEXT, position INTEGER, id TEXT, type TEXT, data TEXT)")
+  for (let index = 0; index < 260; index++) {
+    const id = `msg_${String(index).padStart(3, "0")}`
+    yield* db.run(sql`INSERT INTO source VALUES (${id}, 'ses_migration', 'assistant', 7, 1, 1,
+      ${JSON.stringify({ agent: "build", model: { providerID: "test", id: "model" }, time: { created: 1 }, metadata: { padding: "x".repeat(27500) } })})`)
+    if (index % 2) continue
+    yield* db.run(sql`INSERT INTO children VALUES (${id}, 1, 'second', 'text', '{"text":"second"}'), (${id}, 0, 'first', 'text', '{ "text":"first\\u0020text" }')`)
+  }
+  let payloads = 0
+  const weights = new Map<string, number>()
+  const reader = { get: db.get.bind(db), all: <T>(query: Parameters<typeof db.all>[0]) => {
+    const result = db.all<T>(query)
+    const parent = result.getQuery().sql.includes("SELECT id, session_id")
+    if (!result.getQuery().sql.includes("AS bytes")) {
+      payloads++
+      const execute = result.execute
+      result.execute = () => execute().pipe(Effect.tap((rows) => Effect.sync(() => {
+        expect(rows.length).toBeLessThanOrEqual(128)
+        let bytes = 0
+        for (const row of rows) {
+          if (typeof row !== "object" || row === null || !("data" in row) || typeof row.data !== "string") continue
+          bytes += Buffer.byteLength(row.data)
+          if (parent && "id" in row && typeof row.id === "string") weights.set(row.id, estimate(Buffer.byteLength(row.data)))
+          if (!parent && "message_id" in row && typeof row.message_id === "string")
+            weights.set(row.message_id, (weights.get(row.message_id) ?? 0) + estimate(Buffer.byteLength(row.data)))
+        }
+        expect(bytes).toBeLessThanOrEqual(1024 * 1024)
+      })))
+    }
+    return result
+  } }
+  const seen: string[] = []
+  const entered = yield* Deferred.make<void>()
+  const release = yield* Deferred.make<void>()
+  const fiber = yield* WsNativeScan.consume(reader, { parent: "source", child: "children", previousNative: false, store: () => true }, (row, output) => Effect.gen(function* () {
+    expect((yield* VisitorValue).value).toBe("context")
+    seen.push(row.id)
+    expect(output?.parts.map((part) => part.data)).toEqual(Number(row.id.slice(4)) % 2 ? [] : ['{ "text":"first\\u0020text" }', '{"text":"second"}'])
+    if (seen.length !== 1) return
+    if (cpu === 20) expect(choose({ cpu, freeBytes: 4 * 1024 ** 3 }, [...weights.values()]).workers).toBe(20)
+    yield* Deferred.succeed(entered, undefined)
+    yield* Deferred.await(release)
+  })).pipe(Effect.provideService(VisitorValue, { value: "context" }), Effect.forkChild)
+  yield* Deferred.await(entered)
+  const before = payloads
+  yield* Effect.yieldNow
+  expect(payloads).toBe(before)
+  expect(seen.length).toBe(1)
+  yield* Deferred.succeed(release, undefined)
+  yield* Fiber.join(fiber)
+  expect(seen).toEqual(Array.from({ length: 260 }, (_, index) => `msg_${String(index).padStart(3, "0")}`))
+  expect(payloads).toBe(16)
+}).pipe(Effect.provideService(Resources, () => ({ cpu, freeBytes: 4 * 1024 ** 3 })),
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })), Effect.scoped)))
 
 test("source visitors await consumption and preserve caller context", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
