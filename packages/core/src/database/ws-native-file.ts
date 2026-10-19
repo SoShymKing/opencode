@@ -1,8 +1,8 @@
 export * as WsNativeFile from "./ws-native-file"
 
-import { randomUUID } from "node:crypto"
 import { basename, dirname, join } from "node:path"
 import { Effect } from "effect"
+import { withPool } from "#ws-native-worker"
 import { sql } from "drizzle-orm"
 import type { EffectDrizzleSqlite } from "./drizzle"
 import { DatabaseArtifact } from "./artifact"
@@ -11,6 +11,7 @@ import { DatabaseLegacyV01 } from "./legacy-v01"
 import { DatabaseLineage } from "./lineage"
 import { DatabaseMigration } from "./migration"
 import { DatabaseReplacement } from "./replacement"
+import { WsNativeStage } from "./ws-native-stage"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 const nativeIDs = [...DatabaseMigration.currentMigrationIDs]
@@ -35,7 +36,7 @@ export function admit(target: string, begin: Effect.Effect<void> = Effect.void) 
         const native = yield* DatabaseMigration.preflight(db)
         if ((native.tables.has("session") || native.tables.has("session_v2")) &&
           nativeIDs.some((id) => !native.completed.has(id))) yield* begin
-        return false
+        return yield* DatabaseArtifact.exists(`${target}.ws-stage.json`)
       }))
     }).pipe(Effect.scoped)
     if (!needed) return
@@ -46,9 +47,10 @@ export function admit(target: string, begin: Effect.Effect<void> = Effect.void) 
         if (marker.version === 1) return yield* promote(target, marker)
       } else {
         const state = yield* DatabaseLegacyV01.useDatabase(target, true, (db) => DatabaseLineage.inspect(db, nativeIDs))
-        if (!state.ws && !state.previousNative) return
+        if (!state.ws && !state.previousNative) return yield* WsNativeStage.retire(target)
         const before = yield* evidence(target)
-        const staged = yield* convertFile(target)
+        const staged = yield* WsNativeStage.prepare(target, target)
+        yield* WsNativeStage.handoff(target)
         const targetPreimage = yield* preimage(target, before)
         const marker = {
           format: "opencode.database.replacement", version: 2, stageFormat: "native", phase: "prepared",
@@ -56,9 +58,9 @@ export function admit(target: string, begin: Effect.Effect<void> = Effect.void) 
         } satisfies DatabaseLegacyV01.PendingReplacement
         yield* DatabaseArtifact.write(`${target}.replacement.json`, `${JSON.stringify(marker)}\n`)
       }
-      yield* DatabaseReplacement.activateLocked(target)
+      yield* WsNativeStage.activateAndRetire(target)
     }).pipe(Effect.scoped)
-  })
+  }).pipe(withPool)
 }
 
 function promote(target: string, marker: Extract<DatabaseLegacyV01.PendingReplacement, { readonly version: 1 }>) {
@@ -83,12 +85,13 @@ function promote(target: string, marker: Extract<DatabaseLegacyV01.PendingReplac
       yield* validateSourceFile(backup)
       if (exists) yield* requireSameSource(target, backup)
     }
-    const staged = yield* convertFile(source)
+    const staged = yield* WsNativeStage.prepare(source, target)
     yield* DatabaseReplacement.validate(source, marker.staged)
+    yield* WsNativeStage.handoff(target)
     const targetPreimage = yield* preimage(target, before)
     const next = { ...marker, version: 2, stageFormat: "native", staged, targetPreimage } satisfies DatabaseLegacyV01.PendingReplacement
     yield* DatabaseArtifact.replaceWithText(`${target}.replacement.json`, `${JSON.stringify(next)}\n`)
-    yield* DatabaseReplacement.activateLocked(target)
+    yield* WsNativeStage.activateAndRetire(target)
     const retained = [basename(target), ...(marker.phase === "backup_ready" && marker.backup ? [marker.backup.name] : [])]
     if (exists && !retained.some((name) => process.platform === "win32"
       ? name.toLowerCase() === marker.staged.name.toLowerCase()
@@ -97,25 +100,6 @@ function promote(target: string, marker: Extract<DatabaseLegacyV01.PendingReplac
       yield* DatabaseReplacement.requireNoSidecars(oldStage)
       yield* DatabaseArtifact.remove(oldStage)
     }
-  })
-}
-
-function convertFile(source: string) {
-  const staged = `${source}.native-${randomUUID()}.db`
-  return Effect.gen(function* () {
-    const { WsNative } = yield* Effect.promise(() => import("./ws-native"))
-    yield* DatabaseLegacyV01.useDatabase(source, true, (db) => Effect.gen(function* () {
-      yield* WsNative.validateSource(db)
-      yield* DatabaseArtifact.snapshot(db, staged)
-    }))
-    yield* DatabaseLegacyV01.useDatabase(staged, false, (db) => Effect.gen(function* () {
-      yield* WsNative.convert(db)
-      yield* WsNative.validate(db)
-      yield* checkpoint(db)
-    }))
-    yield* DatabaseReplacement.requireNoSidecars(staged)
-    yield* DatabaseArtifact.syncFile(staged)
-    return { name: basename(staged), ...(yield* DatabaseArtifact.digest(staged)) }
   })
 }
 
@@ -151,32 +135,72 @@ function evidence(target: string) {
   })
 }
 
-function requireSameSource(target: string, backup: string) {
+export function requireSameSource(target: string, backup: string) {
   return DatabaseLegacyV01.useDatabase(target, true, (db) => Effect.gen(function* () {
     yield* db.run(sql`ATTACH DATABASE ${backup} AS replacement_backup`)
-    yield* db.transaction((tx) => Effect.gen(function* () {
-      const schema = sql`SELECT type, name, tbl_name, sql FROM main.sqlite_schema`
-      const prior = sql`SELECT type, name, tbl_name, sql FROM replacement_backup.sqlite_schema`
-      const changed = () => Effect.fail(new DatabaseLegacyV01.DatabaseLegacyV01Error("replacement target differs from its backup"))
-      if ((yield* tx.all(sql`${schema} EXCEPT ${prior}`)).length || (yield* tx.all(sql`${prior} EXCEPT ${schema}`)).length)
-        return yield* changed()
-      for (const pragma of ["user_version", "application_id"]) {
-        if (JSON.stringify(yield* tx.all(sql.raw(`PRAGMA main.${pragma}`))) !==
-          JSON.stringify(yield* tx.all(sql.raw(`PRAGMA replacement_backup.${pragma}`)))) return yield* changed()
-      }
-      for (const table of yield* tx.all<{ name: string }>(sql`SELECT name FROM main.sqlite_schema WHERE type = 'table'`)) {
-        const columns = yield* tx.all<{ name: string }>(sql`SELECT name FROM pragma_table_info(${table.name})`)
-        const fields = sql.join(columns.flatMap((column) => {
-          const name = sql.identifier(column.name)
-          return [sql`typeof(${name})`, sql`CASE WHEN typeof(${name}) IN ('text', 'blob') THEN hex(${name}) ELSE quote(${name}) END`]
-        }), sql`, `)
-        const current = sql`SELECT ${fields}, count(*) FROM main.${sql.identifier(table.name)} GROUP BY ${fields}`
-        const previous = sql`SELECT ${fields}, count(*) FROM replacement_backup.${sql.identifier(table.name)} GROUP BY ${fields}`
-        if ((yield* tx.all(sql`${current} EXCEPT ${previous}`)).length || (yield* tx.all(sql`${previous} EXCEPT ${current}`)).length)
-          return yield* changed()
-      }
-    }))
+    yield* db.transaction(requireSameSnapshot, { behavior: "deferred" })
   }))
+}
+
+export function requireSameSnapshot(tx: Database) {
+  return Effect.gen(function* () {
+    yield* tx.get("SELECT name FROM main.sqlite_schema LIMIT 1")
+    const schema = sql`SELECT type, name, tbl_name, sql FROM main.sqlite_schema`
+    const prior = sql`SELECT type, name, tbl_name, sql FROM replacement_backup.sqlite_schema`
+    const changed = () => Effect.fail(new DatabaseLegacyV01.DatabaseLegacyV01Error("replacement target differs from its backup"))
+    if ((yield* tx.get(sql`SELECT 1 FROM (${schema} EXCEPT ${prior}) LIMIT 1`)) || (yield* tx.get(sql`SELECT 1 FROM (${prior} EXCEPT ${schema}) LIMIT 1`)))
+      return yield* changed()
+    for (const pragma of ["user_version", "application_id"]) {
+      if (JSON.stringify(yield* tx.all(sql.raw(`PRAGMA main.${pragma}`))) !==
+        JSON.stringify(yield* tx.all(sql.raw(`PRAGMA replacement_backup.${pragma}`)))) return yield* changed()
+    }
+    for (const table of yield* tx.all<{ name: string }>(sql`SELECT name FROM main.sqlite_schema WHERE type = 'table'`)) {
+      const current = sql`main.${sql.identifier(table.name)}`
+      const previous = sql`replacement_backup.${sql.identifier(table.name)}`
+      const count = yield* tx.get<{ equal: number }>(sql`SELECT (SELECT count(*) FROM ${current}) = (SELECT count(*) FROM ${previous}) AS equal`)
+      if (!count?.equal) return yield* changed()
+      const columns = yield* tx.all<{ name: string; pk: number; notnull: number }>(sql`SELECT name, pk, "notnull" FROM pragma_table_xinfo(${table.name}, 'main')`)
+      const layout = yield* tx.get<{ wr: number }>(sql`SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = ${table.name}`)
+      const rowid = layout?.wr === 0 ? ["rowid", "_rowid_", "oid"].find((name) => !columns.some((column) => column.name.toLowerCase() === name)) : undefined
+      const primary = columns.filter((column) => column.pk).sort((left, right) => left.pk - right.pk)
+      const nullable = !rowid && primary.some((column) => !column.notnull) && Boolean(
+        (yield* tx.get(sql`SELECT 1 FROM ${current} WHERE ${sql.join(primary.map((column) => sql`${sql.identifier(column.name)} IS NULL`), sql` OR `)} LIMIT 1`)) ||
+        (yield* tx.get(sql`SELECT 1 FROM ${previous} WHERE ${sql.join(primary.map((column) => sql`${sql.identifier(column.name)} IS NULL`), sql` OR `)} LIMIT 1`)))
+      const keys = rowid ? [rowid] : nullable ? [] : primary.map((column) => column.name)
+      if (keys.length) {
+        const join = sql.join(keys.map((key) => sql`snapshot.${sql.identifier(key)} = source.${sql.identifier(key)}`), sql` AND `)
+        const difference = sql.join(columns.map((column) => {
+          const source = sql`source.${sql.identifier(column.name)}`
+          const snapshot = sql`snapshot.${sql.identifier(column.name)}`
+          return sql`(typeof(${source}) <> typeof(${snapshot}) OR CASE WHEN typeof(${source}) IN ('text', 'blob')
+            THEN CAST(${source} AS BLOB) IS NOT CAST(${snapshot} AS BLOB) ELSE quote(${source}) COLLATE BINARY IS NOT quote(${snapshot}) END)`
+        }), sql` OR `)
+        if (yield* tx.get(sql`SELECT 1 FROM ${current} AS source LEFT JOIN ${previous} AS snapshot ON ${join}
+          WHERE snapshot.${sql.identifier(keys[0])} IS NULL OR ${difference} LIMIT 1`)) return yield* changed()
+        continue
+      }
+      const fields = sql.join(columns.flatMap((column) => {
+        const name = sql.identifier(column.name)
+        return [sql`typeof(${name})`, sql`CASE WHEN typeof(${name}) IN ('text', 'blob') THEN CAST(${name} AS BLOB) ELSE quote(${name}) END`]
+      }), sql`, `)
+      const source = sql`SELECT ${fields}, count(*) FROM ${current} GROUP BY ${fields}`
+      const snapshot = sql`SELECT ${fields}, count(*) FROM ${previous} GROUP BY ${fields}`
+      if ((yield* tx.get(sql`SELECT 1 FROM (${source} EXCEPT ${snapshot}) LIMIT 1`)) || (yield* tx.get(sql`SELECT 1 FROM (${snapshot} EXCEPT ${source}) LIMIT 1`))) return yield* changed()
+    }
+  })
+}
+
+export function requireStagedSource(target: string) {
+  return Effect.gen(function* () {
+    if (!(yield* DatabaseArtifact.exists(`${target}.ws-stage.json`))) return
+    const marker = yield* WsNativeStage.read(target)
+    if (process.platform === "win32" ? marker.source.name.toLowerCase() !== basename(target).toLowerCase() : marker.source.name !== basename(target)) return
+    if (!(yield* DatabaseArtifact.exists(join(dirname(target), marker.work)))) return
+    const snapshot = join(dirname(target), marker.snapshot.name)
+    yield* DatabaseReplacement.validate(snapshot, marker.snapshot)
+    yield* DatabaseReplacement.requireNoSidecars(snapshot)
+    yield* requireSameSource(target, snapshot)
+  })
 }
 
 export function snapshotSource(source: string, destination: string) {

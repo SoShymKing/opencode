@@ -15,6 +15,165 @@ import { tmpdir } from "./fixture/tmpdir"
 import { tempGlobalLayer } from "./fixture/global"
 import { setupWs, setupPreviousNative, sessionID } from "./fixture/database-ws"
 import path from "node:path"
+import { readdir } from "node:fs/promises"
+import { WsNativeStage } from "../src/database/ws-native-stage"
+
+test("clean lookup pins main and keeps target queries outside the source transaction context", async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const source = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* source.run("PRAGMA journal_mode = WAL")
+    yield* setupWs(source, { directory: temp.path })
+    yield* source.run("PRAGMA wal_checkpoint(TRUNCATE)")
+    const before = yield* DatabaseArtifact.digest(filename)
+    yield* Effect.gen(function* () {
+      const target = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* DatabaseMigration.apply(target)
+      yield* target.run("INSERT INTO kv VALUES ('guard-target', 'target-only', 1, 1)")
+      const result = yield* target.transaction((tx) => WsNativeStage.cleanRead(filename, () => Effect.gen(function* () {
+        expect(yield* tx.get("SELECT value FROM kv WHERE key = 'guard-target'")).toEqual({ value: "target-only" })
+        const contextual = yield* EffectDrizzleSqlite.makeWithDefaults()
+        expect(yield* contextual.get("SELECT value FROM kv WHERE key = 'guard-target'")).toEqual({ value: "target-only" })
+        yield* source.run("UPDATE session SET title = 'appended during lookup'")
+        const checkpoint = yield* source.get<{ checkpointed: number; log: number }>("PRAGMA wal_checkpoint(PASSIVE)")
+        expect(checkpoint?.log).toBeGreaterThan(0)
+        expect(checkpoint?.checkpointed).toBe(0)
+        expect(yield* DatabaseArtifact.digest(filename)).toEqual(before)
+        return true
+      })))
+      expect(result).toBeUndefined()
+    }).pipe(Effect.provide(sqliteLayer({ filename: ":memory:" })), Effect.scoped)
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.provide(tempGlobalLayer), Effect.scoped))
+})
+
+for (const when of ["before", "during"]) test(`rollback journal ${when} lookup disables raw identity eligibility`, async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* setupWs(db, { directory: temp.path })
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.scoped))
+  if (when === "before") await DatabaseArtifact.write(`${filename}-journal`, "").pipe(Effect.runPromise)
+  let lookups = 0
+  const result = await WsNativeStage.cleanRead(filename, () => Effect.gen(function* () {
+    lookups++
+    yield* DatabaseArtifact.write(`${filename}-journal`, "")
+    return true
+  })).pipe(Effect.runPromise)
+  expect(result).toBeUndefined()
+  expect(lookups).toBe(when === "before" ? 0 : 1)
+})
+
+test("closed WAL-mode source with no frames keeps the completed fast path", async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* setupWs(db, { directory: temp.path })
+    yield* db.run("PRAGMA journal_mode = WAL")
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.scoped))
+  let preparations = 0
+  const run = () => Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* DatabaseMigration.apply(db)
+    expect(yield* WsNativeProfile.run(db, filename, Effect.sync(() => { preparations++ }))).toBe(true)
+    expect(yield* db.get("SELECT count(*) AS count FROM _ws_archive")).toEqual({ count: 1 })
+  }).pipe(Effect.provide(sqliteLayer({ filename: path.join(temp.path, "target.db") })), Effect.provide(tempGlobalLayer), Effect.scoped))
+  await run()
+  await run()
+  expect(preparations).toBe(1)
+})
+
+for (const persistent of [false, true]) test(`nonempty WAL uses canonical completion without raw identity for persistent=${persistent}`, async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const source = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* source.run("PRAGMA journal_mode = WAL")
+    yield* setupWs(source, { directory: temp.path })
+    const before = yield* WsNativeStage.identity(filename)
+    expect(before.evidence.wal).not.toBeNull()
+    yield* Effect.gen(function* () {
+      const target = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* DatabaseMigration.apply(target)
+      let preparations = 0
+      const begin = Effect.sync(() => { preparations++ })
+      expect(yield* WsNativeProfile.run(target, filename, begin)).toBe(true)
+      expect(yield* target.get("SELECT json_extract(value, '$.sourceIdentity') AS identity FROM kv WHERE key LIKE 'migration.ws-profile.%' ")).toEqual({ identity: null })
+      yield* target.run(sql`UPDATE kv SET value = json_set(value, '$.sourceIdentity', ${before.fingerprint}) WHERE key LIKE 'migration.ws-profile.%'`)
+      expect(yield* WsNativeProfile.run(target, filename, begin)).toBe(true)
+      expect(preparations).toBe(2)
+      expect(yield* target.get("SELECT count(*) AS count FROM _ws_archive")).toEqual({ count: 1 })
+      expect(yield* target.get("SELECT json_extract(value, '$.sourceIdentity') AS identity FROM kv WHERE key LIKE 'migration.ws-profile.%' ")).toEqual({ identity: null })
+    }).pipe(Effect.provide(sqliteLayer({ filename: persistent ? path.join(temp.path, "target.db") : ":memory:" })), Effect.scoped)
+    expect(yield* WsNativeStage.identity(filename)).toEqual(before)
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.provide(tempGlobalLayer), Effect.scoped))
+})
+
+test("persistent profile retry retains committed work after late native-encode rejection", async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  const target = path.join(temp.path, "target.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* setupWs(db, { directory: temp.path, rich: true })
+    yield* db.run("UPDATE message SET time_created = 'synthetic-not-a-clock' WHERE id = 'msg_legacy'")
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.scoped))
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* DatabaseMigration.apply(db)
+  }).pipe(Effect.provide(sqliteLayer({ filename: target })), Effect.provide(tempGlobalLayer), Effect.scoped))
+  const sourceBefore = await DatabaseArtifact.digest(filename).pipe(Effect.runPromise)
+  const targetBefore = await DatabaseArtifact.digest(target).pipe(Effect.runPromise)
+  await DatabaseArtifact.write(`${target}.ws-stage.json`, "unrelated file upgrade progress").pipe(Effect.runPromise)
+  const run = () => Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* WsNativeProfile.run(db, filename)
+  }).pipe(Effect.provide(sqliteLayer({ filename: target })), Effect.provide(tempGlobalLayer), Effect.scoped))
+  await expect(run()).rejects.toThrow("native-encode")
+  const markers = (await readdir(temp.path)).filter((name) => name.endsWith(".ws-stage.json") && name !== "target.db.ws-stage.json")
+  expect(markers).toHaveLength(1)
+  const owner = path.join(temp.path, markers[0].slice(0, -".ws-stage.json".length))
+  const marker = await WsNativeStage.read(owner).pipe(Effect.runPromise)
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    expect(yield* db.get("SELECT count(*) AS count FROM session_message")).toEqual({ count: 5 })
+    yield* db.run("CREATE TRIGGER refuse_replay BEFORE INSERT ON session_message BEGIN SELECT RAISE(ABORT, 'replayed prefix'); END")
+  }).pipe(Effect.provide(sqliteLayer({ filename: path.join(temp.path, marker.work) })), Effect.scoped))
+  await expect(run()).rejects.toThrow("native-encode")
+  expect(await WsNativeStage.read(owner).pipe(Effect.runPromise)).toEqual(marker)
+  expect(await DatabaseArtifact.digest(filename).pipe(Effect.runPromise)).toEqual(sourceBefore)
+  expect(await DatabaseArtifact.digest(target).pipe(Effect.runPromise)).toEqual(targetBefore)
+  expect(await Bun.file(`${target}.ws-stage.json`).text()).toBe("unrelated file upgrade progress")
+})
+
+test("persistent old completion key backfills identity without native encoding", async () => {
+  await using temp = await tmpdir()
+  const filename = path.join(temp.path, "source.db")
+  const snapshot = path.join(temp.path, "snapshot.db")
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* setupWs(db, { directory: temp.path, rich: true })
+    yield* db.run("UPDATE message SET time_created = 'synthetic-not-a-clock' WHERE id = 'msg_legacy'")
+    yield* DatabaseArtifact.snapshot(db, snapshot)
+  }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.scoped))
+  const digest = await DatabaseArtifact.digest(snapshot).pipe(Effect.runPromise)
+  const before = await DatabaseArtifact.digest(filename).pipe(Effect.runPromise)
+  await Effect.runPromise(Effect.gen(function* () {
+    const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+    yield* DatabaseMigration.apply(db)
+    yield* db.run(sql`INSERT INTO kv (key, value, time_created, time_updated) VALUES (${`migration.ws-profile.${digest.sha256}`}, '{"completed":true}', 1, 1)`)
+    let preparations = 0
+    const begin = Effect.sync(() => { preparations++ })
+    expect(yield* WsNativeProfile.run(db, filename, begin)).toBe(true)
+    expect(yield* WsNativeProfile.run(db, filename, begin)).toBe(true)
+    expect(preparations).toBe(1)
+    expect(yield* db.all("SELECT * FROM _ws_archive")).toEqual([])
+  }).pipe(Effect.provide(sqliteLayer({ filename: path.join(temp.path, "target.db") })), Effect.provide(tempGlobalLayer), Effect.scoped))
+  expect(await DatabaseArtifact.digest(filename).pipe(Effect.runPromise)).toEqual(before)
+  expect((await readdir(temp.path)).filter((name) => name.endsWith(".ws-stage.json") || name.includes(".native-") || name.includes(".ws-snapshot-"))).toEqual([])
+})
 
 test("imports committed WAL facts while a source writer holds a shared lease", async () => {
   await using temp = await tmpdir()
@@ -77,12 +236,76 @@ test("recognizes the same source snapshot fingerprint before converting it again
     yield* DatabaseMigration.apply(db)
     const key = `migration.ws-profile.${fingerprint.sha256}`
     yield* db.run(sql`INSERT INTO kv (key, value, time_created, time_updated) VALUES (${key}, '{"completed":true}', 1, 1)`)
-    expect(yield* WsNativeProfile.run(db, filename)).toBe(true)
+    let preparations = 0
+    const begin = Effect.sync(() => { preparations += 1 })
+    expect(yield* WsNativeProfile.run(db, filename, begin)).toBe(true)
+    expect(yield* WsNativeProfile.run(db, filename, begin)).toBe(true)
+    expect(preparations).toBe(1)
     expect(yield* db.all(sql`SELECT key FROM kv`)).toEqual([{ key }])
     expect(yield* db.all(sql`SELECT * FROM _ws_archive`)).toEqual([])
   }).pipe(Effect.provide(sqliteLayer({ filename: ":memory:" })), Effect.provide(tempGlobalLayer), Effect.scoped))
   expect(await Bun.file(filename).bytes()).toEqual(before)
 })
+
+for (const wal of [false, true]) {
+  test(`completed profile does not skip changed ${wal ? "WAL" : "main"} content`, async () => {
+    await using temp = await tmpdir()
+    const filename = path.join(temp.path, "source.db")
+    await Effect.runPromise(Effect.gen(function* () {
+      const source = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* setupWs(source, { directory: temp.path })
+      if (wal) yield* source.run("PRAGMA journal_mode = WAL")
+      yield* Effect.gen(function* () {
+        const target = yield* EffectDrizzleSqlite.makeWithDefaults()
+        yield* DatabaseMigration.apply(target)
+        let preparations = 0
+        const begin = Effect.sync(() => { preparations += 1 })
+        expect(yield* WsNativeProfile.run(target, filename, begin)).toBe(true)
+        const main = yield* DatabaseArtifact.digest(filename)
+        yield* source.run("UPDATE project SET name = 'changed profile'")
+        if (wal) expect(yield* DatabaseArtifact.digest(filename)).toEqual(main)
+        expect((yield* WsNativeProfile.run(target, filename, begin).pipe(Effect.exit))._tag).toBe("Failure")
+        expect(preparations).toBe(2)
+        expect(yield* target.get("SELECT name FROM project WHERE id = 'project'")).toEqual({ name: "Source fixture" })
+      }).pipe(Effect.provide(sqliteLayer({ filename: ":memory:" })), Effect.scoped)
+    }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.provide(tempGlobalLayer), Effect.scoped))
+  })
+}
+
+for (const source of [setupWs, setupPreviousNative]) {
+  test(`persists completion before expensive preparation when reopening ${source.name} profile target`, async () => {
+    await using temp = await tmpdir()
+    const filename = path.join(temp.path, "source.db")
+    const target = path.join(temp.path, "target.db")
+    await Effect.runPromise(Effect.gen(function* () {
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* source(db, { directory: temp.path })
+    }).pipe(Effect.provide(sqliteLayer({ filename })), Effect.scoped))
+    const before = await Bun.file(filename).bytes()
+    let preparations = 0
+    const begin = Effect.sync(() => { preparations += 1 })
+    const run = () => Effect.runPromise(Effect.gen(function* () {
+      const db = yield* EffectDrizzleSqlite.makeWithDefaults()
+      yield* DatabaseMigration.apply(db)
+      expect(yield* WsNativeProfile.run(db, filename, begin)).toBe(true)
+      return {
+        archives: yield* db.all(sql`SELECT * FROM _ws_archive ORDER BY id`),
+        roots: yield* db.all(sql`SELECT * FROM _ws_import_root ORDER BY aggregate_id`),
+        messages: yield* db.all(sql`SELECT * FROM session_message ORDER BY id`),
+      }
+    }).pipe(Effect.provide(sqliteLayer({ filename: target })), Effect.provide(tempGlobalLayer), Effect.scoped))
+    const imported = await run()
+    expect(preparations).toBe(1)
+    expect(imported.archives).toHaveLength(1)
+    expect((await readdir(temp.path)).filter((name) => name.endsWith(".ws-stage.json") || name.includes(".native-") || name.includes(".ws-snapshot-"))).toEqual([])
+    expect(imported.roots.length).toBeGreaterThan(0)
+    expect(imported.messages.length).toBeGreaterThan(0)
+    expect(await Bun.file(filename).bytes()).toEqual(before)
+    expect(await run()).toEqual(imported)
+    expect(await Bun.file(filename).bytes()).toEqual(before)
+    expect(preparations).toBe(1)
+  })
+}
 
 test.each(["none", "project", "session", "account"])("transfers staged facts atomically with %s collision", async (collision) => {
   await using temp = await tmpdir()
