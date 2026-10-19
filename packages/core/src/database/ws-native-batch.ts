@@ -1,6 +1,7 @@
 export * as WsNativeBatch from "./ws-native-batch.js"
 
 import { Effect, Schema } from "effect"
+import type { SchemaIssue } from "effect"
 import { WsNativeMessage } from "./ws-native-message.js"
 import { WsNativePrevious } from "./ws-native-previous.js"
 import { WsNativeJson } from "./ws-native-json.js"
@@ -95,8 +96,12 @@ export function run(jobs: readonly Job[]): Effect.Effect<readonly Result[], WsNa
         yield* decodeStoredMessage(job.parent, job.children)
         return { kind: job.kind } as const
       case "native-encode": {
+        const failure = (stage: "schema-decode" | "storage-encode") => (error: Schema.SchemaError) =>
+          new WsNativeMessage.WsNativeMessageError({ messageID: job.row.id,
+            message: `Invalid native-encode stage=${stage} field=${nativeField(error.issue)}` })
         const message = yield* Schema.decodeUnknownEffect(SessionMessage.Info)({ ...job.row.data, id: job.row.id, type: job.row.type })
-        const stored = yield* encodeStoredMessage(message)
+          .pipe(Effect.mapError(failure("schema-decode")))
+        const stored = yield* encodeStoredMessage(message).pipe(Effect.mapError(failure("storage-encode")))
         return { kind: job.kind, output: { type: stored.envelope.type, data: JSON.stringify(stored.envelope.data),
           parts: stored.parts.map((part) => ({ position: part.position, id: part.id, type: part.type, data: JSON.stringify(part.data) })) } } as const
       }
@@ -122,6 +127,23 @@ export function run(jobs: readonly Job[]): Effect.Effect<readonly Result[], WsNa
 
 export function process(items: readonly Input[]) {
   return run(items.map((input) => ({ kind: "message", input }))).pipe(Effect.map(messageOutputs))
+}
+
+function nativeField(issue: SchemaIssue.Issue): string {
+  switch (issue._tag) {
+    case "Pointer":
+      if (issue.path.length === 0) return nativeField(issue.issue)
+      return ["id", "type", "time", "agent", "model", "content", "files", "tokens", "cost", "snapshot", "text"]
+        .find((field) => field === issue.path[0]) ?? "other"
+    case "Filter":
+    case "Encoding":
+      return nativeField(issue.issue)
+    case "Composite":
+    case "AnyOf":
+      return issue.issues.map(nativeField).find((field) => field !== "other") ?? "other"
+    default:
+      return "other"
+  }
 }
 
 export function messageOutputs(results: readonly Result[]) {
