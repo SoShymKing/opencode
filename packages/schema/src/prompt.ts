@@ -19,7 +19,11 @@ export const FileSource = Schema.Union([
 export type FileSource = typeof FileSource.Type
 
 export const Base64 = Schema.String.check(
-  Schema.isPattern(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u),
+  // Repeated four-character groups exhaust the regex engine on large attachments.
+  Schema.makeFilter((value: string) => value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/u.test(value), {
+    expected: "a base64 encoded string",
+    toJsonSchema: () => ({ pattern: "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$" }),
+  }),
 ).annotate({ identifier: "Prompt.Base64" })
 export type Base64 = typeof Base64.Type
 
