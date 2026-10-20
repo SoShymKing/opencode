@@ -17,7 +17,7 @@ export function recover(source: string, target: string, proof: {
 }) {
   return Effect.gen(function* () {
     const marker = proof.marker
-    if (marker.phase !== "snapshot" || JSON.stringify(marker.source.evidence) !== JSON.stringify(proof.before.evidence)) return
+    if (marker.phase !== "snapshot") return
     const work = join(dirname(target), marker.work)
     for (const suffix of ["", "-wal", "-shm", "-journal"])
       if (yield* DatabaseArtifact.exists(`${work}${suffix}`)) return

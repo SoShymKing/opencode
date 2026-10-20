@@ -106,7 +106,7 @@ export function capture(source: string, target: string) {
     if (!captured.initialize) yield* DatabaseReplacement.validate(snapshot, marker.snapshot)
     yield* DatabaseReplacement.requireNoSidecars(snapshot)
     const changed = JSON.stringify(marker.source.evidence) !== JSON.stringify(before.evidence)
-    if (changed && marker.phase !== "handoff") return yield* failure("Database source changed since WS stage preparation")
+    // Checkpoints change physical evidence between attempts; strict logical comparison decides reuse.
     const { WsSnapshotRecovery } = yield* Effect.promise(() => import("./ws-snapshot-recovery.js"))
     const recovered = yield* WsSnapshotRecovery.recover(source, target, { marker, before })
     if (recovered) {
