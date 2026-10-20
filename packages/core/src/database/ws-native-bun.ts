@@ -106,8 +106,15 @@ export const openWith = (acquire: ReturnType<typeof openWorker>) => Effect.gen(f
       const record = workers[index]
       record.busy = true
       yield* Effect.gen(function* () {
+        let flight: { readonly items: typeof queue; readonly rpc: Fiber.Fiber<readonly WsNativeBatch.Result[], WsNativeMessage.WsNativeMessageError> } | undefined
         while (true) {
-          const items = yield* lock.withPermits(1)(Effect.gen(function* () {
+          const finished = flight ? { items: flight.items, outputs: yield* Fiber.join(flight.rpc) } : undefined
+          flight = yield* lock.withPermits(1)(Effect.gen(function* () {
+            if (finished) {
+              workload.estimatedBytes -= record.weight
+              workload.count -= finished.items.length
+              record.weight = 0
+            }
             const capacity = yield* workerPlan(workload, active())
             if (queue.length && index < capacity.capacity) {
               const chunk: (typeof queue)[number][] = []
@@ -117,14 +124,16 @@ export const openWith = (acquire: ReturnType<typeof openWorker>) => Effect.gen(f
                 record.weight += item.weight
                 chunk.push(item)
               }
-              return chunk
+              const rpc = yield* record.worker.run(chunk.map((item) => item.job)).pipe(Effect.forkChild({ startImmediately: true }))
+              return { items: chunk, rpc }
             }
             if (index >= capacity.capacity) yield* Scope.close(record.scope, Exit.void)
             yield* Scope.close(reservation, Exit.void)
             record.busy = false
             return undefined
           }))
-          if (!items) {
+          if (finished) for (const [position, item] of finished.items.entries()) yield* Deferred.succeed(item.ready, finished.outputs[position])
+          if (!flight) {
             if (!active()) {
               while (queue.length) {
                 const remaining = queue.shift()
@@ -137,20 +146,6 @@ export const openWith = (acquire: ReturnType<typeof openWorker>) => Effect.gen(f
             }
             return
           }
-          const outputs = yield* record.worker.run(items.map((item) => item.job))
-          const finished = yield* lock.withPermits(1)(Effect.gen(function* () {
-            workload.estimatedBytes -= record.weight
-            workload.count -= items.length
-            record.weight = 0
-            if (queue.length) return false
-            const capacity = yield* workerPlan(workload, active())
-            if (index >= capacity.capacity) yield* Scope.close(record.scope, Exit.void)
-            yield* Scope.close(reservation, Exit.void)
-            record.busy = false
-            return true
-          }))
-          for (const [position, item] of items.entries()) yield* Deferred.succeed(item.ready, outputs[position])
-          if (finished) return
         }
       }).pipe(
         Effect.onError((cause) => Effect.forEach(pending, (ready) => Deferred.failCause(ready, cause), { discard: true })),
