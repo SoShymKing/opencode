@@ -11,9 +11,11 @@ export const Resources = Context.Reference<() => { readonly cpu: number; readonl
 const reserved = { cpu: 0, bytes: 0 }
 const held = new WeakMap<Scope.Scope, number>()
 let changed = Deferred.makeUnsafe<void>()
+export const resourceChange = Effect.sync(() => Deferred.await(changed))
 function notify() {
-  Deferred.doneUnsafe(changed, Exit.void)
+  const previous = changed
   changed = Deferred.makeUnsafe<void>()
+  Deferred.doneUnsafe(previous, Exit.void)
 }
 export const readingPlan = (bytes = 0, count = 0) => Effect.map(Resources, (snapshot) => {
   const current = snapshot()
