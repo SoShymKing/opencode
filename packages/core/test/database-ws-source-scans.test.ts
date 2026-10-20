@@ -6,7 +6,7 @@ import { EffectDrizzleSqlite } from "@opencode/core/database/drizzle"
 import { WsNativeSource } from "@opencode/core/database/ws-native-source"
 import { WsNativePrevious } from "@opencode/core/database/ws-native-previous"
 import { WsNativeScan } from "@opencode/core/database/ws-native-scan"
-import { choose, estimate, headroom, lease, pipeline, Resources } from "@opencode/core/database/ws-native-serial"
+import { choose, estimate, headroom, lease, pipeline, Resources, workerBytes } from "@opencode/core/database/ws-native-serial"
 import { openWith, openWorker } from "@opencode/core/database/ws-native-bun"
 import { WsNativeBatch } from "@opencode/core/database/ws-native-batch"
 import type { Worker } from "node:worker_threads"
@@ -48,7 +48,7 @@ for (const previous of [false, true]) test(`${previous ? "P" : "WS"} event valid
 
 class VisitorValue extends Context.Service<VisitorValue, { readonly value: string }>()("SourceScanVisitorValue") {}
 
-test("pipeline reads during gated compute and computes its second batch during blocked writes", () => Effect.runPromise(Effect.gen(function* () {
+test("pipeline reads during gated compute and computes all fitting later batches during blocked writes", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* db.run("CREATE TABLE pipeline_source (id TEXT, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
   const data = messageData.replace('"first"', JSON.stringify("x".repeat(270000)))
@@ -62,21 +62,24 @@ test("pipeline reads during gated compute and computes its second batch during b
   const writing = yield* Deferred.make<void>()
   const written = yield* Deferred.make<void>()
   const computed = yield* Deferred.make<void>()
+  const firstComputed = yield* Deferred.make<void>()
   let reads = 0
   let batches = 0
   const seen: string[] = []
   const read = Effect.gen(function* () {
+    if (reads === 3) return undefined
     yield* lease(2 * estimate(Buffer.byteLength(data)), "page")
     const rows = yield* db.all<WsNativeBatch.Row>(sql`SELECT * FROM pipeline_source ORDER BY seq LIMIT 2 OFFSET ${reads * 2}`)
     reads++
-    if (reads === 2) yield* Deferred.succeed(readAhead, undefined)
+    if (reads === 3) yield* Deferred.succeed(readAhead, undefined)
     if (!rows.length) return undefined
     return rows.map((row): WsNativeBatch.Job => ({ kind: "message", input: { row, parts: undefined, previousNative: false, store: true } }))
   })
   const compute = (jobs: readonly WsNativeBatch.Job[], emit: (result: WsNativeBatch.Result, index: number) => Effect.Effect<void>) => Effect.gen(function* () {
     const batch = ++batches
     yield* converter.stream(jobs, emit, true)
-    if (batch === 2) yield* Deferred.succeed(computed, undefined)
+    if (batch === 1) yield* Deferred.succeed(firstComputed, undefined)
+    if (batch === 3) yield* Deferred.succeed(computed, undefined)
   })
   const fiber = yield* pipeline(read, compute, (job, output) => Effect.gen(function* () {
     expect(output.kind).toBe("message")
@@ -87,14 +90,15 @@ test("pipeline reads during gated compute and computes its second batch during b
   })).pipe(Effect.forkChild)
   yield* Deferred.await(writing)
   yield* Deferred.await(readAhead)
-  expect(reads).toBe(2)
+  expect(reads).toBe(3)
   expect(seen).toEqual(["msg_first"])
   workers.forEach((worker) => worker.postMessage("release"))
   yield* Deferred.await(computed)
+  yield* Deferred.await(firstComputed)
   expect(converter.threadIDs().length).toBe(2)
-  expect(reads).toBe(2)
+  expect(reads).toBe(3)
   expect(seen).toEqual(["msg_first"])
-  expect(yield* headroom).toBe(available - 4 * estimate(Buffer.byteLength(data)))
+  expect(yield* headroom).toBe(available - 6 * estimate(Buffer.byteLength(data)))
   yield* Deferred.succeed(written, undefined)
   yield* Fiber.join(fiber)
   expect(seen).toEqual(["msg_first", "msg_gate", "msg_second", "msg_third", "msg_fourth", "msg_fifth"])
@@ -139,12 +143,21 @@ test("bounded pipeline retains the caller transaction after late conversion fail
   for (let index = 0; index < 260; index++) yield* db.run(sql`INSERT INTO session_message VALUES
     (${`msg_pipeline_${index}`}, 'ses_migration', 'assistant', ${index + 51}, 1, 16, ${index === 259 ? '{}' : messageData})`)
   let writes = 0
-  const result = yield* db.transaction((tx) => WsNativeScan.consume(tx,
+  const written = yield* Deferred.make<void>()
+  const result = yield* db.transaction((tx) => WsNativeScan.consume({ get: tx.get.bind(tx), all: <T>(query: Parameters<typeof tx.all>[0]) => {
+    const result = tx.all<T>(query)
+    if (result.getQuery().sql.includes("SELECT id, session_id") && result.getQuery().params.includes("msg_pipeline_259")) {
+      const execute = result.execute
+      result.execute = () => Deferred.await(written).pipe(Effect.andThen(execute()))
+    }
+    return result
+  } },
     { parent: "session_message", child: undefined, previousNative: false, store: () => true },
     (row, output) => Effect.gen(function* () {
       expect((yield* VisitorValue).value).toBe("transaction")
       yield* tx.run(sql`INSERT INTO pipeline_target VALUES (${row.id}, ${output?.data ?? ''})`)
       writes++
+      yield* Deferred.succeed(written, undefined)
     }))).pipe(Effect.provideService(VisitorValue, { value: "transaction" }), Effect.result)
   expect(result._tag).toBe("Failure")
   expect(writes).toBeGreaterThan(0)
@@ -197,10 +210,16 @@ for (const cpu of [1, 20]) test(`consume on ${cpu} CPUs batches bounded parent/c
     yield* db.run(sql`INSERT INTO children VALUES (${id}, 1, 'second', 'text', '{"text":"second"}'), (${id}, 0, 'first', 'text', '{ "text":"first\\u0020text" }')`)
   }
   let payloads = 0
+  const prefetched = yield* Deferred.make<void>()
+  const available = yield* headroom
   const weights = new Map<string, number>()
   const reader = { get: db.get.bind(db), all: <T>(query: Parameters<typeof db.all>[0]) => {
     const result = db.all<T>(query)
     const parent = result.getQuery().sql.includes("SELECT id, session_id")
+    if (result.getQuery().sql.includes("AS bytes")) {
+      const execute = result.execute
+      result.execute = () => execute().pipe(Effect.tap((rows) => rows.length ? Effect.void : Deferred.succeed(prefetched, undefined)))
+    }
     if (!result.getQuery().sql.includes("AS bytes")) {
       payloads++
       const execute = result.execute
@@ -232,9 +251,11 @@ for (const cpu of [1, 20]) test(`consume on ${cpu} CPUs batches bounded parent/c
     yield* Deferred.await(release)
   })).pipe(Effect.provideService(VisitorValue, { value: "context" }), Effect.forkChild)
   yield* Deferred.await(entered)
-  const before = payloads
-  yield* Effect.yieldNow
-  expect(payloads).toBe(before)
+  yield* Deferred.await(prefetched).pipe(Effect.timeout("10 seconds"))
+  expect(payloads).toBe(16)
+  const retained = [...weights.values()].reduce((sum, bytes) => sum + bytes, 0)
+  expect(available - (yield* headroom)).toBeGreaterThanOrEqual(retained)
+  expect(available - (yield* headroom)).toBeLessThanOrEqual(retained + (cpu === 1 ? 0 : cpu * workerBytes))
   expect(seen.length).toBe(1)
   yield* Deferred.succeed(release, undefined)
   yield* Fiber.join(fiber)

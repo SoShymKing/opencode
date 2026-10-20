@@ -447,7 +447,7 @@ test("two real workers preserve serial JSON, independent ordinals and native tim
   expect(results[0]?.[1]?.parts.map((part) => part.data)).toEqual(['{"text":"first"}', '{"text":"second"}'])
 }).pipe(Effect.scoped)))
 
-test("scan prefetches a bounded window while writes block and preserves tied sequence order", () => Effect.runPromise(Effect.gen(function* () {
+test("scan prefetches all fitting payloads while writes block and preserves tied sequence order", () => Effect.runPromise(Effect.gen(function* () {
   const db = yield* EffectDrizzleSqlite.makeWithDefaults()
   yield* setupWs(db, { directory: "/fixture", rich: false })
   yield* db.run("DROP INDEX session_message_session_seq_idx")
@@ -457,6 +457,7 @@ test("scan prefetches a bounded window while writes block and preserves tied seq
   const release = yield* Deferred.make<void>()
   const pages: number[] = []
   const prefetched = yield* Deferred.make<void>()
+  const available = yield* headroom
   const order: string[] = []
   const reader = {
     get: db.get.bind(db),
@@ -464,7 +465,8 @@ test("scan prefetches a bounded window while writes block and preserves tied seq
       const result = db.all<T>(query)
       if (result.getQuery().sql.includes("AS bytes")) {
         pages.push(1)
-        if (pages.length === 2) Effect.runSync(Deferred.succeed(prefetched, undefined))
+        const execute = result.execute
+        result.execute = () => execute().pipe(Effect.tap((rows) => rows.length ? Effect.void : Deferred.succeed(prefetched, undefined)))
       }
       return result
     },
@@ -478,8 +480,9 @@ test("scan prefetches a bounded window while writes block and preserves tied seq
       yield* Deferred.await(release)
     })).pipe(Effect.forkChild)
   yield* Deferred.await(entered)
-  yield* Deferred.await(prefetched)
-  expect(pages.length).toBe(2)
+  yield* Deferred.await(prefetched).pipe(Effect.timeout("10 seconds"))
+  expect(pages.length).toBe(4)
+  expect(yield* headroom).toBe(available - 261 * estimate(Buffer.byteLength(messageData)))
   expect(order.length).toBe(1)
   yield* Deferred.succeed(release, undefined)
   yield* Fiber.join(fiber)

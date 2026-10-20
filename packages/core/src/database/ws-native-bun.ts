@@ -1,8 +1,8 @@
 import { Worker } from "node:worker_threads"
-import { Context, Deferred, Effect, Exit, Scope, Semaphore } from "effect"
+import { Context, Deferred, Effect, Exit, Fiber, Scope, Semaphore } from "effect"
 import { WsNativeBatch } from "./ws-native-batch.js"
 import { WsNativeMessage } from "./ws-native-message.js"
-import { reserve } from "./ws-native-serial.js"
+import { minWorkPerWorker, reserve, reserveWorker, resourceChange, workerPlan } from "./ws-native-serial.js"
 
 declare const OPENCODE_WS_NATIVE_WORKER: string | undefined
 const workerURL = new URL(typeof OPENCODE_WS_NATIVE_WORKER === "undefined"
@@ -61,58 +61,149 @@ export function openWorker(url = workerURL) {
 }
 
 export const openWith = (acquire: ReturnType<typeof openWorker>) => Effect.gen(function* () {
-  const parent = yield* Effect.scope
-  const scope = yield* Scope.fork(parent)
+  const scope = yield* Scope.make()
+  const reservations = yield* Scope.fork(scope)
+  const observers = yield* Scope.fork(scope)
   const lock = yield* Semaphore.make(1)
-  const workers: { readonly worker: Effect.Success<ReturnType<typeof openWorker>>; readonly scope: Scope.Closeable }[] = []
+  const workers: { readonly worker: Effect.Success<ReturnType<typeof openWorker>>; readonly scope: Scope.Closeable; busy: boolean; weight: number }[] = []
+  type Ready = Deferred.Deferred<WsNativeBatch.Result, WsNativeMessage.WsNativeMessageError>
+  const pending = new Set<Ready>()
+  const queue: { readonly job: WsNativeBatch.Job; readonly ready: Ready; readonly weight: number }[] = []
+  const workload = { estimatedBytes: 0, count: 0 }
+  let closed = false
+  const close = (exit: Exit.Exit<unknown, unknown>) => lock.withPermits(1)(Effect.gen(function* () {
+    closed = true
+    yield* Scope.close(observers, exit)
+    yield* Scope.close(scope, exit)
+    queue.length = 0
+    pending.clear()
+    workload.estimatedBytes = 0
+    workload.count = 0
+  }))
+  yield* Effect.addFinalizer(close)
+  const active = () => workers.filter((record) => record.busy).length
+  const dispatch = lock.withPermits(1)(Effect.gen(function* () {
+    if (closed) return yield* new WsNativeMessage.WsNativeMessageError({ messageID: "", message: "WS conversion pool is closed" })
+    const selected = yield* workerPlan(workload, active())
+    while (workers.length && !workers[workers.length - 1].busy &&
+      (workers.length > selected.capacity || workers[workers.length - 1].worker.worker.threadId < 0)) {
+      const record = workers.pop()
+      if (record) yield* Scope.close(record.scope, Exit.void)
+    }
+    const desired = Math.max(active(), selected.workers, active() ? Math.min(workers.length, active() + queue.length) : 0)
+    for (let index = 0; active() < desired && index < selected.capacity; index++) {
+      if (workers[index]?.busy) continue
+      const reservation = yield* Scope.fork(reservations)
+      if (!(yield* reserveWorker.pipe(Scope.provide(reservation)))) {
+        yield* Scope.close(reservation, Exit.void)
+        break
+      }
+      if (!workers[index] || workers[index].worker.worker.threadId < 0) {
+        const child = yield* Scope.fork(scope)
+        const worker = yield* acquire.pipe(Scope.provide(child))
+        workers[index] = { worker, scope: child, busy: false, weight: 0 }
+      }
+      const record = workers[index]
+      record.busy = true
+      yield* Effect.gen(function* () {
+        while (true) {
+          const items = yield* lock.withPermits(1)(Effect.gen(function* () {
+            const capacity = yield* workerPlan(workload, active())
+            if (queue.length && index < capacity.capacity) {
+              const chunk: (typeof queue)[number][] = []
+              while (queue.length && (!chunk.length || record.weight + queue[0].weight <= minWorkPerWorker)) {
+                const item = queue.shift()
+                if (!item) break
+                record.weight += item.weight
+                chunk.push(item)
+              }
+              return chunk
+            }
+            if (index >= capacity.capacity) yield* Scope.close(record.scope, Exit.void)
+            yield* Scope.close(reservation, Exit.void)
+            record.busy = false
+            return undefined
+          }))
+          if (!items) {
+            if (!active()) {
+              while (queue.length) {
+                const remaining = queue.shift()
+                if (!remaining) break
+                const outputs = yield* WsNativeBatch.run([remaining.job])
+                workload.estimatedBytes -= remaining.weight
+                workload.count--
+                yield* Deferred.succeed(remaining.ready, outputs[0])
+              }
+            }
+            return
+          }
+          const outputs = yield* record.worker.run(items.map((item) => item.job))
+          const finished = yield* lock.withPermits(1)(Effect.gen(function* () {
+            workload.estimatedBytes -= record.weight
+            workload.count -= items.length
+            record.weight = 0
+            if (queue.length) return false
+            const capacity = yield* workerPlan(workload, active())
+            if (index >= capacity.capacity) yield* Scope.close(record.scope, Exit.void)
+            yield* Scope.close(reservation, Exit.void)
+            record.busy = false
+            return true
+          }))
+          for (const [position, item] of items.entries()) yield* Deferred.succeed(item.ready, outputs[position])
+          if (finished) return
+        }
+      }).pipe(
+        Effect.onError((cause) => Effect.forEach(pending, (ready) => Deferred.failCause(ready, cause), { discard: true })),
+        Effect.forkIn(scope))
+    }
+    return active() > 0
+  }))
   const stream = <E, R>(items: readonly WsNativeBatch.Job[], accept: (output: WsNativeBatch.Result, index: number) => Effect.Effect<void, E, R>, prepaid = false) => Effect.gen(function* () {
     let offset = 0
     while (offset < items.length) {
       offset += yield* Effect.gen(function* () {
-        const payloadScope = yield* Effect.scope
-        const initialized = yield* Deferred.make<readonly Deferred.Deferred<WsNativeBatch.Result>[]>()
-        const compute = lock.withPermits(1)(Effect.gen(function* () {
-          const selected = yield* reserve(items.slice(offset), true, prepaid).pipe(Scope.provide(payloadScope))
-          const jobs = items.slice(offset, offset + selected.count)
-          const ready = yield* Effect.forEach(jobs, () => Deferred.make<WsNativeBatch.Result>())
-          yield* Deferred.succeed(initialized, ready)
-          while (workers.length > selected.capacity) {
-            const worker = workers.pop()
-            if (worker) yield* Scope.close(worker.scope, Exit.void)
+        const selected = yield* reserve(items.slice(offset), false, prepaid)
+        const jobs = items.slice(offset, offset + selected.count)
+        if (selected.useful < 2) {
+          yield* dispatch
+          for (const [index, job] of jobs.entries()) {
+            const outputs = yield* WsNativeBatch.run([job])
+            yield* accept(outputs[0], offset + index)
           }
-          if (!selected.workers) {
-            for (const [index, job] of jobs.entries()) {
-              const outputs = yield* WsNativeBatch.run([job])
-              yield* Deferred.succeed(ready[index], outputs[0])
-            }
-            yield* selected.releaseCPU
-            return
+          return jobs.length
+        }
+        const ready = yield* Effect.forEach(jobs, () => Deferred.make<WsNativeBatch.Result, WsNativeMessage.WsNativeMessageError>())
+        for (const [index, job] of jobs.entries()) {
+          pending.add(ready[index])
+          workload.estimatedBytes += selected.weights[index]
+          workload.count++
+          queue.push({ job, ready: ready[index], weight: selected.weights[index] })
+        }
+        if (!(yield* dispatch)) {
+          while (queue.length) {
+            const item = queue.shift()
+            if (!item) break
+            const outputs = yield* WsNativeBatch.run([item.job])
+            workload.estimatedBytes -= item.weight
+            workload.count--
+            yield* Deferred.succeed(item.ready, outputs[0])
           }
-          while (workers.length < selected.workers) {
-            const child = yield* Scope.fork(scope)
-            const worker = yield* acquire.pipe(Scope.provide(child),
-              Effect.onExit((exit) => Exit.isFailure(exit) ? Scope.close(child, exit) : Effect.void))
-            workers.push({ worker, scope: child })
+        }
+        const observer = yield* Effect.gen(function* () {
+          while (true) {
+            const change = yield* resourceChange
+            if (queue.length) yield* dispatch
+            yield* change
           }
-          const groups = workers.slice(0, selected.workers).map<{ weight: number; items: { readonly index: number; readonly job: WsNativeBatch.Job }[] }>(() => ({ weight: 0, items: [] }))
-          for (const item of jobs.map((job, index) => ({ job, index, weight: selected.weights[index] })).sort((left, right) => right.weight - left.weight)) {
-            const group = groups.reduce((left, right) => left.weight <= right.weight ? left : right)
-            group.weight += item.weight
-            group.items.push(item)
+        }).pipe(Effect.forkIn(observers))
+        return yield* Effect.gen(function* () {
+          for (const [index, result] of ready.entries()) {
+            yield* accept(yield* Deferred.await(result), offset + index)
+            pending.delete(result)
           }
-          yield* Effect.all(groups.map((group, index) => workers[index].worker.run(group.items.map((item) => item.job)).pipe(
-            Effect.flatMap((outputs) => Effect.forEach(outputs, (output, index) => Deferred.succeed(ready[group.items[index].index], output))),
-          )), { concurrency: selected.workers, discard: true })
-          yield* selected.releaseCPU
-        }))
-        const write = Effect.gen(function* () {
-          const ready = yield* Deferred.await(initialized)
-          for (const [index, result] of ready.entries()) yield* accept(yield* Deferred.await(result), offset + index)
           return ready.length
-        })
-        const results = yield* Effect.all([compute, write], { concurrency: 2 })
-        return results[1]
-      }).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? Scope.close(scope, exit) : Effect.void), Effect.scoped)
+        }).pipe(Effect.raceFirst(Fiber.join(observer)), Effect.ensuring(Fiber.interrupt(observer)))
+      }).pipe(Effect.onExit((exit) => Exit.isFailure(exit) ? close(exit) : Effect.void), Effect.scoped)
     }
   })
   const run = (items: readonly WsNativeBatch.Job[]) => Effect.gen(function* () {
