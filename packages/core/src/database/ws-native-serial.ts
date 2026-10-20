@@ -1,5 +1,5 @@
 import { availableParallelism, freemem } from "#ws-native-os"
-import { Context, Deferred, Effect, Exit, Queue, Scope, Semaphore } from "effect"
+import { Context, Deferred, Effect, Exit, Fiber, Queue, Scope } from "effect"
 import { WsNativeBatch } from "./ws-native-batch.js"
 import { WsNativeMessage } from "./ws-native-message.js"
 
@@ -11,9 +11,11 @@ export const Resources = Context.Reference<() => { readonly cpu: number; readonl
 const reserved = { cpu: 0, bytes: 0 }
 const held = new WeakMap<Scope.Scope, number>()
 let changed = Deferred.makeUnsafe<void>()
+export const resourceChange = Effect.sync(() => Deferred.await(changed))
 function notify() {
-  Deferred.doneUnsafe(changed, Exit.void)
+  const previous = changed
   changed = Deferred.makeUnsafe<void>()
+  Deferred.doneUnsafe(previous, Exit.void)
 }
 export const readingPlan = (bytes = 0, count = 0) => Effect.map(Resources, (snapshot) => {
   const current = snapshot()
@@ -44,7 +46,7 @@ export function lease(bytes: number, messageID: string) {
   })
 }
 // The conversion sweep showed startup overhead dominates below 2 MiB estimated work per Worker.
-const minWorkPerWorker = 2 * 1024 ** 2
+export const minWorkPerWorker = 2 * 1024 ** 2
 export const estimate = (bytes: number, rows = 1) => 8 * bytes + 4096 * rows
 export function choose(snapshot: { readonly cpu: number; readonly freeBytes: number }, weights: readonly number[], active = { cpu: 0, bytes: 0 }) {
   const available = Math.max(0, Math.floor(snapshot.freeBytes / 2) - active.bytes)
@@ -58,7 +60,7 @@ export function choose(snapshot: { readonly cpu: number; readonly freeBytes: num
   const useful = Math.floor(bytes / minWorkPerWorker)
   const capacity = snapshot.cpu < 2 ? 0 : Math.max(0, Math.min(snapshot.cpu - active.cpu, Math.floor((available - bytes) / workerBytes)))
   const workers = useful < 2 ? 0 : Math.min(capacity, count, useful)
-  return { count, workers, capacity, bytes: bytes + workers * workerBytes, available }
+  return { count, workers, capacity, useful, bytes: bytes + workers * workerBytes, available }
 }
 export const headroom = Effect.map(Resources, (snapshot) => Math.max(0, Math.floor(snapshot().freeBytes / 2) - reserved.bytes))
 export function plan(snapshot: { readonly cpu: number; readonly freeBytes: number }, bytes: number, count: number, active = { cpu: 0, bytes: 0 }) {
@@ -108,6 +110,26 @@ export function reserve(jobs: readonly WsNativeBatch.Job[], threads = true, prep
     notify()
   }))))
 }
+export const workerPlan = (workload: { readonly estimatedBytes: number; readonly count: number }, owned: number) => Effect.map(Resources, (snapshot) => {
+  const current = snapshot()
+  const available = Math.max(0, Math.floor(current.freeBytes / 2) - reserved.bytes + owned * workerBytes)
+  const capacity = current.cpu < 2 ? 0 : Math.max(0, Math.min(current.cpu - reserved.cpu + owned, Math.floor(available / workerBytes)))
+  const useful = Math.floor(workload.estimatedBytes / minWorkPerWorker)
+  return { capacity, workers: useful < 2 ? 0 : Math.min(capacity, workload.count, useful) }
+})
+export const reserveWorker = Effect.acquireRelease(Effect.gen(function* () {
+  const snapshot = yield* Resources
+  const current = snapshot()
+  if (current.cpu < 2 || reserved.cpu >= current.cpu || reserved.bytes + workerBytes > Math.floor(current.freeBytes / 2)) return false
+  reserved.cpu++
+  reserved.bytes += workerBytes
+  return true
+}), (active) => Effect.sync(() => {
+  if (!active) return
+  reserved.cpu--
+  reserved.bytes -= workerBytes
+  notify()
+}))
 const stream = <E, R>(jobs: readonly WsNativeBatch.Job[], accept: (output: WsNativeBatch.Result, index: number) => Effect.Effect<void, E, R>, prepaid = false) => Effect.gen(function* () {
   let offset = 0
   while (offset < jobs.length) {
@@ -137,13 +159,12 @@ export function pipeline<A, B, E, R, E2, R2, E3, R3>(
 ) {
   return Effect.scoped(Effect.gen(function* () {
     const parent = yield* Effect.scope
-    const window = yield* Semaphore.make(2)
-    type Batch = { readonly items: readonly A[]; readonly ready: readonly Deferred.Deferred<B>[]; readonly scope: Scope.Closeable }
-    const inputs = yield* Queue.make<Batch | undefined>({ capacity: 2 })
-    const outputs = yield* Queue.make<Batch | undefined>({ capacity: 2 })
+    const failed = yield* Deferred.make<never, E2>()
+    type Batch = { readonly items: readonly A[]; readonly ready: readonly Deferred.Deferred<B>[]; readonly done: Deferred.Deferred<void, E2>; readonly scope: Scope.Closeable }
+    const inputs = yield* Queue.make<Batch | undefined>()
+    const outputs = yield* Queue.make<Batch | undefined>()
     const producer = Effect.gen(function* () {
       while (true) {
-        yield* window.take(1)
         const scope = yield* Scope.fork(parent)
         const items = yield* read.pipe(Scope.provide(scope))
         if (items === undefined) {
@@ -152,15 +173,27 @@ export function pipeline<A, B, E, R, E2, R2, E3, R3>(
           return
         }
         const ready = yield* Effect.forEach(items, () => Deferred.make<B>())
-        yield* Queue.offer(inputs, { items, ready, scope })
+        const done = yield* Deferred.make<void, E2>()
+        yield* Queue.offer(inputs, { items, ready, done, scope })
       }
     })
     const processor = Effect.gen(function* () {
+      const running: Fiber.Fiber<void, E2>[] = []
       while (true) {
         const batch = yield* Queue.take(inputs)
         yield* Queue.offer(outputs, batch)
-        if (batch === undefined) return
-        yield* compute(batch.items, (output, index) => Deferred.succeed(batch.ready[index], output).pipe(Effect.asVoid))
+        if (batch === undefined) return yield* Effect.forEach(running, Fiber.join, { discard: true })
+        for (let index = running.length - 1; index >= 0; index--) {
+          if (running[index].pollUnsafe()) {
+            yield* Fiber.join(running[index])
+            running.splice(index, 1)
+          }
+        }
+        const fiber = yield* compute(batch.items, (output, index) => Deferred.succeed(batch.ready[index], output).pipe(Effect.asVoid)).pipe(
+          Effect.onError((cause) => Deferred.failCause(failed, cause)),
+          Effect.onExit((exit) => Deferred.done(batch.done, exit)),
+          Effect.forkChild)
+        running.push(fiber)
       }
     })
     const writer = Effect.gen(function* () {
@@ -168,10 +201,10 @@ export function pipeline<A, B, E, R, E2, R2, E3, R3>(
         const batch = yield* Queue.take(outputs)
         if (batch === undefined) return
         for (const [index, item] of batch.items.entries()) yield* accept(item, yield* Deferred.await(batch.ready[index]))
+        yield* Deferred.await(batch.done)
         yield* Scope.close(batch.scope, Exit.void)
-        yield* window.release(1)
       }
     })
-    yield* Effect.all([producer, processor, writer], { concurrency: 3, discard: true })
+    yield* Effect.all([producer, processor, writer], { concurrency: 3, discard: true }).pipe(Effect.raceFirst(Deferred.await(failed)))
   }))
 }
